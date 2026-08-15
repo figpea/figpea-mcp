@@ -28,16 +28,36 @@ export interface HelloFrame {
   token: string;
 }
 
-/** Server -> tab. Asks the now-paired tab for its current `figpea.describe()`
- * manifest (+ `figpea.version`), sent once right after a successful `hello`. */
+/** Server -> tab. Asks the now-paired tab for its `figpea.describe(selector)`
+ * result (+ `figpea.version`).
+ *
+ * REQ-188 — mirrors the optional `selector` field REQ-181 added to v3's
+ * `src/agent/bridge/protocolTypes.ts`. Since contract 0.16.0 a **bare** call
+ * (no `selector`) returns only a compact index — `group -> {method: <doc
+ * string>}` plus reserved `version`/`errorCodes` keys — while
+ * `selector: "<group>"` returns that group's full typed descriptors. The
+ * server therefore sends one bare frame to enumerate, then one per group;
+ * see `describeDrill.ts`. Omitting `selector` keeps the pre-REQ-181
+ * behavior on both sides. */
 export interface DescribeFrame {
   type: 'describe';
+  selector?: string;
 }
 
-/** Tab -> server, in response to a `DescribeFrame`. */
+/** Tab -> server, in response to a `DescribeFrame`.
+ *
+ * ⚠️ `manifest` is **optional on the wire**. An unresolved selector makes
+ * v3's `describe()` return `undefined`, and `JSON.stringify` drops an
+ * undefined value's key entirely rather than emitting `null` — so a miss
+ * arrives as `{type:'describe_result', version:'…'}` with no `manifest` key
+ * at all. Consumers must test for the key's presence, not for a null value.
+ *
+ * There is deliberately **no id and no selector echo** here: the frame is
+ * matched to its request purely by ordering over the single socket, so
+ * describe requests must never be issued concurrently. */
 export interface DescribeResultFrame {
   type: 'describe_result';
-  manifest: unknown;
+  manifest?: unknown;
   version: string;
 }
 

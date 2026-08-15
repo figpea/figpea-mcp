@@ -35,6 +35,11 @@ interface BridgeServerHandle {
   readonly token: string;
   isTabConnected(): boolean;
   onDescribe(handler: (manifest: unknown) => void): void;
+  /** REQ-125 — the connected tab's last reported `figpea.version`, or null.
+   * Declared here because REQ-188's drill tests assert it survives the
+   * multi-frame drill; this stand-in interface otherwise drifts from the
+   * real handle and the assertion fails to typecheck rather than to run. */
+  getContractVersion(): string | null;
   callTab(group: string, method: string, args: unknown[], timeoutMs?: number): Promise<unknown>;
   close(): Promise<void>;
 }

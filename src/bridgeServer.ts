@@ -8,6 +8,7 @@
 import * as crypto from 'node:crypto';
 import WebSocket, { WebSocketServer } from 'ws';
 import type { CallFrame, DescribeFrame } from './protocol';
+import { drillManifest, type DescribeFn, type DescribeResultPayload } from './describeDrill';
 
 /** Distinct WebSocket close codes for the two server-initiated close paths
  * (AC-3, OQ-3) — both >=4000 (RFC 6455 private-use range), unambiguously
@@ -22,6 +23,12 @@ const HELLO_TIMEOUT_MS = 5000;
 
 /** Default per-call timeout when the caller doesn't specify one. */
 const DEFAULT_CALL_TIMEOUT_MS = 10_000;
+
+/** How long one `describe` frame may go unanswered before the drill gives up
+ * on it (REQ-188). A stalled tab must degrade to a skipped group — or, for
+ * the bare index, to no contract tools — never to a promise that never
+ * settles and wedges the connection's drill forever. */
+const DESCRIBE_TIMEOUT_MS = 10_000;
 
 export interface StartBridgeServerOptions {
   /** Bind port; omit (or 0) for an OS-assigned ephemeral port (the normal,
@@ -92,6 +99,14 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
   const pending = new Map<string, PendingCall>();
   const describeHandlers: Array<(manifest: unknown) => void> = [];
 
+  /** Resolver for the single in-flight `describe` request, if any.
+   *
+   * One slot, not a map: `describe_result` frames carry no correlation id and
+   * no selector echo (see `protocol.ts`), so a reply can only be matched to
+   * its request by ordering. The drill awaits each frame before sending the
+   * next, which keeps this slot occupied by at most one request at a time. */
+  let pendingDescribe: ((payload: DescribeResultPayload) => void) | undefined;
+
   function rejectAllPending(reason: unknown): void {
     for (const entry of pending.values()) {
       clearTimeout(entry.timer);
@@ -114,7 +129,15 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
 
     if (frame?.type === 'describe_result') {
       contractVersion = typeof frame.version === 'string' ? frame.version : null;
-      for (const handler of describeHandlers) handler(frame.manifest);
+      const resolve = pendingDescribe;
+      pendingDescribe = undefined;
+      // `manifest` is absent (not null) when the selector missed, so presence
+      // is tested on the parsed frame rather than inferred from the value.
+      resolve?.({
+        hasManifest: Object.prototype.hasOwnProperty.call(frame, 'manifest'),
+        manifest: frame.manifest,
+        version: contractVersion,
+      });
       return;
     }
 
@@ -129,6 +152,55 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
         entry.resolve({ ok: false, code: frame.code, message: frame.message });
       }
     }
+  }
+
+  /** Issues one `describe` frame on `socket` and resolves with its reply.
+   *
+   * Rejects on timeout, and on takeover — if `socket` is no longer the active
+   * one, a superseding tab's drill now owns `pendingDescribe`, and answering
+   * a dead drill would let the two interleave and cross-assign each other's
+   * replies (they are matched only by order). */
+  function describeOnce(socket: WebSocket): DescribeFn {
+    return (selector?: string) =>
+      new Promise<DescribeResultPayload>((resolve, reject) => {
+        if (activeSocket !== socket || socket.readyState !== WebSocket.OPEN) {
+          reject(new Error('figpea-mcp bridgeServer: tab disconnected before describe completed'));
+          return;
+        }
+
+        const timer = setTimeout(() => {
+          if (pendingDescribe === settle) pendingDescribe = undefined;
+          reject(
+            new Error(
+              `figpea-mcp bridgeServer: describe(${selector ?? ''}) timed out after ${DESCRIBE_TIMEOUT_MS}ms`,
+            ),
+          );
+        }, DESCRIBE_TIMEOUT_MS);
+
+        const settle = (payload: DescribeResultPayload): void => {
+          clearTimeout(timer);
+          resolve(payload);
+        };
+
+        pendingDescribe = settle;
+        // `selector` is omitted entirely for the bare index call, keeping
+        // that frame byte-identical to the pre-REQ-181 one.
+        const frame: DescribeFrame = selector === undefined ? { type: 'describe' } : { type: 'describe', selector };
+        sendFrame(socket, frame);
+      });
+  }
+
+  /** Drills the connected tab's full manifest and publishes it to
+   * `onDescribe` subscribers exactly once per connect (REQ-188). */
+  async function runDescribeDrill(socket: WebSocket): Promise<void> {
+    const manifest = await drillManifest(describeOnce(socket), (message) => console.error(message));
+
+    // A tab that was superseded mid-drill must not publish its stale result
+    // over the newer tab's.
+    if (activeSocket !== socket) return;
+    if (manifest === undefined) return;
+
+    for (const handler of describeHandlers) handler(manifest);
   }
 
   wss.on('connection', (socket: WebSocket) => {
@@ -175,8 +247,7 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
       activeSocket = socket;
 
       socket.on('message', handleTabFrame);
-      const describeRequest: DescribeFrame = { type: 'describe' };
-      sendFrame(socket, describeRequest);
+      void runDescribeDrill(socket);
     };
 
     socket.on('message', onHelloFrame);
