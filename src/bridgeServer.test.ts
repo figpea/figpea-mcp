@@ -239,3 +239,141 @@ describe('startBridgeServer — single active session, newest-wins takeover (pla
     expect(ws1GotCall).toBe(false);
   });
 });
+
+/**
+ * REQ-188 — the bridge drives the progressive `describe()` drill (AC-1, AC-2,
+ * AC-3). Sequencing itself is unit-tested in `describeDrill.test.ts`; these
+ * tests pin the WIRE behavior and the `onDescribe` contract, driven with a
+ * real `ws` client standing in for an editor tab.
+ */
+
+/** A compact index as contract >=0.16.0's bare `describe()` returns it. */
+const DRILL_INDEX = {
+  version: '1.8.0',
+  session: { openFile: 'Opens a design file.' },
+  layer: { create: 'Creates a layer.' },
+  errorCodes: ['no_session'],
+};
+
+const DRILL_GROUPS: Record<string, unknown> = {
+  session: { openFile: { doc: 'Opens a design file.', params: { url: { kind: 'string' } }, result: 'void' } },
+  layer: { create: { doc: 'Creates a layer.', params: { kind: { kind: 'string' } }, result: 'string' } },
+};
+
+/** Makes `ws` answer describe frames like a real tab: bare -> compact index,
+ * `selector` -> that group's full descriptors. Selectors listed in `missing`
+ * reply with the `manifest` key ABSENT (never null) -- exactly how an
+ * unresolved selector serializes v3-side. Returns the selectors seen, in
+ * order. */
+function serveDrill(ws: WebSocket, missing: string[] = []): Array<string | undefined> {
+  const seen: Array<string | undefined> = [];
+  ws.on('message', (data: WebSocket.RawData) => {
+    let frame: any;
+    try {
+      frame = JSON.parse(data.toString());
+    } catch {
+      return;
+    }
+    if (frame?.type !== 'describe') return;
+    seen.push(frame.selector);
+
+    if (frame.selector === undefined) {
+      ws.send(JSON.stringify({ type: 'describe_result', manifest: DRILL_INDEX, version: '1.8.0' }));
+      return;
+    }
+    if (missing.includes(frame.selector)) {
+      // No `manifest` key at all -- JSON.stringify drops an undefined value.
+      ws.send(JSON.stringify({ type: 'describe_result', version: '1.8.0' }));
+      return;
+    }
+    ws.send(JSON.stringify({ type: 'describe_result', manifest: DRILL_GROUPS[frame.selector], version: '1.8.0' }));
+  });
+  return seen;
+}
+
+async function connectDrillingTab(bridge: BridgeServerHandle, missing: string[] = []) {
+  const ws = new WebSocket(`ws://127.0.0.1:${bridge.port}`);
+  openSockets.push(ws);
+  await waitForOpen(ws);
+  const seen = serveDrill(ws, missing);
+  ws.send(JSON.stringify({ type: 'hello', token: bridge.token }));
+  return { ws, seen };
+}
+
+describe('startBridgeServer — progressive describe drilling (REQ-188)', () => {
+  it('sends a bare describe first, then one per group carrying a selector (AC-2)', async () => {
+    const bridge = trackHandle(await startBridgeServer());
+    const { seen } = await connectDrillingTab(bridge);
+
+    await expect.poll(() => seen.length, { timeout: 3000 }).toBe(3);
+    expect(seen[0]).toBeUndefined();
+    expect(seen.slice(1).sort()).toEqual(['layer', 'session']);
+  });
+
+  it('never drills the reserved errorCodes or version keys (AC-2)', async () => {
+    const bridge = trackHandle(await startBridgeServer());
+    const { seen } = await connectDrillingTab(bridge);
+
+    await expect.poll(() => seen.length, { timeout: 3000 }).toBe(3);
+    expect(seen).not.toContain('errorCodes');
+    expect(seen).not.toContain('version');
+  });
+
+  it('fires onDescribe ONCE with the reassembled full manifest (AC-1)', async () => {
+    const bridge = trackHandle(await startBridgeServer());
+    const received: unknown[] = [];
+    bridge.onDescribe((manifest) => received.push(manifest));
+
+    await connectDrillingTab(bridge);
+
+    await expect.poll(() => received.length, { timeout: 3000 }).toBe(1);
+    // The full descriptors, not the compact index's doc strings -- and none
+    // of the reserved keys, which downstream would read as groups.
+    expect(received[0]).toEqual(DRILL_GROUPS);
+  });
+
+  it('still reports the contract version from the drilled frames', async () => {
+    const bridge = trackHandle(await startBridgeServer());
+    await connectDrillingTab(bridge);
+
+    await expect.poll(() => bridge.getContractVersion(), { timeout: 3000 }).toBe('1.8.0');
+  });
+
+  it('skips a group whose reply omits the manifest key, keeping the rest (AC-3)', async () => {
+    const bridge = trackHandle(await startBridgeServer());
+    const received: any[] = [];
+    bridge.onDescribe((manifest) => received.push(manifest));
+
+    await connectDrillingTab(bridge, ['layer']);
+
+    await expect.poll(() => received.length, { timeout: 3000 }).toBe(1);
+    expect(Object.keys(received[0])).toEqual(['session']);
+    expect(received[0]).not.toHaveProperty('layer');
+  });
+
+  it('re-drills on reconnect so a new tab refreshes the manifest', async () => {
+    const bridge = trackHandle(await startBridgeServer());
+    const received: unknown[] = [];
+    bridge.onDescribe((manifest) => received.push(manifest));
+
+    await connectDrillingTab(bridge);
+    await expect.poll(() => received.length, { timeout: 3000 }).toBe(1);
+
+    await connectDrillingTab(bridge);
+    await expect.poll(() => received.length, { timeout: 3000 }).toBe(2);
+    expect(received[1]).toEqual(DRILL_GROUPS);
+  });
+
+  it('does not hang forever when a tab answers hello but never answers describe', async () => {
+    const bridge = trackHandle(await startBridgeServer());
+    const ws = new WebSocket(`ws://127.0.0.1:${bridge.port}`);
+    openSockets.push(ws);
+    await waitForOpen(ws);
+    ws.send(JSON.stringify({ type: 'hello', token: bridge.token }));
+
+    // The tab is connected; the drill is stalled. The bridge must stay
+    // usable rather than wedging on an unresolved describe promise.
+    await expect.poll(() => bridge.isTabConnected(), { timeout: 3000 }).toBe(true);
+    await expect(bridge.callTab('session', 'ping', [], 300)).rejects.toThrow(/timed out/);
+  });
+});
