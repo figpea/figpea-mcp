@@ -1,0 +1,550 @@
+{
+  "capturedFrom": "https://editor.figpea.com/?agent=1",
+  "contractVersion": "1.8.0",
+  "compactIndex": {
+    "version": "1.8.0",
+    "session": {
+      "newProject": "Creates a new, empty design project and makes it the active session.",
+      "openFile": "Opens a design file into the active session — either by URL (the REQ-016 loader seam) or raw bytes (Uint8Array, ArrayBuffer, or number[]). Accepts 'name' as an alias for 'fileName'. Fails fast within 1s returning { ok: false, code } on invalid parameters or decode failures without hanging.",
+      "layerTree": "Returns the curated, JSON-serializable layer tree from the active project's root.",
+      "layerById": "Returns the curated, JSON-serializable node for a single layer, looked up by id.",
+      "find": "Queries the layer tree by attribute, returning matching curated nodes in document order. Selector fields are all optional and AND-combined. Empty/omitted selector matches every node (returns the flattened tree).",
+      "getSelection": "Returns the ids of the layer(s) currently selected in the active session.",
+      "setSelection": "Sets the active session's current selection to the given layer ids (single or multiple).",
+      "waitForIdle": "Waits for the active design session to become idle -- both the layer model populated AND a settled render frame drawn. Bounded by a timeout (default 10s); resolves promptly when already idle. Safe to call repeatedly; resolves with err('timeout') on deadline elapse, never rejects or hangs."
+    },
+    "layer": {
+      "create": "Creates a new layer of the given kind and attaches it under parentId (or the project root if omitted). If style.fill is set with no explicit style.fillType, fillType is implied to be \"solid\" so the shape actually paints. Props that don't apply to the requested kind are rejected with invalid_transform and nothing is created — the applicable set is this method's params.props.shape merged with params.props.byKind[kind]. Pages are auto-placed clear of existing pages when no explicit transform is given (the editor's own add-page tool is a manual drag action with no fixed placement rule of its own to match — this auto-placement rule exists only for this agent-API path today); pass an explicit transform to override it. Placement: create() specifies a layer's extent only; to place the layer in the document, use setPosition(id, {x, y}) to set its position. E.g. const rect = create('rect', {parentId, rwidth: 100, rheight: 50}); then setPosition(rect.id, {x: 10, y: 20}) places the rect at (10,20) with width 100 and height 50.",
+      "move": "Pans a layer by a local delta (dx, dy).",
+      "setPosition": "Places a layer's visible box: the layer's bounds top-left — the same `bounds` that `layerById`/`layerTree` report — lands exactly on `{x,y}`, in the same world coordinates, for every layer kind. Idempotent: repeating the same call does not move the layer and records no history step. The absolute counterpart to `move`'s relative delta.",
+      "setTransform": "Sets a layer's full affine transform matrix [a,b,c,d,e,f] — the same basis layerTree()/layerById() report, so write and read share one representation (exact round-trip).",
+      "resize": "Resizes a layer to an absolute local target size.",
+      "rotate": "Rotates a layer by a relative delta in degrees, pivoting about the centre of its visible box (its `bounds`), so the layer spins in place — its bounds centre is unchanged by the rotation.",
+      "flipX": "Flips a layer horizontally in place. One undo step: a single figpea.history.undo() fully reverses the flip (REQ-323 — previously the whole flip batch was silently dropped from history by a batchSet contract bug, genuinely NOT undoable; now measured captured via the agent-API facade, req-323-flip-undo-contract.test.ts).",
+      "flipY": "Flips a layer vertically in place. One undo step: a single figpea.history.undo() fully reverses the flip (REQ-323 — same fix as flipX above).",
+      "stylePatch": "Patches a layer's style with an explicit whitelist of public keys — any other key is rejected (OQ-7). If fill is patched with no explicit fillType, fillType is implied to be \"solid\" so the fill actually paints; an explicit fillType in the same patch always wins.",
+      "setImageFill": "Attaches an image fill (from url or bytes) to an EXISTING layer, choosing the fit/tile mode (patternScaleType/patternRepeat) in the same call. Validates the source and mode BEFORE mutating — on any failure (invalid_style_value for an out-of-enum mode, invalid_image_source for a bad url/bytes) the layer's existing fill is left completely unchanged. Read-back exposes fillType:\"pattern\" plus the mode enums, never the raster.",
+      "setText": "Replaces a text layer's full text content.",
+      "setVisible": "Sets a layer's visibility.",
+      "delete": "Deletes a layer from its parent.",
+      "group": "Groups the given layer ids into a new folder layer, at the position of the first id.",
+      "ungroup": "Ungroups a folder layer, promoting its children to its own parent.",
+      "duplicate": "Duplicates a layer — or a whole page — with its entire subtree (fresh ids, structure preserved), inserted as the adjacent sibling in front of the original, and returns the new layer's id. One undo step; a duplicated component instance stays linked to its original master; interactions on the duplicate are copied with fresh ids but still point at the ORIGINAL targets — re-point them with figpea.interaction.remove + create.",
+      "reorder": "Moves a layer to a sibling position relative to a target layer (before/on/after).",
+      "reparent": "Moves a layer into a new parent's children, at an optional index (defaults to appending at the end).",
+      "clip": "Removes a layer from its parent's children and turns it into the clip mask for the sibling directly above it (or the parent itself, if it was the first child).",
+      "unclip": "Removes a layer's clip mask and restores the mask layer as a visible sibling again.",
+      "setMask": "Declares a layer to be a mask, and how it masks: 'alpha' carves the masked content with the mask's own alpha, 'vector' clips the masked content to the mask's geometry. The id is the MASK layer's own id (unlike unclip, which takes the host that owns the clip slot). Masking type is declared, never guessed from the shape or fill. A layer declared a mask covers the siblings in front of it up to the next mask or its parent's boundary, plus, when it sits in another layer's clip slot, that host and its subtree. Calling it again with the same type is a no-op. Returns invalid_mask_type if the type is outside the enum.",
+      "clearMask": "Removes a layer's mask declaration — it stops being a mask and whatever it covered renders unmasked. Cleared means unset, not a 'none' value: the layer reports no mask at all afterwards. Clearing a layer that is not a mask is a no-op. This is the inverse of setMask, and is unrelated to unclip (which empties a host's clip slot rather than un-declaring a mask).",
+      "setConstraints": "Sets a layer's per-child constraint axes (when its parent is in constraint mode, this layer will reflow on parent resize). The patch merges against the layer's current/default constraints, so a partial {horizontal?} or {vertical?} call preserves the other axis untouched. A patch that changes nothing is a no-op (no history entry). Returns invalid_constraint if an axis value is outside its enum.",
+      "setResizeMode": "Sets a container's (page or group/folder) resize mode, controlling how its children reflow when the container is resized. Putting a group in viewport or constraint mode gives it a fixed frame, and that frame clips anything outside it; content mode restores hug-to-contents. A page's Clip Content checkbox is independent and untouched by this method. Returns invalid_constraint if the mode value is outside the enum, if 'content' mode is applied to a page, or if the target is neither a page nor a folder.",
+      "batch": "Applies a sequence of layer ops as ONE undo step, all-or-nothing: on any op failure the whole batch is rolled back and the result reports the failing op's code.",
+      "select": "Sets the active session's current selection to the given layer id(s), rendering the transform widget for them (REQ-100). Accepts a single id, or the multi-select `string[]` form (an array of ids).",
+      "placeProjectImage": "Places an image that is ALREADY in the project -- identified by the sha256 content hash figpea.report.projectImages() reports -- onto the canvas as a new rect layer: sized to the image's intrinsic pixel dimensions, fillType 'pattern' with patternScaleType 'cover', appended to the selected page/layer's page (a selected non-page layer resolves to its page; a selected page resolves to itself; selection wins over viewport centre), or to the project root at the viewport centre when nothing is selected (or when selection has no shared page); positioned at the viewport centre when that point lies on the target page, or otherwise at the centre of the page's on-screen region (or the page's own centre if off-screen). Correct parenting is always guaranteed; visibility is guaranteed when the placement point lies in the viewport (nothing-selected at viewport centre is always visible; a selected off-screen page is parented correctly but may require panning). The camera never moves. Selected on creation. ONE undo step. Reuses the library's existing image instance rather than decoding a second copy. Returns not_found for an unknown hash or when no session is active. The Assets panel's other action, the local 'Add image...' disk picker, intentionally has NO agent surface: it opens the browser's native file chooser, which is not automatable from in-page script, and layer.setImageFill(id, {bytes|url}) / layer.create('image', ...) already cover bringing new bytes in."
+    },
+    "history": {
+      "undo": "Reverts the most recent undo step on the active design session's history (shared with the UI's undo/redo — one figpea.layer.* API call is exactly one step).",
+      "redo": "Re-applies the most recently undone step on the active design session's history."
+    },
+    "export": {
+      "layer": "Exports a single layer as a raster image (png/jpeg/webp) or SVG. Crops tightly to the layer's bounding box and omits outer drop shadows and background transparency padding outside the layer bounds (use export.artboard for full-canvas RGBA with drop shadows intact). Honors hasClaim('extract.scale') for scale!=1 and hasClaim('extract.svg') for svg exactly as the UI does, with no free-grace allowance (OQ-A) — returns {ok:false, code:'entitlement_required'} instead of the UI's upgrade modal when blocked.",
+      "artboard": "Exports an artboard (a page/folder layer, addressed like any other layer id) as a raster image or SVG — includes page-level drop shadows and full-canvas RGBA alpha channels (especially on unpainted artboards with fillType: 'none'), unlike export.layer which crops tightly to layer bounds. Same operation and gating as figpea.export.layer.",
+      "project": "Exports the whole active project as PDF, ZIP (per-layer rasters), or the native Figpea format. Honors hasClaim('export.pdf')/hasClaim('export.zip') exactly as the UI does (the Figpea-native format is ungated); returns {ok:false, code:'entitlement_required'} instead of the UI's upgrade modal when blocked.",
+      "specBundle": "Exports a self-contained, offline developer-handoff spec bundle (one HTML string, zero external references — opens from file:// with no network requests) covering every artboard's inspectable elements (position, size, fills, typography, copyable CSS). Honors hasClaim('export.zip') exactly as the UI's Spec Bundle export does; returns {ok:false, code:'entitlement_required'} instead of the UI's upgrade modal when blocked. Returns the HTML text directly — never triggers a download.",
+      "tokens": "Exports the active project's design tokens — distinct fill colors and text styles — as CSS custom properties + a documented JSON subset, with deterministic, stable naming across consecutive exports. Honors hasClaim('export.zip') exactly as the UI's Design Tokens export does; returns {ok:false, code:'entitlement_required'} instead of the UI's upgrade modal when blocked. Returns the css/json text directly — never triggers a download.",
+      "originals": "REQ-046 — recovers every distinct (by content hash) original embedded image as a ZIP, returned as base64 bytes (no download triggered). Honors hasClaim('export.zip') exactly as SessionCtrl.projectExport's Originals branch does; returns {ok:false, code:'entitlement_required'} instead of the UI's upgrade modal when blocked.",
+      "assetHarvest": "REQ-048 — harvests every detected asset (embedded images + icon-sized vector groups) from the active project as a preset-formatted ZIP (Web/iOS/Android with platform scales and naming), returned as base64 bytes (no download triggered). Honors hasClaim('export.zip') exactly as SessionCtrl.projectExport's AssetHarvest branch does; returns {ok:false, code:'entitlement_required'} instead of the UI's upgrade modal when blocked. The agent-API call exports all detected assets (no per-asset selection — selection is a UI affordance). Preset defaults to 'web' if omitted.",
+      "figmaKit": "REQ-047 — assembles the Figma Migration Kit: a per-artboard Figma-tuned SVG for every top-level artboard (text stays editable, named layers/groups keep their names), assets/ (original embedded images byte-for-byte plus @1x/@2x reference renders), fonts.md, copy-deck.md, and README.md, all in one ZIP, returned as base64 bytes (no download triggered). Honors hasClaim('export.zip') exactly as SessionCtrl.projectExport's FigmaKit branch does; returns {ok:false, code:'entitlement_required'} instead of the UI's upgrade modal when blocked.",
+      "contactSheet": "Exports the whole active project's contact-sheet PDF — a cover page (project name, stats, font manifest) composed from the same report data figpea.report.summary() returns, plus one titled page per artboard in document order. Honors hasClaim('export.pdf') exactly as the UI's Contact Sheet export does; returns {ok:false, code:'entitlement_required'} instead of the UI's upgrade modal when blocked. Returns the PDF as base64 bytes — never triggers a download.",
+      "flowPoster": "Exports the project's prototype flow poster — one node per artboard (thumbnail + name), one edge per parsed prototype transition — as SVG (default) or a PNG/PDF render of that same SVG. Honors hasClaim('export.pdf') exactly as the UI's Flow Poster export does (the poster is the same document-render class as the contact sheet, OQ-3); returns {ok:false, code:'entitlement_required'} instead of the UI's upgrade modal when blocked. Returns the artifact as base64 bytes — never triggers a download. The single-source-of-truth generator also feeds the FREE, ungated in-report preview (figpea.report.summary() does not include it; the preview lives in the Project Report UI only)."
+    },
+    "canvas": {
+      "screenshot": "Captures the live canvas as a PNG screenshot -- a visual-feedback aid for the agent, deliberately NOT routed through the entitled export.* encoder path, so it is ungated. With options.id, captures that layer/page/artboard's on-canvas region; omitted, captures the current page/artboard when the active project has exactly one distinct page, otherwise falls back to the whole visible stage.",
+      "fit": "Pans/zooms the editor camera so the given layer/page/artboard (or the whole design when id is omitted) is framed within the visible viewport, centered with ~10% padding -- mirrors the UI's own zoom-to-fit. Convenience built on setViewport. A degenerate/zero-area target (e.g. an empty project) is a no-op that returns the current viewport.",
+      "getViewport": "Reads the current editor camera as a world-space visible rectangle {x,y,width,height,zoom} -- (x,y) is the world coordinate at the DOM viewport's top-left corner, sharing the same world basis as layerTree()/layerById()'s bounds.",
+      "setViewport": "Sets the editor camera deterministically from a world-space {x,y,zoom} -- the exact inverse of getViewport()'s basis, so setViewport(v) then getViewport() round-trips v. Returns the resulting viewport (including the derived width/height).",
+      "widgetGeometry": "Returns the current on-screen (client/viewport) coordinates of the selected layer's transform-widget interaction points (8 resize handles + rotate handle + body-move region) and its on-canvas rect corners (REQ-100). Reads the rendered widget's own DOM, so points match exactly where each handle renders. err('not_found') when there is no active session or no rendered transform widget for the current selection.",
+      "layerRect": "Returns the world-space bounding box (AABB) of an arbitrary layer, selected or not -- a pure model-level geometry read using the same calcBounds() basis as layerTree(), fit(), and other reads. Selection-preserving by construction. Hidden or zero-area layers resolve ok with their rect -- visibility is a separate axis, never a throw. err('not_found') for an unknown id or no active session.",
+      "gradientWidgetGeometry": "Returns the current on-screen (client/viewport) coordinates of the gradient overlay widget's rendered handles and color-stop anchors (REQ-309). Reads the rendered widget's own DOM, so points match exactly where each handle renders. err('not_found') when there is no active session, the gradient widget is not active, or the selected layer has no gradient fill."
+    },
+    "report": {
+      "summary": "Builds the project health report for the active session: artboard names, component count, font manifest (with missing-locally + Google Fonts match flags), interaction count, distinct-by-content-hash image count/total bytes, and text stats. FREE -- no entitlement gating.",
+      "copyDeck": "Builds the copy deck for the active session: every non-empty text-layer string grouped by top-level artboard, as both Markdown and CSV. FREE -- no entitlement gating.",
+      "fonts": "Returns just the font manifest (name, missing-locally flag, Google Fonts match) from the project health report -- a convenience projection of summary().fonts. FREE -- no entitlement gating.",
+      "diagnostics": "Soft decode/render diagnostics for the active project since its last open. FREE -- no entitlement gating. Wired sources: font manifest across every format; SVG <use>/<image>/<pattern> decode signals; XD unsupported shape/element/gradient/fill + missing-font signals + missing gradient reference + unloadable pattern fill + unreadable prototype interaction signals; PSD per-layer decode failure; .fig unregistered node type, style/convert failures, instance post-processing, STRETCH image paint missing dimensions, unknown boolean combine modes, and mask post-processing failures. Code set: font_missing_local (a font family used in the project is not available in the local library), unsupported_node (SVG/XD/.fig: a source node/reference or shape that could not be fully realized -- e.g. a broken or cyclic SVG <use>, an unsupported <image> href, an XD unsupported element, an XD missing gradient reference, or a .fig node type Figpea doesn't yet convert -- and was dropped, or on .fig kept as an empty placeholder group), rasterized_fallback (SVG, XD and .fig: a vector construct that could not be reproduced faithfully was replaced with a simpler approximation -- currently an unresolvable SVG <pattern> falling back to a solid fill, or an XD pattern image that couldn't load falling back to flat grey, or a .fig STRETCH image fill missing its original dimensions), layer_decode_failed (PSD and .fig: a layer whose decode or post-processing threw during import -- dropped entirely on PSD, kept as an empty placeholder group or degraded folder on .fig -- content loss), interaction_lost (XD: a prototype interaction in the source file that couldn't be read and isn't imported). Severity meaning: 'error' = content loss (a layer that couldn't decode, or a prototype interaction that couldn't be read), 'warning' = approximated or substituted (structure preserved). More diagnostics on a format means more of its degradation paths are wired to report, not that it renders worse. Coverage reflects wiring order, not fidelity. Extensible and non-exhaustive -- grows per format over time. PDF stays unwired for a channel reason, not a fidelity one: the PDF decoder emits no decode warnings at all.",
+      "projectImages": "Returns the active project's derived image library: one entry per DISTINCT image (content-hash deduplicated) that the project uses as a layer fill, each carrying its sha256 content hash, name, MIME type, byte size, intrinsic pixel width/height, and the ids of every layer using it (usedBy). FREE -- no entitlement gating (browsing your own project is free-tier editing, not export). This is the same derived library the editor's Assets panel shows, so the same scope rules apply: it lists images that are IN USE (there is no unplaced-asset state), it walks project.layers AND project.components (an image used only inside a component master is listed), and it includes per-text-run pattern fills. PSD raster layers and masks are NOT listed -- they decode to ImageData, not an image blob, a pre-existing gap shared with the Originals/asset-harvest exports; an empty result therefore means 'no blob-backed image fills found by this version', never 'this file contains no images'. Ordering is by content hash ascending (stable across runs). Pass a returned hash to figpea.layer.placeProjectImage(hash) to put that image on the canvas."
+    },
+    "interaction": {
+      "create": "Authors an interaction on a layer: one of four triggers (tap, time, keys-gamepad, hover) driving one of six actions (navigate — an alias for artboard-transition —, artboard-transition, auto-animate, overlay-transition, previous-artboard, scroll-transition, hyperlink), each with its own targetId rule (navigate/artboard-transition/auto-animate/overlay-transition require a page targetId; previous-artboard/hyperlink forbid targetId; scroll-transition's targetId is optional and, when given, any layer in the owner's own page; hyperlink also requires properties.hyperlinkUrl). state-transition is NOT supported here — it needs component/state context, author it via figpea.component.* instead. Returns the created interaction's id. Validation runs before any mutation; invalid inputs leave the layer unchanged (AC-4). One undo step.",
+      "list": "Lists all interactions on a layer, mapping model vocabulary to the public shape. Authored interactions (via create) round-trip byte-identically; imported interactions from a design file map `artboard-transition → navigate` and pass other model action tokens through read-only (for count reconciliation with report.summary().interactionCount). properties whitelists 12 keys: duration, easing, transition, delay, overlayPosition, hyperlinkUrl, yOffset, keysGamepad, keysGamepadDevice, preserveScrollPosition, destinationType, voiceLocale. Returns empty array for layers with no interactions.",
+      "remove": "Removes an interaction from its owner layer by id. Walks the active project to find the owner. One undo step."
+    },
+    "component": {
+      "create": "Converts a plain layer to a component and registers it in the project's component library. All mutations route through the shared facade (facade.layer.component.create). Selects the newly-created component. One undo step: a single figpea.history.undo() fully reverses the whole conversion — com/states are cleared and the layer is deregistered from the component library; figpea.history.redo() re-applies it (measured — REQ-322, req-322-convert-to-component-undo.test.ts).",
+      "placeInstance": "Creates an instance of a component and adds it to the main component's own page, offset from the component so the two do not overlap. All mutations route through the shared facade (facade.layer.component.placeInstance). Selects the newly-created instance. NOT undoable via the app's undo stack — adding the instance is a repo-level layer mutation, the same deliberate history exclusion as create's above (REQ-197 plan Q-B/OQ-1; REQ-211 fix).",
+      "addState": "Adds a new state to a component and makes it the active state. All mutations route through the shared facade (facade.layer.component.addState). Returns the newly-created state. NOT undoable via the app's undo stack — creating the state is a repo-level layer mutation, the same deliberate history exclusion as create's above (REQ-197 plan Q-B/OQ-1; REQ-211 fix).",
+      "setActiveState": "Switches a component's active state by id, or clears it to Base (undefined). All mutations route through the shared facade (facade.layer.component.switchState). Omit or pass undefined for stateId to switch to Base. One undo step for ANY state transition, named-to-named or to/from Base: a single figpea.history.undo() reverses the switch (REQ-323 fix — the app's history guard is now change-based rather than truthy-based, so the prior 'a switch to/from Base is NOT captured' limitation, REQ-211, no longer holds; measured — req-323-capture-matrix.test.ts row B).",
+      "getStates": "Reads back the states of a component, including their names and active status. Synchronous read operation — no mutations. Returns an object with a `states` array (id, name, active flag) and an `activeStateId` field.",
+      "getChildOverrides": "Reconcile-and-read: recomputes which override groups ('transform'/'fill'/'text'/'visibility') childId currently diverges from its enclosing instance's master, syncing the instance's record as a side effect (so imported/decoded divergence becomes legible on read, not just authored divergence). All work routes through the shared facade (facade.layer.component.getChildOverrides). A layer with no enclosing instance (plain layer, master child, or the instance root itself) is NOT an error — returns ok({instanceId: undefined, groups: []}). Synchronous read. err('not_found') for an unknown childId.",
+      "getOverrides": "Full read of one instance's Overrides block: every child with a currently-recorded overridden-groups entry, plus every removed child resolved via its recorded base id (a stale id whose master child no longer resolves is pruned silently here, never thrown or fabricated). Routes through the shared facade (facade.layer.component.getInstanceOverrides). Synchronous read — no mutations. err('not_found') for an unknown instanceId.",
+      "resetOverride": "Clears one overridden group on a child (the reset gesture): its own value for that group's keys is removed (a bridged child falls back to tracking the master live) or copied from the master's current value (a syncMap-only/XD child, which has no bridge to fall back to). Other overridden groups on the same child (e.g. a deliberate stroke change alongside a reset fill) are left untouched. Routes through the shared facade (facade.layer.component.resetChildOverride). A childId with no enclosing instance, or a group that isn't one of the four recognized names, is a safe no-op — ok(undefined), no mutation, never a thrown error. err('not_found') for an unknown childId. One undo step, faithfully reversible in both directions — including the style-group case, which restores the exact prior own-style record without disturbing a sibling group's own delta (REQ-323 fix: the app's history guard is now change-based rather than truthy-based, and the style-group reset now emits the real post-delete own record instead of a whole-style wipe; previously NOT reliably undoable, measured — req-206-undo-characterization.test.ts op 2, expectation updated not deleted).",
+      "resetAllOverrides": "\"Reset all changes\" on an instance: clears every overridden group plus the other inspector-editable style keys (opacity/blendMode/stroke/effects) on every descendant with a resolvable master child, and restores every removed child — returns the whole instance to the component over an enumerable key set, never a blanket wipe (a literal wipe would blank an imported XD-baked child, whose content IS own data). Bounded to one instance's subtree — the instance root's own edits are placement-level and untouched. Routes through the shared facade (facade.layer.component.resetAllOverrides). err('not_found') for an unknown instanceId. Undo (measured — req-206-undo-characterization.test.ts op 5): the whole operation is wrapped in one beginBatch/endBatch, so it lands ONE undo step whenever the instance has at least one overridden group to clear OR at least one removed child to restore (both kinds of change are now captured; REQ-323 fix). Zero undo steps only when there is genuinely nothing to reset — previously an instance with ONLY overridden groups and no removed children landed ZERO undo steps (group-clears were dropped by the old truthy guard); that gap is now closed.",
+      "removeChild": "Removes a child from its enclosing instance only (the master and every sibling instance are untouched) — records the child's base id in the instance's removedChildIds so it can be restored later via restoreChild. A no-op if childId has no enclosing instance. Routes through the shared facade (facade.layer.component.removeChildOnInstance). err('not_found') for an unknown childId. One undo step (measured — req-206-undo-characterization.test.ts op 3): removal rides the 'children' mutation channel, which the app's history stack DOES capture (a children array is always truthy, even empty).",
+      "restoreChild": "Restores a previously-removed child on an instance by its recorded base id: re-instances it from the master child at the master's child-order index (restore always re-instances — it never re-attaches the original detached child, which would not survive a project serialize/restore round-trip). Routes through the shared facade (facade.layer.component.restoreChildOnInstance). err('not_found') for an unknown instanceId, or when baseChildId doesn't resolve to a restorable master child (nothing to restore). One undo step (measured — req-206-undo-characterization.test.ts op 4): restoring also rides the undoable 'children' mutation channel.",
+      "removeState": "Removes a state variant from a component by id. All mutations route through the shared facade (facade.layer.component.removeState). If removing the active state, active state falls back to Base (undefined). err('not_found') for an unknown componentId or stateId; err('unsupported_op') if targeting an instance layer (instances do not own states). NOT undoable via the app's undo stack — state removal is a repo-level layer deletion, the same deliberate history exclusion as addState/placeInstance.",
+      "renameState": "Renames an existing state variant on a component. All mutations route through the shared facade (facade.layer.component.renameState). err('not_found') for an unknown componentId or stateId; err('unsupported_op') if targeting an instance layer. One undo step: a single figpea.history.undo() fully reverses the rename (measured — property mutation on the state layer via BaseMutator)."
+    },
+    "errorCodes": [
+      "not_found",
+      "unsupported_style_key",
+      "entitlement_required",
+      "unsupported_kind",
+      "not_flippable",
+      "not_a_text_layer",
+      "not_a_group",
+      "group_failed",
+      "open_failed",
+      "export_failed",
+      "invalid_format",
+      "invalid_position",
+      "invalid_transform",
+      "unsupported_op",
+      "timeout",
+      "invalid_style_value",
+      "invalid_image_source",
+      "invalid_selector",
+      "invalid_interaction",
+      "invalid_constraint",
+      "not_duplicable",
+      "invalid_mask_type",
+      "invalid_params"
+    ]
+  },
+  "stylePatchDrilled": {
+    "doc": "Patches a layer's style with an explicit whitelist of public keys — any other key is rejected (OQ-7). If fill is patched with no explicit fillType, fillType is implied to be \"solid\" so the fill actually paints; an explicit fillType in the same patch always wins.",
+    "params": {
+      "id": {
+        "type": "string",
+        "required": true
+      },
+      "patch": {
+        "type": "object",
+        "required": true,
+        "shape": {
+          "fill": {
+            "type": "string",
+            "required": false
+          },
+          "fillType": {
+            "type": "string",
+            "required": false,
+            "enum": [
+              "none",
+              "gradient",
+              "pattern",
+              "solid"
+            ]
+          },
+          "strokeEnabled": {
+            "type": "boolean",
+            "required": false
+          },
+          "strokeColor": {
+            "type": "string",
+            "required": false
+          },
+          "strokeWidth": {
+            "type": "number",
+            "required": false
+          },
+          "opacity": {
+            "type": "number",
+            "required": false
+          },
+          "cornerRadius": {
+            "type": "number",
+            "required": false
+          },
+          "fontFamily": {
+            "type": "string",
+            "required": false
+          },
+          "fontSize": {
+            "type": "number",
+            "required": false
+          },
+          "fontWeight": {
+            "type": "string",
+            "required": false,
+            "enum": [
+              "100",
+              "200",
+              "300",
+              "normal",
+              "500",
+              "600",
+              "bold",
+              "800",
+              "900"
+            ]
+          },
+          "fontItalic": {
+            "type": "boolean",
+            "required": false
+          },
+          "align": {
+            "type": "string",
+            "required": false,
+            "enum": [
+              "left",
+              "center",
+              "right"
+            ]
+          },
+          "patternScaleType": {
+            "type": "string",
+            "required": false,
+            "enum": [
+              "fill",
+              "cover",
+              "free",
+              "fit"
+            ]
+          },
+          "patternRepeat": {
+            "type": "string",
+            "required": false,
+            "enum": [
+              "no-repeat",
+              "repeat",
+              "repeat-x",
+              "repeat-y"
+            ]
+          },
+          "gradient": {
+            "type": "object",
+            "required": false,
+            "shape": {
+              "type": {
+                "type": "string",
+                "required": true,
+                "enum": [
+                  "linear",
+                  "radial",
+                  "conic"
+                ]
+              },
+              "stops": {
+                "type": "array",
+                "required": true,
+                "of": {
+                  "type": "object",
+                  "required": true,
+                  "shape": {
+                    "offset": {
+                      "type": "number",
+                      "required": true
+                    },
+                    "color": {
+                      "type": "string",
+                      "required": true
+                    }
+                  }
+                }
+              },
+              "linearX1": {
+                "type": "number",
+                "required": false
+              },
+              "linearX2": {
+                "type": "number",
+                "required": false
+              },
+              "linearY1": {
+                "type": "number",
+                "required": false
+              },
+              "linearY2": {
+                "type": "number",
+                "required": false
+              },
+              "innerCircleX": {
+                "type": "number",
+                "required": false
+              },
+              "innerCircleY": {
+                "type": "number",
+                "required": false
+              },
+              "innerCircleR": {
+                "type": "number",
+                "required": false
+              },
+              "outterCircleX": {
+                "type": "number",
+                "required": false
+              },
+              "outterCircleY": {
+                "type": "number",
+                "required": false
+              },
+              "outterCircleR": {
+                "type": "number",
+                "required": false
+              },
+              "startAngle": {
+                "type": "number",
+                "required": false
+              },
+              "centerX": {
+                "type": "number",
+                "required": false
+              },
+              "centerY": {
+                "type": "number",
+                "required": false
+              },
+              "transform": {
+                "type": "matrix",
+                "required": false
+              }
+            }
+          },
+          "case": {
+            "type": "string",
+            "required": false,
+            "enum": [
+              "upper",
+              "lower",
+              "title"
+            ]
+          },
+          "strokePosition": {
+            "type": "string",
+            "required": false,
+            "enum": [
+              "outside",
+              "inside",
+              "center"
+            ]
+          },
+          "lineCap": {
+            "type": "string",
+            "required": false,
+            "enum": [
+              "butt",
+              "round",
+              "square"
+            ]
+          },
+          "lineJoin": {
+            "type": "string",
+            "required": false,
+            "enum": [
+              "bevel",
+              "round",
+              "miter"
+            ]
+          },
+          "dashArray": {
+            "type": "array",
+            "required": false,
+            "of": {
+              "type": "number",
+              "required": true
+            }
+          },
+          "dashOffset": {
+            "type": "number",
+            "required": false
+          },
+          "miterLimit": {
+            "type": "number",
+            "required": false
+          },
+          "dropShadow": {
+            "type": "object",
+            "required": false,
+            "shape": {
+              "enabled": {
+                "type": "boolean",
+                "required": true
+              },
+              "dx": {
+                "type": "number",
+                "required": true
+              },
+              "dy": {
+                "type": "number",
+                "required": true
+              },
+              "r": {
+                "type": "number",
+                "required": true
+              },
+              "spread": {
+                "type": "number",
+                "required": false
+              },
+              "color": {
+                "type": "string",
+                "required": true
+              }
+            }
+          },
+          "innerShadow": {
+            "type": "object",
+            "required": false,
+            "shape": {
+              "enabled": {
+                "type": "boolean",
+                "required": true
+              },
+              "dx": {
+                "type": "number",
+                "required": true
+              },
+              "dy": {
+                "type": "number",
+                "required": true
+              },
+              "r": {
+                "type": "number",
+                "required": true
+              },
+              "spread": {
+                "type": "number",
+                "required": false
+              },
+              "color": {
+                "type": "string",
+                "required": true
+              }
+            }
+          },
+          "objectBlur": {
+            "type": "object",
+            "required": false,
+            "shape": {
+              "enabled": {
+                "type": "boolean",
+                "required": true
+              },
+              "r": {
+                "type": "number",
+                "required": true
+              }
+            }
+          },
+          "backgroundBlur": {
+            "type": "object",
+            "required": false,
+            "shape": {
+              "enabled": {
+                "type": "boolean",
+                "required": true
+              },
+              "r": {
+                "type": "number",
+                "required": true
+              },
+              "brightness": {
+                "type": "number",
+                "required": true
+              },
+              "opacity": {
+                "type": "number",
+                "required": true
+              }
+            }
+          },
+          "overlay": {
+            "type": "object",
+            "required": false,
+            "shape": {
+              "enabled": {
+                "type": "boolean",
+                "required": true
+              },
+              "color": {
+                "type": "string",
+                "required": true
+              }
+            }
+          },
+          "gradientOverlay": {
+            "type": "object",
+            "required": false
+          },
+          "strokes": {
+            "type": "array",
+            "required": false
+          },
+          "patternOverlay": {
+            "type": "object",
+            "required": false
+          },
+          "outerGlow": {
+            "type": "object",
+            "required": false
+          },
+          "innerGlow": {
+            "type": "object",
+            "required": false
+          },
+          "blendMode": {
+            "type": "string",
+            "required": false,
+            "enum": [
+              "normal",
+              "dissolve",
+              "darken",
+              "multiply",
+              "color-burn",
+              "linear-burn",
+              "darker-color",
+              "lighten",
+              "screen",
+              "color-dodge",
+              "linear-dodge",
+              "lighter-color",
+              "overlay",
+              "soft-light",
+              "hard-light",
+              "vivid-light",
+              "linear-light",
+              "pin-light",
+              "hard-mix",
+              "difference",
+              "exclusion",
+              "subtract",
+              "divide",
+              "hue",
+              "saturation",
+              "color",
+              "luminosity"
+            ]
+          },
+          "fixWidth": {
+            "type": "number",
+            "required": false
+          },
+          "fixHeight": {
+            "type": "number",
+            "required": false
+          },
+          "valign": {
+            "type": "string",
+            "required": false,
+            "enum": [
+              "top",
+              "center",
+              "bottom"
+            ]
+          }
+        }
+      }
+    },
+    "result": "void"
+  }
+}

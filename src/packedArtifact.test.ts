@@ -72,7 +72,11 @@ describe('npm pack manifest (AC-2)', () => {
   it('npm publish --dry-run succeeds (no "private" refusal)', () => {
     const output = execFileSync('npm', ['publish', '--dry-run'], { cwd: PACKAGE_ROOT, encoding: 'utf8' });
     expect(output).not.toMatch(/private/i);
-    expect(output).toMatch(/figpea-mcp@0\.1\.0/);
+    // Read from package.json rather than pinned as a literal: the version
+    // moves with the contract under REQ-188's lockstep rule, and metadata.test.ts
+    // is the one place that asserts what it must be.
+    const pkgVersion = JSON.parse(fs.readFileSync(path.join(PACKAGE_ROOT, 'package.json'), 'utf8')).version;
+    expect(output).toContain(`figpea-mcp@${pkgVersion}`);
   });
 });
 
