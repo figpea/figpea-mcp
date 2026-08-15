@@ -69,15 +69,26 @@ describe('npm pack manifest (AC-2)', () => {
     expect(firstLine).toBe('#!/usr/bin/env node');
   });
 
-  it('npm publish --dry-run succeeds (no "private" refusal)', () => {
-    const output = execFileSync('npm', ['publish', '--dry-run'], { cwd: PACKAGE_ROOT, encoding: 'utf8' });
-    expect(output).not.toMatch(/private/i);
-    // Read from package.json rather than pinned as a literal: the version
-    // moves with the contract under REQ-188's lockstep rule, and metadata.test.ts
-    // is the one place that asserts what it must be.
-    const pkgVersion = JSON.parse(fs.readFileSync(path.join(PACKAGE_ROOT, 'package.json'), 'utf8')).version;
-    expect(output).toContain(`figpea-mcp@${pkgVersion}`);
-  });
+  // Explicit timeout, matching this file's `beforeAll` (60s) and stdio test
+  // (20s): `npm publish --dry-run` runs the `prepublishOnly` hook, which is a
+  // full `tsc` build PLUS a full typecheck -- ~6.7s on a warm dev machine, and
+  // it grows with the source tree. It fit inside vitest's 5s default by luck
+  // until REQ-188 added a module and two test files, then failed as a timeout
+  // (never an assertion). Timing, not behavior: the assertions below are
+  // unchanged.
+  it(
+    'npm publish --dry-run succeeds (no "private" refusal)',
+    () => {
+      const output = execFileSync('npm', ['publish', '--dry-run'], { cwd: PACKAGE_ROOT, encoding: 'utf8' });
+      expect(output).not.toMatch(/private/i);
+      // Read from package.json rather than pinned as a literal: the version
+      // moves with the contract under REQ-188's lockstep rule, and metadata.test.ts
+      // is the one place that asserts what it must be.
+      const pkgVersion = JSON.parse(fs.readFileSync(path.join(PACKAGE_ROOT, 'package.json'), 'utf8')).version;
+      expect(output).toContain(`figpea-mcp@${pkgVersion}`);
+    },
+    60_000,
+  );
 });
 
 describe('installed tarball — stdio MCP handshake (AC-4)', () => {
