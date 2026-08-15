@@ -2,3 +2,11 @@ dist/
 node_modules/
 *.tgz
 
+# Credentials. This repo is PUBLIC (MIT), and npm auth tokens live in .npmrc
+# files — a token pushed here is compromised within minutes of landing.
+# Ignored even though none is committed today, because the safe way to scope a
+# publish token to this project is a local .npmrc, and that is exactly the file
+# that must never be pushed. Prefer NPM_CONFIG_USERCONFIG pointing OUTSIDE the
+# repo, or publishing from CI with a repo secret.
+.npmrc
+.npmrc.*
