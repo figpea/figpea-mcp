@@ -1,0 +1,56 @@
+{
+  "name": "figpea-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for AI agents to open, inspect, and export PSD, Adobe XD, Figma, SVG & PDF files in a live Figpea editor — runs locally over stdio, files never leave your machine.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "mcp-server",
+    "figpea",
+    "design",
+    "psd",
+    "adobe-xd",
+    "figma",
+    "svg",
+    "ai-agent",
+    "llm",
+    "claude"
+  ],
+  "license": "MIT",
+  "author": "Figpea",
+  "homepage": "https://github.com/figpea/figpea-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/figpea/figpea-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/figpea/figpea-mcp/issues"
+  },
+  "bin": {
+    "figpea-mcp": "dist/cli.js"
+  },
+  "main": "dist/cli.js",
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build && npm run typecheck"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "ws": "^8.21.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.2.2",
+    "vitest": "^4.1.10"
+  }
+}

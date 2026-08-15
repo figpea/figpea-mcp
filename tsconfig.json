@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    /* Standalone Node package config (plan §7 OQ-1) -- deliberately NOT
+     * extending the root tsconfig.json: no app path aliases ("@/*", "agent",
+     * "core", ...), no DOM lib, no jsx. This package is outside the 5-layer
+     * app entirely (plan "Layer placement") and depends only on the MCP SDK,
+     * ws, zod, and its own dependency-free protocol.ts/tools.ts. */
+    "target": "ES2022",
+    "module": "CommonJS",
+    "lib": ["ES2022"],
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noImplicitAny": true,
+    "noImplicitThis": true,
+    "alwaysStrict": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "resolveJsonModule": true,
+    "sourceMap": true,
+    "declaration": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}
