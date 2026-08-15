@@ -40,7 +40,7 @@ export interface CreateMcpServerOptions {
 
 const DEFAULT_EDITOR_BASE_URL = 'https://editor.figpea.com';
 const SERVER_NAME = 'figpea-mcp';
-const SERVER_VERSION = '1.8.0';
+const SERVER_VERSION = '1.8.1';
 
 function toCallToolResult(mapped: { content: McpContentBlockLike[]; isError: boolean }): CallToolResult {
   // `McpContentBlockLike` mirrors the SDK's own TextContent/ImageContent

@@ -2,9 +2,9 @@
 
 A Model Context Protocol (MCP) server that lets an AI agent open and drive a live Figpea editor — to view, inspect, and export PSD, Adobe XD, Figma, SVG, and PDF files — entirely on your machine.
 
-> **Status: pre-release.** Published to npm under the **`next`** dist-tag only, so plain `npx figpea-mcp` deliberately resolves to nothing for now. To try it, pin the tag — use `"figpea-mcp@next"` in place of `"figpea-mcp"` in the `args` array below, or `npm install figpea-mcp@next`.
+> **Status: early release.** Usable today, with one rough edge worth knowing before your first run.
 >
-> `latest` is held back on purpose: connecting an editor tab needs your browser's permission to reach the local network, and the current flow neither asks for it clearly nor tells you when it was denied. Until that lands, a first run can look like it simply hangs. *(This note is replaced when `latest` is promoted.)*
+> Connecting an editor tab needs your browser's permission to reach the local network. Chrome asks once — **accept it, and it is remembered for that site**. If you dismiss it, or if the connection is blocked, the tab currently gives no feedback and simply appears to hang. A guided connect flow that explains this up front is in progress.
 
 ![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)
 ![node](https://img.shields.io/badge/node-%3E%3D18-green.svg)
