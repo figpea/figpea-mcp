@@ -397,3 +397,19 @@ describe('REQ-699 — prefetchedManifest & reconciliation / structural discrimin
   });
 });
 
+describe('contract tool calls when no tab is connected — AC-1 actionable no_tab error', () => {
+  it('returns no_tab with a message and a url carrying origin, agent=1, bridgePort, and bridgeToken', async () => {
+    const bridge = fakeBridge({ port: 12345, token: 'secret-tok' });
+    const manifest = { layer: { setPosition: { doc: 'Move layer', params: {} } } };
+    const bridgeWithDescribe = { ...bridge, onDescribe: (h: any) => h(manifest) };
+    const client = await connectedClient(bridgeWithDescribe);
+    const result = await client.callTool({ name: 'layer_setPosition', arguments: {} });
+    const textBlock = (result.content as any).find((c: any) => c.type === 'text');
+    const parsed = JSON.parse(textBlock.text);
+    expect(parsed.ok).toBe(false);
+    expect(parsed.code).toBe('no_tab');
+    expect(parsed.message).toContain('No editor tab paired');
+    expect(parsed.url).toBe('https://editor.figpea.com/?agent=1&bridgePort=12345&bridgeToken=secret-tok');
+  });
+});
+

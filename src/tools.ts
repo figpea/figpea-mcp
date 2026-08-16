@@ -168,7 +168,7 @@ export function buildToolsFromManifest(manifest: ManifestLike): GeneratedTool[] 
 
 export type FigpeaCallResultLike =
   | { ok: true; value: unknown }
-  | { ok: false; code: string; message?: string };
+  | { ok: false; code: string; message?: string; url?: string };
 
 export interface McpTextContentLike {
   type: 'text';
@@ -216,7 +216,7 @@ export function resultToContent(result: FigpeaCallResultLike): MappedToolResultL
   if (!result.ok) {
     return {
       isError: true,
-      content: [{ type: 'text', text: JSON.stringify({ ok: false, code: result.code, message: result.message }) }],
+      content: [{ type: 'text', text: JSON.stringify({ ok: false, code: result.code, message: result.message, url: result.url }) }],
     };
   }
 

@@ -2,9 +2,11 @@
 
 A Model Context Protocol (MCP) server that lets an AI agent open and drive a live Figpea editor — to view, inspect, and export PSD, Adobe XD, Figma, SVG, and PDF files — entirely on your machine.
 
-> **Status: early release.** Usable today, with one rough edge worth knowing before your first run.
->
-> Connecting an editor tab needs your browser's permission to reach the local network. Chrome asks once — **accept it, and it is remembered for that site**. If you dismiss it, or if the connection is blocked, the tab currently gives no feedback and simply appears to hang. A guided connect flow that explains this up front is in progress.
+> **Guided Pairing & Local Network Access (LNA).** When an agent invokes a contract tool before a tab is paired, it receives an actionable `no_tab` error carrying the exact pairing URL:
+> ```text
+> {"ok":false,"code":"no_tab","message":"No editor tab paired. Open this URL in your browser to connect an editor tab:","url":"https://editor.figpea.com/?agent=1&bridgePort=8080&bridgeToken=abc123token"}
+> ```
+> Opening that URL opens the editor with an LNA connect notice and explicit **Connect** consent gate button. Chrome may ask permission to reach the local network (accepted once per origin). Once granted, clicking Connect attaches the session safely.
 
 ![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)
 ![node](https://img.shields.io/badge/node-%3E%3D18-green.svg)
@@ -64,6 +66,13 @@ Every call returns `{ok: true, value}` or `{ok: false, code, message}`. Image-sh
 ## Entitlement boundary
 
 Authoring is free — opening, inspecting, and editing a file costs nothing. Export tools honor the signed-in user's plan exactly as the Figpea UI does: a call that isn't entitled returns `{ok: false, code: "entitlement_required"}`, never a silent partial result. The bridge doesn't unlock anything the editor UI wouldn't.
+
+## Automated Browser & Agent Harness Pairing
+
+Automated or headless browsers cannot answer native Local Network Access permission prompts. To pair in automated test or agent harness environments:
+1. **Grant LNA permission** via CDP (`Browser.grantPermissions`), a pre-granted browser profile, or Chrome's `LocalNetworkAccessAllowedForUrls` enterprise policy.
+2. **Programmatically click Connect** on the editor notice.
+3. **Localhost exemption**: Editors served from `http://localhost` are same-address-space and exempt from LNA entirely.
 
 ## Troubleshooting
 

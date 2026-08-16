@@ -280,4 +280,16 @@ describe('resultToContent — runtime result -> MCP content mapping (plan §1 OQ
     const mapped = resultToContent({ ok: true, value: { id: 'abc' } });
     expect(mapped.content.some((c: McpContentBlockLike) => c.type === 'image')).toBe(false);
   });
+
+  it('passes an optional url field through an {ok:false} result unchanged', () => {
+    const mapped = resultToContent({
+      ok: false,
+      code: 'no_tab',
+      message: 'No tab paired',
+      url: 'https://editor.figpea.com/?agent=1&bridgePort=1234&bridgeToken=tok',
+    });
+    expect(mapped.isError).toBe(true);
+    const parsed = JSON.parse((mapped.content[0] as McpTextContentLike).text);
+    expect(parsed.url).toBe('https://editor.figpea.com/?agent=1&bridgePort=1234&bridgeToken=tok');
+  });
 });

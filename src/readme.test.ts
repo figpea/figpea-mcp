@@ -62,4 +62,21 @@ describe('README.md (AC-5)', () => {
     expect(readme).toContain('/agent/contract.json');
     expect(readme).not.toContain('pure localhost relay: it holds no credentials and ships no telemetry');
   });
+
+  it('documents the Connect click and browser permission prompt as expected first-run pairing steps (AC-8)', () => {
+    // Shipped first-run pairing steps: actionable pairing URL, Connect consent gate, and LNA permission explainer
+    expect(readme).toContain('Guided Pairing & Local Network Access (LNA)');
+    expect(readme).toContain('no_tab');
+    expect(readme).toContain('https://editor.figpea.com/?agent=1&bridgePort=');
+    expect(readme).toContain('Connect');
+    expect(readme).toMatch(/Local Network Access|permission/i);
+
+    // Assert pre-REQ placeholder sentence is absent
+    expect(readme).not.toMatch(/guided connect flow.*is in progress/i);
+    expect(readme.toLowerCase()).not.toContain('is in progress');
+  });
+
+  it('documents automated-browser and agent harness pairing options (AC-10)', () => {
+    expect(readme).toContain('Automated Browser');
+  });
 });

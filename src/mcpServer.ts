@@ -107,6 +107,18 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     return perCall ?? options?.editorBaseUrl ?? process.env.FIGPEA_EDITOR_URL ?? DEFAULT_EDITOR_BASE_URL;
   }
 
+  function buildConnectUrl(perCallBaseUrl?: string, fileArg?: string): string {
+    const url = new URL(resolveEditorBaseUrl(perCallBaseUrl));
+    url.searchParams.set('agent', '1');
+    url.searchParams.set('bridgePort', String(bridge.port));
+    url.searchParams.set('bridgeToken', bridge.token);
+    if (fileArg) {
+      url.searchParams.set('loader', 'http');
+      url.searchParams.set('url', fileArg);
+    }
+    return url.toString();
+  }
+
   server.registerTool(
     'open_editor',
     {
@@ -120,15 +132,8 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     async (args) => {
       const fileArg = typeof args.file === 'string' ? args.file : undefined;
       const baseArg = typeof args.editorBaseUrl === 'string' ? args.editorBaseUrl : undefined;
-      const url = new URL(resolveEditorBaseUrl(baseArg));
-      url.searchParams.set('agent', '1');
-      url.searchParams.set('bridgePort', String(bridge.port));
-      url.searchParams.set('bridgeToken', bridge.token);
-      if (fileArg) {
-        url.searchParams.set('loader', 'http');
-        url.searchParams.set('url', fileArg);
-      }
-      return jsonTextResult({ port: bridge.port, token: bridge.token, url: url.toString() });
+      const urlStr = buildConnectUrl(baseArg, fileArg);
+      return jsonTextResult({ port: bridge.port, token: bridge.token, url: urlStr });
     },
   );
 
@@ -151,8 +156,14 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
   function makeContractHandler(groupName: string, methodName: string, inputKeys: string[]) {
     return async (rawArgs: Record<string, unknown>): Promise<CallToolResult> => {
       if (!bridge.isTabConnected()) {
+        const connectUrl = buildConnectUrl(undefined, undefined);
         return toCallToolResult(
-          resultToContent({ ok: false, code: 'no_tab', message: 'open an editor tab with open_editor first' }),
+          resultToContent({
+            ok: false,
+            code: 'no_tab',
+            message: 'No editor tab paired. Open this URL in your browser to connect an editor tab:',
+            url: connectUrl,
+          }),
         );
       }
       const args = inputKeys.map((key) => rawArgs[key]);
