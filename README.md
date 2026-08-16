@@ -51,8 +51,15 @@ Every call returns `{ok: true, value}` or `{ok: false, code, message}`. Image-sh
 - The bridge binds **localhost only** (`127.0.0.1`) — never a public interface.
 - A **per-run pairing token** is regenerated on every start; a connection without the correct token is closed without ever being relayed.
 - **Single active session** — the newest valid connection always supersedes the previous one.
-- The server is a **pure localhost relay**: it holds no credentials and ships no telemetry.
+- At startup, the server performs a single GET request to the editor origin (`/agent/contract.json`) to prefetch the latest tool definitions. This reveals only your client IP and startup timing to the editor origin; no usage telemetry is shipped. You can disable this fetch entirely by setting `FIGPEA_DISABLE_CONTRACT_FETCH=1`.
+- The server holds no credentials.
 - Your design files are opened in your own browser tab and **never leave your machine**.
+
+## Configuration & Environment Variables
+
+- `FIGPEA_EDITOR_URL` — overrides the default editor origin (`https://editor.figpea.com`) for both contract prefetching and `open_editor` links.
+- `FIGPEA_DISABLE_CONTRACT_FETCH=1` — disables the startup contract prefetch, falling back to cold-start static tools and drill-on-connect.
+- `--port=<n>` — binds the bridge server to a specific port.
 
 ## Entitlement boundary
 

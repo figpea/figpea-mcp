@@ -96,7 +96,11 @@ describe('installed tarball — stdio MCP handshake (AC-4)', () => {
     const binPath = path.join(installDir, 'node_modules', '.bin', 'figpea-mcp');
     expect(fs.existsSync(binPath)).toBe(true);
 
-    const transport = new StdioClientTransport({ command: binPath, args: [] });
+    const transport = new StdioClientTransport({
+      command: binPath,
+      args: [],
+      env: { ...process.env, FIGPEA_DISABLE_CONTRACT_FETCH: '1' },
+    });
     const client = new Client({ name: 'req-088-packed-install-smoke', version: '0.0.0' });
 
     try {

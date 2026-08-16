@@ -56,4 +56,10 @@ describe('README.md (AC-5)', () => {
   it('never claims a "Figma alternative"', () => {
     expect(readme.toLowerCase()).not.toMatch(/figma alternative/);
   });
+
+  it('documents FIGPEA_DISABLE_CONTRACT_FETCH and startup contract prefetch in README (REQ-699 AC-10)', () => {
+    expect(readme).toContain('FIGPEA_DISABLE_CONTRACT_FETCH');
+    expect(readme).toContain('/agent/contract.json');
+    expect(readme).not.toContain('pure localhost relay: it holds no credentials and ships no telemetry');
+  });
 });

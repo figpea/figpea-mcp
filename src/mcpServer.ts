@@ -36,6 +36,8 @@ export interface CreateMcpServerOptions {
   /** Overrides both the env var and the built-in default for every
    * `open_editor` call on this server, unless a call supplies its own. */
   editorBaseUrl?: string;
+  /** Prefetched contract manifest to register tools immediately on startup. */
+  prefetchedManifest?: ManifestLike;
 }
 
 const DEFAULT_EDITOR_BASE_URL = 'https://editor.figpea.com';
@@ -225,6 +227,10 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     }
 
     toolCount = generated.length;
+  }
+
+  if (options?.prefetchedManifest) {
+    registerContractTools(options.prefetchedManifest);
   }
 
   bridge.onDescribe((manifest) => {

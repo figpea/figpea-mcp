@@ -246,3 +246,154 @@ describe('REQ-093 AC-4: contract tools carry enum params through as z.enum in th
     ).toBe('no_tab');
   });
 });
+
+describe('REQ-699 — prefetchedManifest & reconciliation / structural discriminator', () => {
+  const FIXTURE_MANIFEST = {
+    session: {
+      status: { doc: 'Status doc', params: {}, result: {} }
+    },
+    layer: {
+      create: { doc: 'Create layer', params: {}, result: {} }
+    }
+  };
+
+  it('registers tools from prefetchedManifest immediately with no tab connected (AC-3)', async () => {
+    const bridge = fakeBridge({ isTabConnected: () => false });
+    const server = createMcpServer(bridge, { prefetchedManifest: FIXTURE_MANIFEST as any });
+    const client = new Client({ name: 'req-699-prefetch-test', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    cleanupFns.push(async () => {
+      await client.close();
+      await server.close();
+    });
+
+    const { tools } = await client.listTools();
+    const names = tools.map(t => t.name).sort();
+    expect(names).toContain('session_status');
+    expect(names).toContain('layer_create');
+  });
+
+  it('reconciles when a narrower real tab connects, disabling surplus prefetched tools (AC-7)', async () => {
+    const WIDE_PREFETCH = {
+      session: {
+        status: { doc: 'Status doc', params: {}, result: {} },
+        close: { doc: 'Close session', params: {}, result: {} },
+      },
+      layer: {
+        create: { doc: 'Create layer', params: {}, result: {} },
+        delete: { doc: 'Delete layer', params: {}, result: {} },
+      },
+    };
+    const NARROW_TAB_MANIFEST = {
+      session: {
+        status: { doc: 'Status doc', params: {}, result: {} },
+      },
+      layer: {
+        create: { doc: 'Create layer', params: {}, result: {} },
+      },
+    };
+
+    let onDescribeHandler: ((manifest: unknown) => void) | undefined;
+    let isConnected = false;
+    const bridge = fakeBridge({
+      isTabConnected: () => isConnected,
+      onDescribe: (handler) => {
+        onDescribeHandler = handler;
+      },
+      callTab: async (group, method, args) => ({ ok: true, value: `${group}.${method}` }),
+    });
+
+    const server = createMcpServer(bridge, { prefetchedManifest: WIDE_PREFETCH as any });
+    const client = new Client({ name: 'req-699-reconcile-test', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    cleanupFns.push(async () => {
+      await client.close();
+      await server.close();
+    });
+
+    // 1. Initially with no tab, all 4 prefetched tools are registered
+    const initialTools = await client.listTools();
+    const initialNames = initialTools.tools.map((t) => t.name).sort();
+    expect(initialNames).toEqual([
+      'layer_create',
+      'layer_delete',
+      'open_editor',
+      'session_close',
+      'session_status',
+      'status',
+    ]);
+
+    // 2. Real tab connects with narrower surface
+    isConnected = true;
+    expect(onDescribeHandler).toBeDefined();
+    onDescribeHandler!(NARROW_TAB_MANIFEST);
+
+    // 3. Surplus tools (session_close, layer_delete) are disabled and omitted from active tools list
+    const postConnectTools = await client.listTools();
+    const postConnectNames = postConnectTools.tools.map((t) => t.name).sort();
+    expect(postConnectNames).toEqual(['layer_create', 'open_editor', 'session_status', 'status']);
+    expect(postConnectNames).not.toContain('session_close');
+    expect(postConnectNames).not.toContain('layer_delete');
+
+    // 4. Advertised tools work normally
+    const result = await callToolJson(client, 'session_status', {});
+    expect(result).toEqual({ ok: true, value: 'session.status' });
+
+    // 5. Calling a disabled surplus tool fails with tool disabled error
+    const disabledCall = await client.callTool({ name: 'session_close', arguments: {} });
+    expect(disabledCall.isError).toBe(true);
+    expect(((disabledCall as any).content?.[0] as any)?.text).toMatch(/disabled/i);
+  });
+
+  it('handles pre-0.16.0 full-manifest-shaped tab connecting after prefetch via structural discriminator (AC-9)', async () => {
+    const PREFETCH = {
+      session: {
+        status: { doc: 'Prefetched status', params: {}, result: {} },
+      },
+    };
+    // Pre-0.16.0 full manifest shape (bare describe returns full descriptor objects with doc/params/result)
+    const PRE_016_FULL_MANIFEST = {
+      session: {
+        status: { doc: 'Legacy session status', params: {}, result: {} },
+      },
+      layer: {
+        create: { doc: 'Legacy layer create', params: { name: { type: 'string' } }, result: {} },
+        inspect: { doc: 'Legacy layer inspect', params: {}, result: {} },
+      },
+    };
+
+    let onDescribeHandler: ((manifest: unknown) => void) | undefined;
+    let isConnected = false;
+    const bridge = fakeBridge({
+      isTabConnected: () => isConnected,
+      onDescribe: (handler) => {
+        onDescribeHandler = handler;
+      },
+      callTab: async (group, method, args) => ({ ok: true, value: `called ${group}.${method}` }),
+    });
+
+    const server = createMcpServer(bridge, { prefetchedManifest: PREFETCH as any });
+    const client = new Client({ name: 'req-699-ac9-test', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    cleanupFns.push(async () => {
+      await client.close();
+      await server.close();
+    });
+
+    // Tab connects reporting full-manifest shape
+    isConnected = true;
+    expect(onDescribeHandler).toBeDefined();
+    onDescribeHandler!(PRE_016_FULL_MANIFEST);
+
+    const { tools } = await client.listTools();
+    const names = tools.map((t) => t.name).sort();
+    expect(names).toEqual(['layer_create', 'layer_inspect', 'open_editor', 'session_status', 'status']);
+
+    const callResult = await callToolJson(client, 'layer_create', { name: 'my-layer' });
+    expect(callResult).toEqual({ ok: true, value: 'called layer.create' });
+  });
+});
+
