@@ -45,7 +45,8 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
       await client.connect(transport, { timeout: 10_000 });
       const { tools } = await client.listTools();
       const names = tools.map((t) => t.name).sort();
-      expect(names).toEqual(['open_editor', 'status']);
+      // REQ-705: figpea_skill joins the always-present set.
+      expect(names).toEqual(['figpea_skill', 'open_editor', 'status']);
     } finally {
       await client.close().catch(() => {});
       await transport.close().catch(() => {});
@@ -65,17 +66,28 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
       await client.connect(transport, { timeout: 10_000 });
       const { tools } = await client.listTools();
       const names = tools.map((t) => t.name).sort();
-      expect(names).toEqual(['open_editor', 'status']);
+      // REQ-705: figpea_skill is still present (registered unconditionally),
+      // even though its own body fetch is gated by the SAME env var and
+      // therefore also disabled here -- it just degrades (skill_unavailable)
+      // rather than being absent from tools/list.
+      expect(names).toEqual(['figpea_skill', 'open_editor', 'status']);
     } finally {
       await client.close().catch(() => {});
       await transport.close().catch(() => {});
     }
   }, 15_000);
 
-  it('targets the origin specified by FIGPEA_EDITOR_URL to fetch contract (AC-4)', async () => {
-    let requestedPath = '';
+  it('targets the origin specified by FIGPEA_EDITOR_URL to fetch contract AND skill (AC-4)', async () => {
+    // REQ-705: cli.ts now fetches BOTH /agent/contract.json and
+    // /agent/skill.md from the same origin at startup -- track every
+    // requested path (not a single reassigned variable) so both fetches are
+    // independently observable, and serve a real skill.md body so the
+    // figpea_skill tool call below (T5/T6's own new assertions) has real
+    // content to return.
+    const requestedPaths: string[] = [];
+    const skillBody = '# Figpea Agent Skill (fixture)\n\nFixture reference body.\n';
     const server = http.createServer((req, res) => {
-      requestedPath = req.url ?? '';
+      requestedPaths.push(req.url ?? '');
       if (req.url === '/agent/contract.json') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(
@@ -90,6 +102,9 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
             errorCodes: {},
           }),
         );
+      } else if (req.url === '/agent/skill.md') {
+        res.writeHead(200, { 'Content-Type': 'text/markdown' });
+        res.end(skillBody);
       } else {
         res.writeHead(404);
         res.end();
@@ -111,8 +126,17 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
       await client.connect(transport, { timeout: 10_000 });
       const { tools } = await client.listTools();
       const names = tools.map((t) => t.name).sort();
-      expect(requestedPath).toBe('/agent/contract.json');
+      expect(requestedPaths).toContain('/agent/contract.json');
+      expect(requestedPaths, 'REQ-705: the skill.md fetch also targets FIGPEA_EDITOR_URL\'s origin').toContain(
+        '/agent/skill.md',
+      );
       expect(names).toContain('custom_group_custom_tool');
+
+      // REQ-705: figpea_skill returns the fetched fixture body verbatim.
+      const skillResult = await client.callTool({ name: 'figpea_skill', arguments: {} });
+      const content = (skillResult as any).content as Array<{ type: string; text?: string }>;
+      const textBlock = content.find((c) => c.type === 'text');
+      expect(textBlock?.text).toBe(skillBody);
     } finally {
       await client.close().catch(() => {});
       await transport.close().catch(() => {});
@@ -135,18 +159,31 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
       await client.connect(transport, { timeout: 10_000 });
       const { tools } = await client.listTools();
       const names = tools.map((t) => t.name).sort();
-      expect(names).toEqual(['open_editor', 'status']);
+      // REQ-705: figpea_skill is still registered (always-present) even
+      // though its own prefetch also failed against the same unreachable
+      // origin -- it just degrades when called, never absent from the list.
+      expect(names).toEqual(['figpea_skill', 'open_editor', 'status']);
+
+      const skillResult = await client.callTool({ name: 'figpea_skill', arguments: {} });
+      expect(skillResult).toBeDefined();
+      const content = (skillResult as any).content as Array<{ type: string; text?: string }>;
+      const textBlock = content.find((c) => c.type === 'text');
+      expect(textBlock, 'figpea_skill still returns a text content block, degraded but non-throwing').toBeDefined();
+      const parsed = JSON.parse(textBlock!.text!);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.code).toBe('skill_unavailable');
     } finally {
       await client.close().catch(() => {});
       await transport.close().catch(() => {});
     }
   }, 15_000);
 
-  it('fetches contract at most once per server run across lifecycle and operations (AC-6)', async () => {
-    let requestCount = 0;
+  it('fetches contract AND skill at most once each per server run across lifecycle and operations (AC-6)', async () => {
+    let contractRequestCount = 0;
+    let skillRequestCount = 0;
     const server = http.createServer((req, res) => {
       if (req.url === '/agent/contract.json') {
-        requestCount++;
+        contractRequestCount++;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(
           JSON.stringify({
@@ -158,6 +195,10 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
             errorCodes: {},
           }),
         );
+      } else if (req.url === '/agent/skill.md') {
+        skillRequestCount++;
+        res.writeHead(200, { 'Content-Type': 'text/markdown' });
+        res.end('# skill body\n');
       } else {
         res.writeHead(404);
         res.end();
@@ -179,9 +220,12 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
       await client.connect(transport, { timeout: 10_000 });
       await client.listTools();
       await client.callTool({ name: 'status', arguments: {} });
+      await client.callTool({ name: 'figpea_skill', arguments: {} });
       await client.listTools();
-      // Server fetches once at startup in main(), never on subsequent tool listings or calls
-      expect(requestCount).toBe(1);
+      // Both fetches happen once at startup in main(), never on subsequent
+      // tool listings or calls.
+      expect(contractRequestCount).toBe(1);
+      expect(skillRequestCount, 'REQ-705: the skill.md fetch is also a one-shot startup fetch').toBe(1);
     } finally {
       await client.close().catch(() => {});
       await transport.close().catch(() => {});

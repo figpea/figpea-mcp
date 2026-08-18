@@ -42,6 +42,7 @@ The server starts a bridge on `127.0.0.1:<port>` with a per-run pairing token. T
 |------|-----------------|---------------|
 | `open_editor` | yes | Opens/points at an editor tab wired to this bridge. Returns `{port, token, url}`. |
 | `status` | yes | Reports the bridge's port, whether a tab is connected, the connected tab's contract version, and the live tool count. |
+| `figpea_skill` | yes | Returns Figpea's agent skill reference (the craft guidance for using `window.figpea` well), sourced from the editor origin's `/agent/skill.md` at startup — works even with no tab paired. Degrades to a structured `{ok:false, code:"skill_unavailable", message}` (never throws) if the fetch failed or was disabled. |
 | `group_method` (e.g. `layer_setPosition`, `canvas_screenshot`, `export_project`) | generated live | One MCP tool per method in the connected tab's `figpea.describe()` manifest. |
 
 The contract-tool list reflects whatever the connected editor advertises — it is not hardcoded here, and grows with the editor's contract. `status` and `tools/list` are the source of truth for what's callable right now; there is no version-lock between this bridge and the editor.
@@ -53,14 +54,14 @@ Every call returns `{ok: true, value}` or `{ok: false, code, message}`. Image-sh
 - The bridge binds **localhost only** (`127.0.0.1`) — never a public interface.
 - A **per-run pairing token** is regenerated on every start; a connection without the correct token is closed without ever being relayed.
 - **Single active session** — the newest valid connection always supersedes the previous one.
-- At startup, the server performs a single GET request to the editor origin (`/agent/contract.json`) to prefetch the latest tool definitions. This reveals only your client IP and startup timing to the editor origin; no usage telemetry is shipped. You can disable this fetch entirely by setting `FIGPEA_DISABLE_CONTRACT_FETCH=1`.
+- At startup, the server performs two GET requests to the editor origin — `/agent/contract.json` (tool definitions) and `/agent/skill.md` (the agent skill reference, backing the `figpea_skill` tool) — to prefetch both before any tab pairs. This reveals only your client IP and startup timing to the editor origin; no usage telemetry is shipped. You can disable both fetches by setting `FIGPEA_DISABLE_CONTRACT_FETCH=1`.
 - The server holds no credentials.
 - Your design files are opened in your own browser tab and **never leave your machine**.
 
 ## Configuration & Environment Variables
 
-- `FIGPEA_EDITOR_URL` — overrides the default editor origin (`https://editor.figpea.com`) for both contract prefetching and `open_editor` links.
-- `FIGPEA_DISABLE_CONTRACT_FETCH=1` — disables the startup contract prefetch, falling back to cold-start static tools and drill-on-connect.
+- `FIGPEA_EDITOR_URL` — overrides the default editor origin (`https://editor.figpea.com`) for contract prefetching, skill prefetching (`figpea_skill`), and `open_editor` links.
+- `FIGPEA_DISABLE_CONTRACT_FETCH=1` — disables BOTH the startup contract prefetch and the startup skill prefetch, falling back to cold-start static tools, drill-on-connect, and a degraded `figpea_skill` result.
 - `--port=<n>` — binds the bridge server to a specific port.
 
 ## Entitlement boundary

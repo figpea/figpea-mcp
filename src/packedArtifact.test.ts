@@ -107,7 +107,8 @@ describe('installed tarball — stdio MCP handshake (AC-4)', () => {
       await client.connect(transport, { timeout: 10_000 });
       const { tools } = await client.listTools();
       const names = tools.map((t) => t.name).sort();
-      expect(names).toEqual(['open_editor', 'status']);
+      // REQ-705: figpea_skill joins the always-present set.
+      expect(names).toEqual(['figpea_skill', 'open_editor', 'status']);
     } finally {
       await client.close().catch(() => {});
       await transport.close().catch(() => {});

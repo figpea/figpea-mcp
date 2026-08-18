@@ -15,6 +15,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { startBridgeServer } from './bridgeServer';
 import { createMcpServer } from './mcpServer';
 import { fetchContract } from './contractFetch';
+import { fetchSkill } from './skillFetch';
 
 /** Minimal argv parsing (plan §2): only a fixed bridge port is worth
  * exposing on the command line -- everything else (editor base URL) is
@@ -48,16 +49,27 @@ async function main(): Promise<void> {
   console.error('[figpea-mcp] (or call the open_editor tool from the connected MCP client)');
 
   let prefetchedManifest: any | undefined;
+  let prefetchedSkillBody: string | undefined;
   const disableFetch = process.env.FIGPEA_DISABLE_CONTRACT_FETCH === '1' || process.env.FIGPEA_DISABLE_CONTRACT_FETCH === 'true';
   if (!disableFetch) {
     const editorBase = process.env.FIGPEA_EDITOR_URL ?? 'https://editor.figpea.com';
-    const fetchRes = await fetchContract(editorBase);
-    if (fetchRes.status === 'ok') {
-      prefetchedManifest = fetchRes.manifest;
+    // REQ-705: the skill fetch reuses REQ-699's startup fetch ladder --
+    // same gating env var, same editor-origin resolution -- rather than
+    // inventing a parallel mechanism/flag.
+    const [contractRes, skillRes] = await Promise.all([fetchContract(editorBase), fetchSkill(editorBase)]);
+    if (contractRes.status === 'ok') {
+      prefetchedManifest = contractRes.manifest;
+    }
+    if (skillRes.status === 'ok') {
+      prefetchedSkillBody = skillRes.body;
     }
   }
 
-  const server = createMcpServer(bridge, prefetchedManifest ? { prefetchedManifest } : undefined);
+  const serverOptions =
+    prefetchedManifest || prefetchedSkillBody
+      ? { prefetchedManifest, prefetchedSkillBody }
+      : undefined;
+  const server = createMcpServer(bridge, serverOptions);
   const transport = new StdioServerTransport();
   await server.connect(transport);
 

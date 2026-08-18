@@ -94,6 +94,81 @@ describe('createMcpServer — static tools are always present (plan §2 OQ-4)', 
     expect(names).toContain('open_editor');
     expect(names).toContain('status');
   });
+
+  // REQ-705 AC-7 — figpea_skill joins the always-present set, regardless of
+  // tab state or whether a skill body was ever prefetched.
+  it('lists figpea_skill before any tab ever connects', async () => {
+    const client = await connectedClient(fakeBridge());
+    const { tools } = await client.listTools();
+    const names = tools.map((t) => t.name);
+    expect(names).toContain('figpea_skill');
+  });
+});
+
+/**
+ * REQ-705 T5 — `figpea_skill` MCP tool (Tech design §E). Sourced from the
+ * origin artifact over REQ-699's startup fetch (cli.ts calls `fetchSkill()`
+ * alongside `fetchContract()`, threading the result in as
+ * `prefetchedSkillBody`) -- NOT tab-derived, so (unlike the manifest-driven
+ * contract tools) it needs no `bridge.onDescribe` wiring: it's captured once
+ * at construction and never changes for this server's lifetime.
+ */
+describe('REQ-705 — figpea_skill MCP tool (prefetchedSkillBody)', () => {
+  it('has no inputSchema (no-argument tool, mirrors "status")', async () => {
+    const client = await connectedClient(fakeBridge());
+    const { tools } = await client.listTools();
+    const tool = tools.find((t) => t.name === 'figpea_skill');
+    expect(tool, 'figpea_skill is registered').toBeDefined();
+    expect(
+      (tool as any)?.inputSchema?.properties ?? {},
+      'figpea_skill has no input properties',
+    ).toEqual({});
+  });
+
+  it('returns the prefetched skill body as plain text when present, with no tab connected', async () => {
+    const bridge = fakeBridge({ isTabConnected: () => false });
+    const server = createMcpServer(bridge, { prefetchedSkillBody: '# Some skill markdown\n\nBody text.' });
+    const client = new Client({ name: 'req-705-skill-tool-test', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    cleanupFns.push(async () => {
+      await client.close();
+      await server.close();
+    });
+
+    const result = await client.callTool({ name: 'figpea_skill', arguments: {} });
+    const content = (result as any).content as Array<{ type: string; text?: string }>;
+    const textBlock = content.find((c) => c.type === 'text');
+    expect(textBlock, 'figpea_skill returns a text content block').toBeDefined();
+    expect(textBlock!.text).toBe('# Some skill markdown\n\nBody text.');
+    expect(result.isError, 'a successful skill fetch is not an error result').not.toBe(true);
+  });
+
+  it('degrades without crashing and reports why when no skill body was prefetched (fetch failed or disabled)', async () => {
+    const bridge = fakeBridge({ isTabConnected: () => false });
+    // No `prefetchedSkillBody` option at all -- the fetch failed, or was
+    // disabled via FIGPEA_DISABLE_CONTRACT_FETCH, before this server was
+    // constructed.
+    const client = await connectedClient(bridge);
+
+    let threw = false;
+    let result: Awaited<ReturnType<Client['callTool']>> | undefined;
+    try {
+      result = await client.callTool({ name: 'figpea_skill', arguments: {} });
+    } catch {
+      threw = true;
+    }
+    expect(threw, 'figpea_skill must never throw/reject even with no prefetched body').toBe(false);
+
+    const content = (result as any).content as Array<{ type: string; text?: string }>;
+    const textBlock = content.find((c) => c.type === 'text');
+    expect(textBlock, 'figpea_skill still returns a text content block').toBeDefined();
+    const parsed = JSON.parse(textBlock!.text!);
+    expect(parsed.ok, 'the degraded result is a structured {ok:false,...}, never a thrown error').toBe(false);
+    expect(parsed.code).toBe('skill_unavailable');
+    expect(typeof parsed.message, 'names WHY it is unavailable and how to get the body another way').toBe('string');
+    expect(parsed.message.length).toBeGreaterThan(0);
+  });
 });
 
 describe('open_editor — well-formed URL (plan §2)', () => {
@@ -314,9 +389,11 @@ describe('REQ-699 — prefetchedManifest & reconciliation / structural discrimin
     });
 
     // 1. Initially with no tab, all 4 prefetched tools are registered
+    // (plus the two always-present static tools + figpea_skill, REQ-705)
     const initialTools = await client.listTools();
     const initialNames = initialTools.tools.map((t) => t.name).sort();
     expect(initialNames).toEqual([
+      'figpea_skill',
       'layer_create',
       'layer_delete',
       'open_editor',
@@ -333,7 +410,7 @@ describe('REQ-699 — prefetchedManifest & reconciliation / structural discrimin
     // 3. Surplus tools (session_close, layer_delete) are disabled and omitted from active tools list
     const postConnectTools = await client.listTools();
     const postConnectNames = postConnectTools.tools.map((t) => t.name).sort();
-    expect(postConnectNames).toEqual(['layer_create', 'open_editor', 'session_status', 'status']);
+    expect(postConnectNames).toEqual(['figpea_skill', 'layer_create', 'open_editor', 'session_status', 'status']);
     expect(postConnectNames).not.toContain('session_close');
     expect(postConnectNames).not.toContain('layer_delete');
 
@@ -390,7 +467,7 @@ describe('REQ-699 — prefetchedManifest & reconciliation / structural discrimin
 
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual(['layer_create', 'layer_inspect', 'open_editor', 'session_status', 'status']);
+    expect(names).toEqual(['figpea_skill', 'layer_create', 'layer_inspect', 'open_editor', 'session_status', 'status']);
 
     const callResult = await callToolJson(client, 'layer_create', { name: 'my-layer' });
     expect(callResult).toEqual({ ok: true, value: 'called layer.create' });

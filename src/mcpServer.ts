@@ -38,6 +38,11 @@ export interface CreateMcpServerOptions {
   editorBaseUrl?: string;
   /** Prefetched contract manifest to register tools immediately on startup. */
   prefetchedManifest?: ManifestLike;
+  /** REQ-705: prefetched `/agent/skill.md` body (fetched once in `cli.ts`'s
+   * `main()`, alongside `prefetchedManifest`). Absent when the fetch failed
+   * or was disabled -- the `figpea_skill` tool degrades gracefully rather
+   * than being omitted from `tools/list`. */
+  prefetchedSkillBody?: string;
 }
 
 const DEFAULT_EDITOR_BASE_URL = 'https://editor.figpea.com';
@@ -54,6 +59,13 @@ function toCallToolResult(mapped: { content: McpContentBlockLike[]; isError: boo
 
 function jsonTextResult(payload: unknown): CallToolResult {
   return toCallToolResult({ content: [{ type: 'text', text: JSON.stringify(payload) }], isError: false });
+}
+
+/** REQ-705: unlike jsonTextResult, returns `text` verbatim rather than
+ * JSON.stringify-ing it -- figpea_skill's successful result is the raw
+ * markdown reference body, not a JSON-wrapped string. */
+function textResult(text: string): CallToolResult {
+  return toCallToolResult({ content: [{ type: 'text', text }], isError: false });
 }
 
 function buildInputShape(tool: GeneratedTool): Record<string, z.ZodTypeAny> | undefined {
@@ -149,6 +161,33 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         tabConnected: bridge.isTabConnected(),
         contractVersion: bridge.getContractVersion ? bridge.getContractVersion() : null,
         toolCount,
+      });
+    },
+  );
+
+  // REQ-705 — `figpea_skill`: always-registered (mirrors `open_editor`/
+  // `status`, not manifest-derived), no input schema (mirrors `status`'s
+  // no-argument shape). Sourced from `options.prefetchedSkillBody` (set
+  // once in cli.ts's main() via skillFetch.ts's fetchSkill(), alongside the
+  // existing fetchContract() call) -- NOT tab-derived, so unlike the
+  // contract tools it needs no `bridge.onDescribe` re-registration and is
+  // visible in `tools/list` regardless of tab state.
+  server.registerTool(
+    'figpea_skill',
+    {
+      description:
+        "Returns Figpea's agent skill reference -- the craft guidance for using window.figpea well (the authoring loop, recreating a reference faithfully, wiring interactions, the screenshot feedback loop, undo etiquette, entitlement boundaries, and the canonical Tier-1 recipe). Sourced from the editor origin's /agent/skill.md at startup.",
+    },
+    async () => {
+      if (options?.prefetchedSkillBody) {
+        return textResult(options.prefetchedSkillBody);
+      }
+      return jsonTextResult({
+        ok: false,
+        code: 'skill_unavailable',
+        message:
+          'The skill body was not available at startup (fetch failed, or disabled via FIGPEA_DISABLE_CONTRACT_FETCH). ' +
+          'Get it another way: call figpea.SKILL() from a connected editor tab, or GET <editor-origin>/agent/skill.md directly.',
       });
     },
   );

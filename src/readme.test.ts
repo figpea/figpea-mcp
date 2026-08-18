@@ -12,7 +12,7 @@ import * as path from 'node:path';
 const PACKAGE_ROOT = path.resolve(__dirname, '..');
 const readme = fs.readFileSync(path.join(PACKAGE_ROOT, 'README.md'), 'utf8');
 
-const STATIC_TOOLS = ['open_editor', 'status'];
+const STATIC_TOOLS = ['open_editor', 'status', 'figpea_skill'];
 // The literal placeholder pattern name the README uses to describe the
 // live-generated tool naming convention — not a real tool name itself.
 const DOCUMENTED_PLACEHOLDERS = ['group_method'];
