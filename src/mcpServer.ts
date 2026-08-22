@@ -47,7 +47,7 @@ export interface CreateMcpServerOptions {
 
 const DEFAULT_EDITOR_BASE_URL = 'https://editor.figpea.com';
 const SERVER_NAME = 'figpea-mcp';
-const SERVER_VERSION = '1.8.1';
+const SERVER_VERSION = '2.0.1';
 
 function toCallToolResult(mapped: { content: McpContentBlockLike[]; isError: boolean }): CallToolResult {
   // `McpContentBlockLike` mirrors the SDK's own TextContent/ImageContent
@@ -70,7 +70,28 @@ function textResult(text: string): CallToolResult {
 
 function buildInputShape(tool: GeneratedTool): Record<string, z.ZodTypeAny> | undefined {
   if (tool.inputKeys.length === 0) return undefined;
-  const shape: Record<string, z.ZodTypeAny> = {};
+  // REQ-769 — the type mapping below rests on one mechanic of the MCP SDK,
+  // verified empirically against the installed @modelcontextprotocol/sdk +
+  // zod v4 (plan REQ-769 §Tech design): every registered zod shape serves
+  // TWO roles. On `tools/list` the SDK advertises the shape as JSON Schema
+  // (`toJsonSchemaCompat`, server/mcp.js ~L75-90); on every `tools/call` it
+  // VALIDATES the arguments with `safeParseAsync` (~L430). The only construct
+  // satisfying both AC-1 (real types advertised) and AC-2 (zero new
+  // rejections) is `z.any().meta({ type })`: `.meta()` flows a `type` into
+  // the JSON-Schema advertisement, while parse remains literally z.any() —
+  // mismatched and omitted values still pass exactly as before. Plain typed
+  // schemas (z.string(), z.record(), …) would add server-side rejections;
+  // `z.record(...).catch(ctx => ctx.input)` parses permissively but
+  // `z.toJSONSchema` throws "Dynamic catch values are not supported in JSON
+  // Schema", so it cannot serve the advertisement role at all.
+  const TYPE_TO_ADVERTISED: Record<string, Record<string, unknown>> = {
+    object: { type: 'object', additionalProperties: true },
+    string: { type: 'string' },
+    number: { type: 'number' },
+    boolean: { type: 'boolean' },
+    array: { type: 'array' },
+    matrix: { type: 'array' }, // affine transform tuple — advertised as an array (AC-1)
+  };  const shape: Record<string, z.ZodTypeAny> = {};
   for (const key of tool.inputKeys) {
     // Permissive by design (plan §1): descriptor params are informal,
     // human-readable hints, not a machine schema -- z.any() is the faithful
@@ -96,9 +117,23 @@ function buildInputShape(tool: GeneratedTool): Record<string, z.ZodTypeAny> | un
     // NEVER enforced here as a rejection -- the key stays `.optional()`
     // regardless, preserving the same permissive default above (Q1's
     // decision, and the `canvas.screenshot(options?)` fix's intent).
-    const enumValues = tool.paramSchemas?.[key]?.enum;
-    shape[key] =
-      enumValues && enumValues.length > 0 ? z.enum(enumValues as [string, ...string[]]).optional() : z.any().optional();
+    //
+    // REQ-769 (AC-1): a structured schema carrying a known `type` advertises
+    // that type via meta-typed z.any() (see the two-role comment above) so
+    // type-respecting MCP clients stop stringifying object/array arguments.
+    // Precedence: enum first — an enum param is by definition a constrained
+    // string; unknown/absent types keep today's bare `z.any().optional()`
+    // byte-for-byte (legacy pre-REQ-093 free-text-hint descriptors included).
+    const paramSchema = tool.paramSchemas?.[key];
+    const enumValues = paramSchema?.enum;
+    const advertised = paramSchema ? TYPE_TO_ADVERTISED[paramSchema.type] : undefined;
+    if (enumValues && enumValues.length > 0) {
+      shape[key] = z.enum(enumValues as [string, ...string[]]).optional();
+    } else if (advertised) {
+      shape[key] = z.any().meta(advertised).optional();
+    } else {
+      shape[key] = z.any().optional();
+    }
   }
   return shape;
 }

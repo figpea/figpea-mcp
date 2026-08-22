@@ -474,6 +474,311 @@ describe('REQ-699 — prefetchedManifest & reconciliation / structural discrimin
   });
 });
 
+/**
+ * REQ-769 T1 — AC-1 + AC-4 red repro (docs/plans/REQ-769.md). Root cause:
+ * `buildInputShape()` honors only `enum` from each structured ParamSchema and
+ * maps everything else to `z.any().optional()`, which Zod v4 serializes as
+ * `{}` in the JSON Schema the SDK advertises over `tools/list` — so every
+ * object/array param (`layer_create.props`, `layer_setPosition.pos`,
+ * `layer_stylePatch.patch`, `session_setSelection.ids`) is advertised untyped
+ * and type-respecting clients stringify structured arguments.
+ *
+ * Two halves, both written against the ACCEPTANCE CRITERIA (not the fix):
+ *  (a) schema half — a real SDK Client's `tools/list` advertisement declares
+ *      the six structured types of AC-1 (objects passthrough with
+ *      additionalProperties:true, scalars typed, arrays/matrix typed array);
+ *  (b) chain half — a real `client.callTool` with an object argument delivers
+ *      it to the stub bridge's `callTab` still `typeof "object"`.
+ *
+ * Same harness as REQ-093's AC-4 block above: InMemoryTransport linked pair +
+ * real Client, `onDescribe` firing synchronously with an inline manifest
+ * carrying structured params mirroring the live surface's methods.
+ */
+describe('REQ-769 AC-1/AC-4: contract tools advertise structured param types from the manifest', () => {
+  const TYPED_MANIFEST = {
+    layer: {
+      setPosition: {
+        doc: 'Places a layer visible box at world coords.',
+        params: {
+          id: { type: 'string', required: true },
+          pos: { type: 'object', required: true, shape: { x: { type: 'number' }, y: { type: 'number' } } },
+        },
+        result: {},
+      },
+      create: {
+        doc: 'Creates a new layer.',
+        params: {
+          kind: { type: 'string', required: true, enum: ['rect', 'ellipse', 'text'] },
+          props: { type: 'object', required: false },
+        },
+        result: {},
+      },
+      stylePatch: {
+        doc: 'Patches layer style keys.',
+        params: {
+          id: { type: 'string', required: true },
+          patch: { type: 'object', required: true },
+        },
+        result: {},
+      },
+      setTransform: {
+        doc: 'Sets the affine transform.',
+        params: {
+          id: { type: 'string', required: true },
+          matrix: { type: 'array', required: true },
+        },
+        result: {},
+      },
+    },
+    canvas: {
+      // REQ-769 review-r1 F1: pin the bare scalar branches of the type
+      // mapping — number and boolean params without enum must advertise
+      // their own types, never regress to an untyped {} advertisement.
+      setZoom: {
+        doc: 'Sets the viewport zoom level.',
+        params: {
+          zoom: { type: 'number', required: false },
+        },
+        result: {},
+      },
+      setGridVisible: {
+        doc: 'Toggles grid visibility.',
+        params: {
+          visible: { type: 'boolean', required: false },
+        },
+        result: {},
+      },
+    },
+    session: {
+      setSelection: {
+        doc: 'Sets the current selection.',
+        params: {
+          ids: { type: 'array', required: false },
+        },
+        result: {},
+      },
+    },
+  };
+
+  function typedBridge(overrides?: Partial<BridgeServerHandleStub>) {
+    return fakeBridge({
+      onDescribe: (handler) => handler(TYPED_MANIFEST),
+      ...overrides,
+    });
+  }
+
+  async function toolByName(client: Client, name: string): Promise<any> {
+    const { tools } = await client.listTools();
+    const tool = tools.find((t) => t.name === name);
+    expect(tool, `${name} is registered from the typed manifest`).toBeDefined();
+    return tool;
+  }
+
+  it('(AC-1 schema half) layer_setPosition advertises pos.type="object" (passthrough, additionalProperties:true) and id.type="string"', async () => {
+    const client = await connectedClient(typedBridge());
+    const posSchema = ((await toolByName(client, 'layer_setPosition')).inputSchema?.properties?.pos);
+    expect(posSchema?.type, 'pos is advertised as object').toBe('object');
+    expect(posSchema?.additionalProperties, 'object params stay passthrough — unknown keys keep flowing').toBe(true);
+    const idSchema = (await toolByName(client, 'layer_setPosition')).inputSchema?.properties?.id;
+    expect(idSchema?.type, 'id is advertised as string').toBe('string');
+  });
+
+  it('(AC-1 schema half) layer_create advertises props.type="object"; layer_stylePatch advertises patch.type="object"', async () => {
+    const client = await connectedClient(typedBridge());
+    expect((await toolByName(client, 'layer_create')).inputSchema?.properties?.props?.type).toBe('object');
+    expect((await toolByName(client, 'layer_stylePatch')).inputSchema?.properties?.patch?.type).toBe('object');
+  });
+
+  it('(AC-1 schema half) bare number and boolean params advertise their own scalar types — never an untyped {} (review-r1 F1)', async () => {
+    const client = await connectedClient(typedBridge());
+    const zoom = (await toolByName(client, 'canvas_setZoom')).inputSchema?.properties?.zoom;
+    expect(zoom?.type, 'a bare {type:"number"} param advertises type "number"').toBe('number');
+    const visible = (await toolByName(client, 'canvas_setGridVisible')).inputSchema?.properties?.visible;
+    expect(visible?.type, 'a bare {type:"boolean"} param advertises type "boolean"').toBe('boolean');
+  });
+
+  it('(AC-1 schema half) session_setSelection advertises ids.type="array" and layer_setTransform advertises matrix.type="array"', async () => {
+    const client = await connectedClient(typedBridge());
+    expect((await toolByName(client, 'session_setSelection')).inputSchema?.properties?.ids?.type).toBe('array');
+    // matrix (an affine transform tuple) is advertised as an array per AC-1.
+    expect((await toolByName(client, 'layer_setTransform')).inputSchema?.properties?.matrix?.type).toBe('array');
+  });
+
+  it('(AC-4 chain half) an object argument sent through a real client.callTool reaches bridge.callTab still typeof "object", contents intact', async () => {
+    const captured: Array<unknown[]> = [];
+    const bridge = typedBridge({
+      isTabConnected: () => true,
+      callTab: async (_group, _method, args) => {
+        captured.push(args);
+        return { ok: true, value: null };
+      },
+    });
+    const client = await connectedClient(bridge);
+
+    const result = await callToolJson(client, 'layer_setPosition', { id: 'test-id', pos: { x: 10, y: 10 } });
+    expect(result.ok, 'the call succeeds end-to-end').toBe(true);
+
+    expect(captured.length, 'bridge.callTab was reached exactly once').toBe(1);
+    const [idArg, posArg] = captured[0];
+    expect(idArg).toBe('test-id');
+    expect(typeof posArg, 'the object argument arrives as a real object, not a JSON string').toBe('object');
+    expect(posArg, 'contents survive the relay intact').toEqual({ x: 10, y: 10 });
+  });
+});
+
+/**
+ * REQ-769 T3 — guard pins around the AC-1/AC-2/AC-4 fix (docs/plans/REQ-769.md
+ * task T3). Deliberate regression fences, written AFTER the fix they fence:
+ * each behavior below holds both before and after T2's change, so any future
+ * refactor of buildInputShape that breaks permissiveness (AC-2), legacy
+ * registration (AC-3), or the enum mapping (AC-5) fails here loudly.
+ */
+describe('REQ-769 T3 guard pins — permissiveness, legacy manifests, enum precedence', () => {
+  const PIN_MANIFEST = {
+    layer: {
+      setPosition: {
+        doc: 'Places a layer visible box at world coords.',
+        params: {
+          id: { type: 'string', required: true },
+          pos: { type: 'object', required: true },
+        },
+        result: {},
+      },
+    },
+    legacy: {
+      hintMethod: {
+        doc: 'A pre-REQ-093 descriptor whose params are legacy free-text hint strings.',
+        params: {
+          target: 'the layer id to act on',
+          options: '{width, height} — informal shape hint',
+        },
+        result: {},
+      },
+    },
+  };
+
+  function pinnedBridge(overrides?: Partial<BridgeServerHandleStub>) {
+    return fakeBridge({
+      onDescribe: (handler) => handler(PIN_MANIFEST),
+      ...overrides,
+    });
+  }
+
+  it('(AC-2) a wrong-typed value (string where "object" is advertised) still reaches bridge.callTab untouched', async () => {
+    const captured: Array<unknown[]> = [];
+    const bridge = pinnedBridge({
+      isTabConnected: () => true,
+      callTab: async (_g, _m, args) => {
+        captured.push(args);
+        return { ok: true, value: null };
+      },
+    });
+    const client = await connectedClient(bridge);
+
+    // The schema ADVERTISES pos as object; supplying a string must not be
+    // rejected server-side — the value passes through value-identical.
+    const result = await callToolJson(client, 'layer_setPosition', { id: 'x', pos: 'i-am-not-an-object' });
+    expect(result.ok).toBe(true);
+    expect(captured.length).toBe(1);
+    expect(captured[0][0]).toBe('x');
+    expect(captured[0][1]).toBe('i-am-not-an-object');
+  });
+
+  it('(AC-2) an entirely omitted optional key reaches bridge.callTab as an undefined positional slot (inputKeys.map convention)', async () => {
+    const captured: Array<unknown[]> = [];
+    const bridge = pinnedBridge({
+      isTabConnected: () => true,
+      callTab: async (_g, _m, args) => {
+        captured.push(args);
+        return { ok: true, value: null };
+      },
+    });
+    const client = await connectedClient(bridge);
+
+    const result = await callToolJson(client, 'layer_setPosition', { id: 'only-id' });
+    expect(result.ok).toBe(true);
+    expect(captured[0].length, 'positional arity is preserved').toBe(2);
+    expect(captured[0][0]).toBe('only-id');
+    expect(captured[0][1], 'the omitted key lands as undefined in its declared position').toBeUndefined();
+  });
+
+  it('(AC-2) every typed-mapped property stays .optional() in the advertisement — none appear in inputSchema.required', async () => {
+    const client = await connectedClient(pinnedBridge());
+    const { tools } = await client.listTools();
+    const setPosition = tools.find((t) => t.name === 'layer_setPosition');
+    const required: string[] | undefined = (setPosition as any)?.inputSchema?.required;
+    expect(required ?? []).toEqual([]);
+  });
+
+  it('(AC-3) a legacy free-text-hint descriptor registers unchanged and its properties stay untyped {} advertisements', async () => {
+    const client = await connectedClient(pinnedBridge());
+    const { tools } = await client.listTools();
+    const hint = tools.find((t) => t.name === 'legacy_hintMethod');
+    expect(hint, 'legacy descriptor registers successfully').toBeDefined();
+    const props = (hint as any)?.inputSchema?.properties;
+    expect(Object.keys(props ?? {}).sort()).toEqual(['options', 'target']);
+    // Untyped: today's z.any().optional() serializes to an empty property schema.
+    expect(props.target ?? {}).toEqual({});
+    expect(props.options ?? {}).toEqual({});
+  });
+
+  it('(AC-5) an enum-carrying param still advertises {type:"string", enum:[…]} alongside typed params', async () => {
+    const ENUM_MANIFEST = {
+      layer: {
+        reorder: {
+          doc: 'Moves a layer relative to a target.',
+          params: {
+            id: { type: 'string', required: true },
+            pos: { type: 'string', required: true, enum: ['before', 'on', 'after'] },
+          },
+          result: {},
+        },
+      },
+    };
+    const bridge = fakeBridge({ onDescribe: (handler) => handler(ENUM_MANIFEST) });
+    const client = await connectedClient(bridge);
+    const { tools } = await client.listTools();
+    const pos = (tools.find((t) => t.name === 'layer_reorder') as any)?.inputSchema?.properties?.pos;
+    expect(pos?.type, 'enum params advertise their constrained string type').toBe('string');
+    expect(pos?.enum).toEqual(['before', 'on', 'after']);
+    // And its parse stays enum-constrained (pre-existing REQ-093 behavior):
+    // a non-listed value is rejected by the SDK's validation role.
+    const bridge2 = fakeBridge({
+      onDescribe: (h) => h(ENUM_MANIFEST),
+      isTabConnected: () => false,
+    });
+    const client2 = await connectedClient(bridge2);
+    const rejected = await client2.callTool({ name: 'layer_reorder', arguments: { id: 'x', pos: 'sideways' } });
+    const rejectedText = ((rejected as any).content as Array<{ type: string; text?: string }>)
+      .find((c) => c.type === 'text')
+      ?.text;
+    expect(
+      rejected.isError === true || /invalid/i.test(rejectedText ?? ''),
+      'non-listed enum value is still rejected (unchanged REQ-093 behavior)',
+    ).toBe(true);
+  });
+
+  it('(AC-5) a param carrying both enum and type resolves enum-FIRST: the advertisement is the constrained string, never the raw type', async () => {
+    const PRECEDENCE_MANIFEST = {
+      layer: {
+        setBlend: {
+          doc: 'Sets blend mode.',
+          params: {
+            mode: { type: 'number', required: true, enum: ['normal', 'multiply'] },
+          },
+          result: {},
+        },
+      },
+    };
+    const bridge = fakeBridge({ onDescribe: (handler) => handler(PRECEDENCE_MANIFEST) });
+    const client = await connectedClient(bridge);
+    const { tools } = await client.listTools();
+    const mode = (tools.find((t) => t.name === 'layer_setBlend') as any)?.inputSchema?.properties?.mode;
+    expect(mode?.type, 'enum wins over the declared type (documented precedence)').toBe('string');
+    expect(mode?.enum).toEqual(['normal', 'multiply']);
+  });
+});
+
 describe('contract tool calls when no tab is connected — AC-1 actionable no_tab error', () => {
   it('returns no_tab with a message and a url carrying origin, agent=1, bridgePort, and bridgeToken', async () => {
     const bridge = fakeBridge({ port: 12345, token: 'secret-tok' });

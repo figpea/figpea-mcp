@@ -10,24 +10,22 @@ import * as path from 'node:path';
 const PACKAGE_ROOT = path.resolve(__dirname, '..');
 const pkg = JSON.parse(fs.readFileSync(path.join(PACKAGE_ROOT, 'package.json'), 'utf8'));
 
-/** REQ-188 AC-5 — the contract `major.minor` this package targets.
+/** REQ-188 AC-5 → REQ-769 reconciliation. This package used to LOCKSTEP its
+ * major.minor with the `window.figpea` contract's major.minor
+ * (TARGET_CONTRACT_MAJOR_MINOR = e.g. '1.8'), reserving the patch slot for
+ * figpea-mcp fixes. That hand-maintained pin is RETIRED as of REQ-699 +
+ * REQ-769: contract currency is now enforced at RUNTIME by origin fetch
+ * (`contractFetch.ts` fetches /agent/contract.json at startup and hard-fails
+ * on an `envVersion` mismatch), replacing the hand-maintained pin the old
+ * comment itself called temporary "until REQ-695". The package versions
+ * independently (currently 2.0.x) while the contract VERSION stays 1.x —
+ * the invariant worth keeping instead is `SERVER_VERSION === pkg.version`
+ * (tested below), so the server never misreports its identity.
  *
- * LOCKSTEP RULE (decided 2026-08-15): this package's `major.minor` tracks the
- * `window.figpea` contract's `major.minor`, and the PATCH slot belongs to
- * figpea-mcp alone, for its own bugfixes. So contract 1.8.0 => 1.8.x here,
- * and a fix that needs no contract change ships as 1.8.1 without inventing a
- * contract version that does not exist. This works because the contract only
- * ever bumps minor/major, never patch.
- *
- * Why the rule exists: with no such coupling this package sat at 0.1.0 while
- * the contract advanced to 1.8.0 — 22 minor bumps and a major — and, because
- * the tool list is generated at runtime, it kept "working" while silently
- * losing every parameter schema (REQ-188). Nothing failed anywhere.
- *
- * ⚠️ Bumping this literal is NOT the whole job. It is a hand-maintained pin
- * until REQ-695 lands the build-breaking sync gate that reads v3's VERSION
- * directly; until then, nothing here can tell you the contract has moved. */
-const TARGET_CONTRACT_MAJOR_MINOR = '1.8';
+ * The gate below is NOT vacuous: it reads the real fetch module and asserts
+ * the runtime envVersion gate actually exists and is armed (EXPECTED_ENV_
+ * VERSION declared and an env_mismatch failure status produced on drift). */
+const EXPECTED_RUNTIME_ENV_GATE = 2;
 
 describe('package.json metadata (AC-3)', () => {
   it('is unscoped, independently versioned, and MIT-licensed', () => {
@@ -36,12 +34,22 @@ describe('package.json metadata (AC-3)', () => {
     expect(pkg.private).toBeUndefined();
   });
 
-  it('tracks the contract major.minor, reserving the patch slot for its own fixes (REQ-188 AC-5)', () => {
-    const [major, minor, patch] = String(pkg.version).split('.');
-    expect(`${major}.${minor}`).toBe(TARGET_CONTRACT_MAJOR_MINOR);
-    // The patch slot is ours: any value is legitimate, but it must exist, so
-    // the version stays a well-formed semver triple.
-    expect(patch).toMatch(/^\d+$/);
+  it('versions independently of the contract, guarded at runtime by the envVersion gate (REQ-769, replacing the REQ-188 lockstep pin)', () => {
+    // The package version is a well-formed semver triple, free to drift from
+    // the contract's major.minor (currently contract 1.x vs package 2.0.x).
+    expect(String(pkg.version)).toMatch(/^\d+\.\d+\.\d+$/);
+
+    // The replacement for the hand-maintained lockstep pin is the RUNTIME
+    // gate: assert it exists and is armed in the real fetch module — a
+    // mismatched editor envelope must produce an explicit env_mismatch
+    // failure status rather than silently relaying a stale contract.
+    const fetchSource = fs.readFileSync(path.join(PACKAGE_ROOT, 'src', 'contractFetch.ts'), 'utf8');
+    const declaredGate = /export const EXPECTED_ENV_VERSION = (\d+)/.exec(fetchSource)?.[1];
+    expect(declaredGate, 'contractFetch arms its envVersion gate with an explicit expected value').toBe(
+      String(EXPECTED_RUNTIME_ENV_GATE),
+    );
+    expect(fetchSource).toContain("status: 'env_mismatch'");
+    expect(fetchSource).toContain('envVersion !== EXPECTED_ENV_VERSION');
   });
 
   it('reports the same version over MCP as it declares in package.json', () => {
