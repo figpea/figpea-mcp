@@ -282,7 +282,15 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(id);
-          reject(new Error(`figpea-mcp bridgeServer: call ${group}.${method} timed out after ${timeoutMs}ms`));
+          // REQ-772 AC-3: a relay timeout is NOT proof the tab failed — the
+          // tab keeps executing and the effect (e.g. layer.create) may land
+          // anyway. The rejection must say so, so callers check state before
+          // blindly retrying non-idempotent mutations.
+          reject(
+            new Error(
+              `figpea-mcp bridgeServer: call ${group}.${method} timed out after ${timeoutMs}ms; the editor may still be executing this call — check state before retrying`,
+            ),
+          );
         }, timeoutMs);
         pending.set(id, { resolve, reject, timer });
         sendFrame(socket, frame);

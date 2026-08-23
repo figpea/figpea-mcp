@@ -19,7 +19,25 @@ const DOCUMENTED_PLACEHOLDERS = ['group_method'];
 // Real group_method names from v3's agent-API contract (src/agent/index.ts's
 // registerGroup calls + the layer/canvas/export descriptors), used as README
 // examples of live-generated contract tools.
-const REAL_CONTRACT_TOOL_EXAMPLES = ['layer_setPosition', 'canvas_screenshot', 'export_project'];
+const REAL_CONTRACT_TOOL_EXAMPLES = [
+  'layer_setPosition',
+  'canvas_screenshot',
+  'export_project',
+  // REQ-772 AC-5: named in the Call-timeouts retry guidance / state-check
+  // advice — all real v3 contract tools.
+  'layer_create',
+  'session_layerTree',
+];
+// REQ-772 AC-5 — the known-slow methods whose raised defaults the README's
+// "Call timeouts" section documents. All six are real contract tools.
+const TIMEOUT_TABLE_METHODS = [
+  'session_openFile',
+  'session_waitForIdle',
+  'export_project',
+  'export_specBundle',
+  'export_assetHarvest',
+  'export_figmaKit',
+];
 
 describe('README.md (AC-5)', () => {
   it('exists and is non-empty', () => {
@@ -47,7 +65,14 @@ describe('README.md (AC-5)', () => {
       ...[...readme.matchAll(groupMethodPattern)].map((m) => m[1]),
       ...STATIC_TOOLS.filter((name) => readme.includes('`' + name + '`')),
     ];
-    const allowed = new Set([...STATIC_TOOLS, ...REAL_CONTRACT_TOOL_EXAMPLES, ...DOCUMENTED_PLACEHOLDERS]);
+    const allowed = new Set([
+      ...STATIC_TOOLS,
+      ...REAL_CONTRACT_TOOL_EXAMPLES,
+      // REQ-772 AC-5: the known-slow methods named in the "Call timeouts"
+      // section are real contract tools too.
+      ...TIMEOUT_TABLE_METHODS,
+      ...DOCUMENTED_PLACEHOLDERS,
+    ]);
     for (const name of referenced) {
       expect(allowed.has(name), `README references unknown tool name: ${name}`).toBe(true);
     }
@@ -78,5 +103,19 @@ describe('README.md (AC-5)', () => {
 
   it('documents automated-browser and agent harness pairing options (AC-10)', () => {
     expect(readme).toContain('Automated Browser');
+  });
+
+  // REQ-772 AC-5 — the four content pins from the marketing brief §2: the
+  // reserved key, the cap number, the table method names, and the AC-3
+  // ambiguity phrasing, plus clamp-not-error semantics.
+  it('documents call timeouts: reserved _timeoutMs key, cap, table methods, and honest retry guidance (REQ-772 AC-5)', () => {
+    expect(readme).toContain('_timeoutMs');
+    expect(readme, 'the documented cap number matches MAX_CALL_TIMEOUT_MS').toContain('120000');
+    expect(readme, 'values above the cap are clamped, not rejected').toMatch(/clamp/i);
+    for (const method of TIMEOUT_TABLE_METHODS) {
+      expect(readme, `README documents the raised default for ${method}`).toContain(method);
+    }
+    expect(readme, 'the AC-3 ambiguity clause is quoted in the retry guidance').toContain('may still be executing');
+    expect(readme, 'never forwarded to the tab-side method is stated').toMatch(/never forwarded|not forwarded/i);
   });
 });

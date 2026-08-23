@@ -49,6 +49,39 @@ const DEFAULT_EDITOR_BASE_URL = 'https://editor.figpea.com';
 const SERVER_NAME = 'figpea-mcp';
 const SERVER_VERSION = '2.0.1';
 
+/** REQ-772 AC-1 — the documented maximum a per-call `_timeoutMs` override may
+ * raise a single bridge call's timeout to. Values above it are clamped (not
+ * rejected), per the README's stated semantics. */
+export const MAX_CALL_TIMEOUT_MS = 120_000;
+
+/** REQ-772 AC-2 — raised default timeouts for known-slow contract methods,
+ * keyed by tool name (`${group}_${method}`). Lives next to the tool
+ * registration so docs and code stay in one place; every method NOT listed
+ * here keeps `callTab`'s own flat 10s default (AC-4 — the fast path is
+ * byte-for-byte unchanged: an `undefined` 4th arg hits callTab's default
+ * parameter exactly as before). Mirrored verbatim in README.md ("Call
+ * timeouts") and the shipped skill markdown — keep them in sync. */
+export const DEFAULT_TIMEOUT_TABLE_MS: Record<string, number> = {
+  session_openFile: 120_000,
+  session_waitForIdle: 30_000,
+  export_project: 120_000,
+  export_specBundle: 60_000,
+  export_assetHarvest: 120_000,
+  export_figmaKit: 60_000,
+};
+
+/** REQ-772 — resolves the timeout for one contract-tool call:
+ * a usable `_timeoutMs` override (finite, > 0) wins, clamped to the cap;
+ * anything else falls through to the method-aware table, then to `undefined`
+ * (= `callTab`'s built-in 10s default). Non-number/NaN/≤0 values are ignored
+ * rather than rejected — a broken knob must not fail an otherwise-valid call. */
+function resolveTimeoutMs(toolName: string, rawOverride: unknown): number | undefined {
+  if (typeof rawOverride === 'number' && Number.isFinite(rawOverride) && rawOverride > 0) {
+    return Math.min(rawOverride, MAX_CALL_TIMEOUT_MS);
+  }
+  return DEFAULT_TIMEOUT_TABLE_MS[toolName];
+}
+
 function toCallToolResult(mapped: { content: McpContentBlockLike[]; isError: boolean }): CallToolResult {
   // `McpContentBlockLike` mirrors the SDK's own TextContent/ImageContent
   // shapes exactly (plan §1) but is declared independently in the
@@ -68,8 +101,18 @@ function textResult(text: string): CallToolResult {
   return toCallToolResult({ content: [{ type: 'text', text }], isError: false });
 }
 
-function buildInputShape(tool: GeneratedTool): Record<string, z.ZodTypeAny> | undefined {
-  if (tool.inputKeys.length === 0) return undefined;
+function buildInputShape(tool: GeneratedTool): Record<string, z.ZodTypeAny> {
+  const shape: Record<string, z.ZodTypeAny> = {};
+  // REQ-772 AC-1 — every generated contract tool accepts the reserved
+  // `_timeoutMs` key to raise that single call's bridge timeout (capped at
+  // MAX_CALL_TIMEOUT_MS, clamped not rejected). Declared in the shape so it
+  // survives the SDK's safeParseAsync stripping (see the REQ-769 comment
+  // below: undeclared keys never reach the handler); excluded from the
+  // manifest-args mapping by construction (`makeContractHandler` maps only
+  // `inputKeys`, which never contains `_timeoutMs`), so it is never
+  // forwarded to the tab-side method.
+  shape['_timeoutMs'] = z.number().optional();
+  if (tool.inputKeys.length === 0) return shape;
   // REQ-769 — the type mapping below rests on one mechanic of the MCP SDK,
   // verified empirically against the installed @modelcontextprotocol/sdk +
   // zod v4 (plan REQ-769 §Tech design): every registered zod shape serves
@@ -91,7 +134,7 @@ function buildInputShape(tool: GeneratedTool): Record<string, z.ZodTypeAny> | un
     boolean: { type: 'boolean' },
     array: { type: 'array' },
     matrix: { type: 'array' }, // affine transform tuple — advertised as an array (AC-1)
-  };  const shape: Record<string, z.ZodTypeAny> = {};
+  };
   for (const key of tool.inputKeys) {
     // Permissive by design (plan §1): descriptor params are informal,
     // human-readable hints, not a machine schema -- z.any() is the faithful
@@ -240,9 +283,13 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           }),
         );
       }
+      // `_timeoutMs` is a reserved top-level key (REQ-772 AC-1), excluded
+      // from the manifest-args mapping by construction: only `inputKeys` are
+      // forwarded positionally to the tab-side method.
+      const effectiveTimeoutMs = resolveTimeoutMs(`${groupName}_${methodName}`, rawArgs['_timeoutMs']);
       const args = inputKeys.map((key) => rawArgs[key]);
       try {
-        const result = (await bridge.callTab(groupName, methodName, args)) as FigpeaCallResultLike;
+        const result = (await bridge.callTab(groupName, methodName, args, effectiveTimeoutMs)) as FigpeaCallResultLike;
         return toCallToolResult(resultToContent(result));
       } catch (e) {
         return toCallToolResult(
@@ -272,11 +319,16 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
 
     const inputShape = buildInputShape(tool);
     const handler = makeContractHandler(groupName, methodName, tool.inputKeys);
-    const registeredTool = inputShape
-      ? server.registerTool(tool.name, { description: tool.description, inputSchema: inputShape }, (args) =>
-          handler(args as Record<string, unknown>),
-        )
-      : server.registerTool(tool.name, { description: tool.description }, () => handler({}));
+    // REQ-772: buildInputShape now ALWAYS returns a shape (it carries the
+    // reserved `_timeoutMs` key even for zero-param methods), so the former
+    // no-schema zero-param registration branch — which dropped ALL arguments
+    // and made `_timeoutMs` unreachable for those tools — is removed. Every
+    // contract tool registers with a schema and receives its rawArgs.
+    const registeredTool = server.registerTool(
+      tool.name,
+      { description: tool.description, inputSchema: inputShape },
+      (args) => handler(args as Record<string, unknown>),
+    );
 
     registeredTools.set(tool.name, registeredTool);
     registeredMeta.set(tool.name, { description: tool.description, inputKeys: tool.inputKeys });

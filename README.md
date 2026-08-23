@@ -51,6 +51,26 @@ The contract-tool list reflects whatever the connected editor advertises — it 
 
 Every call returns `{ok: true, value}` or `{ok: false, code, message}`. Image-shaped results (`canvas.screenshot`, raster exports) come back as MCP image content alongside a text summary.
 
+## Call timeouts
+
+Every relayed call has a bridge timeout. Two knobs control it:
+
+- **Per-call override** — every generated contract tool accepts an optional top-level `_timeoutMs` input key that raises that single call's timeout, e.g. `{ "url": "…", "_timeoutMs": 120000 }`. It is a reserved key: it is never forwarded to the editor-side method (it is not part of any method's arguments) and only affects the relay's own deadline. The documented maximum is **120000 ms (120 seconds)**; values above it are clamped to the cap rather than rejected.
+- **Raised defaults for known-slow methods** — methods that legitimately run long get longer default ceilings automatically:
+
+  | Tool | Default timeout |
+  |------|-----------------|
+  | `session_openFile` | 120000 ms |
+  | `session_waitForIdle` | 30000 ms |
+  | `export_project` | 120000 ms |
+  | `export_specBundle` | 60000 ms |
+  | `export_assetHarvest` | 120000 ms |
+  | `export_figmaKit` | 60000 ms |
+
+  Everything else keeps the flat 10-second default.
+
+When a call does time out, the error says so honestly — `timed out after Nms; the editor may still be executing this call — check state before retrying`. **Do not blindly retry a failed mutation**: the tab keeps working after the relay gives up, so the effect may have landed anyway (retrying a non-idempotent call like `layer_create` duplicates the layer). Check state first (`status`, `session_layerTree`) and re-issue reads and idempotent setters freely.
+
 ## Security model
 
 - The bridge binds **localhost only** (`127.0.0.1`) — never a public interface.

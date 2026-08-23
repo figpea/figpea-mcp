@@ -716,7 +716,12 @@ describe('REQ-769 T3 guard pins — permissiveness, legacy manifests, enum prece
     const hint = tools.find((t) => t.name === 'legacy_hintMethod');
     expect(hint, 'legacy descriptor registers successfully').toBeDefined();
     const props = (hint as any)?.inputSchema?.properties;
-    expect(Object.keys(props ?? {}).sort()).toEqual(['options', 'target']);
+    // REQ-772: `_timeoutMs` is the reserved per-call timeout key added to
+    // EVERY generated contract tool's shape — it joins the advertised
+    // properties by design. The pin's original point (the legacy
+    // free-text-hint params themselves stay untyped {}) is unchanged.
+    expect(Object.keys(props ?? {}).sort()).toEqual(['_timeoutMs', 'options', 'target']);
+    expect(props._timeoutMs?.type, 'the reserved key advertises as number (REQ-772)').toBe('number');
     // Untyped: today's z.any().optional() serializes to an empty property schema.
     expect(props.target ?? {}).toEqual({});
     expect(props.options ?? {}).toEqual({});
@@ -776,6 +781,220 @@ describe('REQ-769 T3 guard pins — permissiveness, legacy manifests, enum prece
     const mode = (tools.find((t) => t.name === 'layer_setBlend') as any)?.inputSchema?.properties?.mode;
     expect(mode?.type, 'enum wins over the declared type (documented precedence)').toBe('string');
     expect(mode?.enum).toEqual(['normal', 'multiply']);
+  });
+});
+
+/**
+ * REQ-772 T1 (AC-1, AC-6, docs/plans/REQ-772.md task T1b) — a contract tool
+ * called with the reserved `_timeoutMs` key must raise that single call's
+ * bridge timeout by passing it as `callTab`'s 4th argument. RED on the
+ * unfixed tree: `makeContractHandler` calls `callTab(group, method, args)`
+ * with no fourth argument, so the stub records `undefined`.
+ */
+describe('REQ-772 AC-1 — contract tools forward _timeoutMs to bridge.callTab', () => {
+  const TIMEOUT_MANIFEST = {
+    layer: {
+      setPosition: {
+        doc: 'Places a layer visible box at world coords.',
+        params: {
+          id: { type: 'string', required: true },
+          pos: { type: 'object', required: true },
+        },
+        result: {},
+      },
+    },
+  };
+
+  function recordingBridge() {
+    const captured: Array<{ group: string; method: string; args: unknown[]; timeoutMs?: number }> = [];
+    const bridge = fakeBridge({
+      onDescribe: (handler) => handler(TIMEOUT_MANIFEST),
+      isTabConnected: () => true,
+      callTab: async (group, method, args, timeoutMs) => {
+        captured.push({ group, method, args, timeoutMs });
+        return { ok: true, value: null };
+      },
+    });
+    return { bridge, captured };
+  }
+
+  it('a _timeoutMs argument raises that single call\'s bridge timeout (callTab\'s resolved 4th arg)', async () => {
+    const { bridge, captured } = recordingBridge();
+    const client = await connectedClient(bridge);
+
+    const result = await callToolJson(client, 'layer_setPosition', {
+      id: 'x',
+      pos: { x: 0, y: 0 },
+      _timeoutMs: 45_000,
+    });
+    expect(result.ok, 'the call succeeds end-to-end').toBe(true);
+    expect(captured.length).toBe(1);
+    expect(captured[0].timeoutMs, 'the override reaches callTab as its resolved timeoutMs').toBe(45_000);
+  });
+
+  it('_timeoutMs is never forwarded into the manifest-args mapping (never reaches the tab-side args)', async () => {
+    const { bridge, captured } = recordingBridge();
+    const client = await connectedClient(bridge);
+
+    await callToolJson(client, 'layer_setPosition', { id: 'x', pos: { x: 1, y: 2 }, _timeoutMs: 45_000 });
+    expect(JSON.stringify(captured[0].args), 'args stay exactly the manifest inputKeys').not.toContain('timeout');
+  });
+});
+
+/**
+ * REQ-772 T3 (AC-1, AC-2, AC-4, AC-6 — docs/plans/REQ-772.md task T3) — the
+ * timeout-knob behavior table. Written against the ACs, red on the unfixed
+ * tree (the handler passes no timeout and declares no `_timeoutMs` key).
+ *
+ * EMPIRICAL PROBE (REQ-769-style recorded observation, run before these
+ * tests were written): with the installed @modelcontextprotocol/sdk +
+ * zod v4, `tools/call` arguments are validated via `safeParseAsync` against
+ * the registered shape and UNDECLARED KEYS ARE STRIPPED before the handler's
+ * rawArgs — a probe tool declaring only `{id}` received exactly `{id:'a'}`
+ * when called with `{id, _timeoutMs, bogus}`. Consequences pinned here:
+ *  - pre-fix, a caller-supplied `_timeoutMs` never reaches the handler at
+ *    all (it is an undeclared key) — consistent with the T1 red;
+ *  - post-fix, declaring `_timeoutMs` in every generated shape is required
+ *    AND sufficient for it to reach the handler;
+ *  - non-number values (`'45000'`, `null`, …) are rejected client-side by
+ *    the declared `z.number()` schema (like REQ-093 enums), so they are not
+ *    wire-reachable; JSON cannot carry NaN. The resolver still defends
+ *    typeof/NaN/≤0 for robustness; the wire-testable fallback row is ≤0.
+ */
+describe('REQ-772 AC-1/AC-2/AC-4 — per-call _timeoutMs override + method-aware default table', () => {
+  /** Manifest carrying one zero-param method plus one single-param control,
+   * mirroring the real surface's shapes (`session_layerTree` is zero-param
+   * in v3's session descriptor). */
+  const KNOB_MANIFEST = {
+    session: {
+      layerTree: { doc: 'Returns the layer tree.', params: {}, result: {} },
+      waitForIdle: { doc: 'Waits for idle.', params: { timeout: { type: 'number', required: false } }, result: {} },
+      openFile: { doc: 'Opens a design file.', params: { url: { type: 'string', required: true } }, result: {} },
+    },
+    export: {
+      project: { doc: 'Exports the project.', params: {}, result: {} },
+      assetHarvest: { doc: 'Harvests assets.', params: {}, result: {} },
+      figmaKit: { doc: 'Builds the Figma kit.', params: {}, result: {} },
+      specBundle: { doc: 'Spec bundle.', params: {}, result: {} },
+    },
+    layer: {
+      setPosition: {
+        doc: 'Places a layer visible box at world coords.',
+        params: {
+          id: { type: 'string', required: true },
+          pos: { type: 'object', required: true },
+        },
+        result: {},
+      },
+    },
+  };
+
+  function knobBridge() {
+    const captured: Array<{ name: string; args: unknown[]; timeoutMs?: number }> = [];
+    const bridge = fakeBridge({
+      onDescribe: (handler) => handler(KNOB_MANIFEST),
+      isTabConnected: () => true,
+      callTab: async (group, method, args, timeoutMs) => {
+        captured.push({ name: `${group}_${method}`, args, timeoutMs });
+        return { ok: true, value: null };
+      },
+    });
+    return { bridge, captured };
+  }
+
+  it('(AC-1) override above the documented cap clamps to the cap instead of being rejected', async () => {
+    const { bridge, captured } = knobBridge();
+    const client = await connectedClient(bridge);
+    const result = await callToolJson(client, 'session_waitForIdle', { timeout: 1000, _timeoutMs: 999_999_999 });
+    expect(result.ok, 'an over-cap override is clamped, not rejected').toBe(true);
+    expect(captured[0].timeoutMs).toBe(120_000);
+  });
+
+  it('(AC-1) zero and negative overrides are ignored — fall through to the default policy', async () => {
+    const { bridge, captured } = knobBridge();
+    const client = await connectedClient(bridge);
+    // Table method + useless override -> falls through to its TABLE value
+    // (corrected: originally asserted against layer_setPosition, which is a
+    // NON-table method and can only ever yield the default path — the AC-2
+    // fall-through needs a DEFAULT_TIMEOUT_TABLE_MS method to be observable).
+    await callToolJson(client, 'session_waitForIdle', { timeout: 1000, _timeoutMs: 0 });
+    await callToolJson(client, 'layer_setPosition', { id: 'x', pos: { x: 0, y: 0 }, _timeoutMs: -5 });
+    expect(captured[0].timeoutMs, 'a table-method with a useless override keeps its table value').toBe(30_000);
+    expect(captured[1].timeoutMs, 'non-table method + useless override = no explicit timeout (default path)').toBeUndefined();
+  });
+
+  it('(AC-2) known-slow methods get their raised defaults whenever no override is given', async () => {
+    const { bridge, captured } = knobBridge();
+    const client = await connectedClient(bridge);
+    await callToolJson(client, 'session_openFile', { url: 'https://example.com/d.fig' });
+    await callToolJson(client, 'session_waitForIdle', {});
+    await callToolJson(client, 'export_project', {});
+    await callToolJson(client, 'export_specBundle', {});
+    await callToolJson(client, 'export_assetHarvest', {});
+    await callToolJson(client, 'export_figmaKit', {});
+    expect(captured.map((c) => [c.name, c.timeoutMs])).toEqual([
+      ['session_openFile', 120_000],
+      ['session_waitForIdle', 30_000],
+      ['export_project', 120_000],
+      ['export_specBundle', 60_000],
+      ['export_assetHarvest', 120_000],
+      ['export_figmaKit', 60_000],
+    ]);
+  });
+
+  it('(AC-4) a non-table method without an override keeps the unchanged default path (no explicit timeout)', async () => {
+    const { bridge, captured } = knobBridge();
+    const client = await connectedClient(bridge);
+    await callToolJson(client, 'layer_setPosition', { id: 'x', pos: { x: 1, y: 1 } });
+    expect(captured[0].timeoutMs, 'callTab receives no explicit override — its own 10s default applies').toBeUndefined();
+  });
+
+  it('(AC-1) a zero-param contract tool honors _timeoutMs too (its registered shape carries the reserved key)', async () => {
+    const { bridge, captured } = knobBridge();
+    const client = await connectedClient(bridge);
+    const result = await callToolJson(client, 'session_layerTree', { _timeoutMs: 45_000 });
+    expect(result.ok).toBe(true);
+    expect(captured[0].timeoutMs, 'zero-param methods are not second-class for timeouts').toBe(45_000);
+  });
+
+  it('(AC-1) _timeoutMs is advertised in the tools/list inputSchema of every generated contract tool', async () => {
+    const { bridge } = knobBridge();
+    const client = await connectedClient(bridge);
+    const { tools } = await client.listTools();
+    for (const name of ['session_layerTree', 'session_openFile', 'layer_setPosition']) {
+      const tool = tools.find((t) => t.name === name);
+      expect(tool, `${name} is registered`).toBeDefined();
+      expect(
+        (tool as any)?.inputSchema?.properties?._timeoutMs,
+        `${name} advertises the reserved _timeoutMs key`,
+      ).toBeDefined();
+    }
+  });
+});
+
+/**
+ * REQ-772 AC-3 propagation guard (T3) — the bridgeServer rejection message
+ * (with its ambiguity clause) must flow through makeContractHandler's catch
+ * into the tool result's bridge_error message unchanged.
+ */
+describe('REQ-772 AC-3 — bridge_error propagation of the honest timeout message', () => {
+  it('a timed-out call surfaces bridge_error whose message carries the ambiguity clause verbatim', async () => {
+    const bridge = fakeBridge({
+      onDescribe: (handler) =>
+        handler({ session: { waitForIdle: { doc: 'Waits.', params: {}, result: {} } } }),
+      isTabConnected: () => true,
+      callTab: async () => {
+        throw new Error(
+          'figpea-mcp bridgeServer: call session.waitForIdle timed out after 30000ms; the editor may still be executing this call — check state before retrying',
+        );
+      },
+    });
+    const client = await connectedClient(bridge);
+    const payload = await callToolJson(client, 'session_waitForIdle', {});
+    expect(payload.ok).toBe(false);
+    expect(payload.code).toBe('bridge_error');
+    expect(payload.message).toContain('may still be executing this call');
+    expect(payload.message).toContain('check state before retrying');
   });
 });
 

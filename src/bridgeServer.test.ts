@@ -305,6 +305,73 @@ async function connectDrillingTab(bridge: BridgeServerHandle, missing: string[] 
   return { ws, seen };
 }
 
+/**
+ * REQ-772 T1 (AC-3 + AC-6, docs/plans/REQ-772.md task T1) — a timed-out
+ * call's error must be HONEST ABOUT AMBIGUITY: the tab keeps executing after
+ * the relay gives up, so the rejection message must say so explicitly.
+ * Written against the AC text, red on the unfixed tree (today's message is
+ * just "timed out after Nms"). Driven through the real ws listener with a
+ * fake tab, mirroring this file's established harness.
+ */
+describe('REQ-772 AC-3 — timeout rejection states the editor may still be executing the call', () => {
+  async function connectSilentTab(bridge: BridgeServerHandle): Promise<WebSocket> {
+    const ws = new WebSocket(`ws://127.0.0.1:${bridge.port}`);
+    openSockets.push(ws);
+    await waitForOpen(ws);
+    ws.send(JSON.stringify({ type: 'hello', token: bridge.token }));
+    await expect.poll(() => bridge.isTabConnected(), { timeout: 3000 }).toBe(true);
+    return ws;
+  }
+
+  it('a call whose tab never replies rejects with the full ambiguity clause', async () => {
+    const bridge = trackHandle(await startBridgeServer());
+    await connectSilentTab(bridge);
+
+    let rejection: unknown;
+    try {
+      await bridge.callTab('session', 'waitForIdle', [], 100);
+    } catch (e) {
+      rejection = e;
+    }
+    expect(rejection, 'callTab rejects when nothing answers').toBeInstanceOf(Error);
+    const message = (rejection as Error).message;
+    expect(message).toContain('timed out after 100ms');
+    expect(
+      message,
+      'AC-3: the message must state the tab may still complete the work',
+    ).toContain('may still be executing this call');
+    expect(message, 'AC-3: callers must be told not to blindly retry').toContain('check state before retrying');
+  });
+
+  it('the pending entry is deleted at the deadline while a late tab-side result still arrives (the effect lands anyway)', async () => {
+    const bridge = trackHandle(await startBridgeServer());
+    const ws = await connectSilentTab(bridge);
+
+    const LATE_RESULT_DELAY_MS = 150;
+    const TIMEOUT_MS = 50;
+    // `on`, not `once`: the drill's describe frames arrive first; we act
+    // only on the relayed `call` frame.
+    ws.on('message', (data: WebSocket.RawData) => {
+      const frame = JSON.parse(data.toString());
+      if (frame?.type !== 'call') return;
+      // The tab side keeps working past the relay's deadline and eventually
+      // delivers its result — exactly the ambiguous-failure shape REQ-772
+      // documents. The server must ignore this stale id (entry deleted).
+      setTimeout(() => {
+        ws.send(JSON.stringify({ type: 'result', id: frame.id, ok: true, value: 'late-tab-side-effect' }));
+      }, LATE_RESULT_DELAY_MS);
+    });
+
+    const callPromise = bridge.callTab('session', 'waitForIdle', [], TIMEOUT_MS);
+    await expect(callPromise, 'the relay itself still gives up at its own deadline').rejects.toThrow(/timed out/);
+
+    // Let the late reply arrive and be dropped; the bridge must neither
+    // crash nor wedge — it stays usable for the next call.
+    await new Promise((resolve) => setTimeout(resolve, LATE_RESULT_DELAY_MS + 150));
+    expect(bridge.isTabConnected()).toBe(true);
+  });
+});
+
 describe('startBridgeServer — progressive describe drilling (REQ-188)', () => {
   it('sends a bare describe first, then one per group carrying a selector (AC-2)', async () => {
     const bridge = trackHandle(await startBridgeServer());
