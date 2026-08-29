@@ -1,0 +1,31 @@
+#!/bin/sh
+# post-merge hook: after merging/pulling main, rebuild dist/
+# Installed via: git config core.hooksPath .githooks  (or copy to .git/hooks/post-merge)
+# This keeps the local dist/ in sync after a fast-forward merge from origin/main,
+# which otherwise leaves stale .js in dist/ until the next manual build.
+
+set -e
+
+# Only act when HEAD is main
+branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+if [ "$branch" != "main" ]; then
+  exit 0
+fi
+
+# Detect whether the merge brought changes that affect the build output
+# HEAD@{1} is the pre-merge tip; diff it against new HEAD
+changed="$(git diff --name-only HEAD@{1} HEAD 2>/dev/null | grep -E '^(src/|tsconfig|package)' || true)"
+if [ -z "$changed" ]; then
+  exit 0
+fi
+
+echo "[post-merge] main updated ($changed) — rebuilding dist/..."
+# Run build from repo root (hook cwd is repo root, but be defensive)
+repo_root="$(git rev-parse --show-toplevel)"
+( cd "$repo_root" && npm run build )
+
+# Optional: also verify typecheck doesn't break after merge
+# (uncomment if you want the hook to be a hard gate)
+# ( cd "$repo_root" && npm run typecheck )
+
+echo "[post-merge] dist/ rebuilt"
