@@ -57,6 +57,9 @@ export interface ParamSchemaLike {
   type: string;
   required: boolean;
   enum?: string[];
+  shape?: Record<string, ParamSchemaLike>;
+  byKind?: Record<string, Record<string, ParamSchemaLike>>;
+  of?: ParamSchemaLike;
 }
 
 export interface GeneratedTool {
@@ -106,11 +109,108 @@ function buildParamSchemas(descriptor: ManifestMethodDescriptorLike): Record<str
   for (const [key, value] of Object.entries(params)) {
     if (!isStructuredParamSchema(value)) continue;
     schemas ??= {};
-    schemas[key] = {
+    const raw = value as unknown as Record<string, unknown>;
+    const schema: ParamSchemaLike = {
       type: value.type,
       required: value.required,
       ...(Array.isArray(value.enum) ? { enum: [...value.enum] as string[] } : {}),
     };
+    // Preserve nested shape/byKind/of for detailed JSON Schema advertisement and coercion (REQ-769 follow-up)
+    if (raw.shape !== undefined && typeof raw.shape === 'object' && raw.shape !== null) {
+      const shape = raw.shape as Record<string, unknown>;
+      const nested: Record<string, ParamSchemaLike> = {};
+      let hasNested = false;
+      for (const [k, v] of Object.entries(shape)) {
+        if (isStructuredParamSchema(v)) {
+          // Recursively preserve nested schemas (handle one level of nesting for object shapes)
+          const inner = v as unknown as Record<string, unknown>;
+          const innerSchema: ParamSchemaLike = {
+            type: (v as ParamSchemaLike).type,
+            required: (v as ParamSchemaLike).required,
+            ...(Array.isArray((v as ParamSchemaLike).enum) ? { enum: [...(v as ParamSchemaLike).enum!] } : {}),
+          };
+          if (inner.shape && typeof inner.shape === 'object') {
+            const innerShape = inner.shape as Record<string, unknown>;
+            const innerNested: Record<string, ParamSchemaLike> = {};
+            let hasInnerNested = false;
+            for (const [ik, iv] of Object.entries(innerShape)) {
+              if (isStructuredParamSchema(iv)) {
+                innerNested[ik] = { type: (iv as ParamSchemaLike).type, required: (iv as ParamSchemaLike).required, ...(Array.isArray((iv as ParamSchemaLike).enum) ? { enum: [...(iv as ParamSchemaLike).enum!] } : {}) };
+                hasInnerNested = true;
+              }
+            }
+            if (hasInnerNested) (innerSchema as any).shape = innerNested;
+          }
+          if (inner.of && isStructuredParamSchema(inner.of as unknown)) {
+            (innerSchema as any).of = { type: (inner.of as unknown as ParamSchemaLike).type, required: (inner.of as unknown as ParamSchemaLike).required, ...(Array.isArray((inner.of as unknown as ParamSchemaLike).enum) ? { enum: [...(inner.of as unknown as ParamSchemaLike).enum!] } : {}) };
+            // Handle of.shape for array of objects (e.g., polygon points)
+            const ofShape = (inner.of as unknown as any).shape;
+            if (ofShape && typeof ofShape === 'object') {
+              const ofNested: Record<string, ParamSchemaLike> = {};
+              let hasOfNested = false;
+              for (const [ok, ov] of Object.entries(ofShape as Record<string, unknown>)) {
+                if (isStructuredParamSchema(ov)) {
+                  ofNested[ok] = { type: (ov as ParamSchemaLike).type, required: (ov as ParamSchemaLike).required, ...(Array.isArray((ov as ParamSchemaLike).enum) ? { enum: [...(ov as ParamSchemaLike).enum!] } : {}) };
+                  hasOfNested = true;
+                }
+              }
+              if (hasOfNested) ((innerSchema as any).of as any).shape = ofNested;
+            }
+          }
+          nested[k] = innerSchema;
+          hasNested = true;
+        }
+      }
+      if (hasNested) schema.shape = nested;
+      // Preserve top-level shape even if no nested structured entries, to indicate object shape exists
+      if (!hasNested && Object.keys(shape).length > 0) {
+        // Still mark as having shape for advertisement purposes (empty shape means generic object)
+        // We keep it undefined to avoid empty advertisement, but the type is already object
+      }
+    }
+    if (raw.byKind !== undefined && typeof raw.byKind === 'object' && raw.byKind !== null) {
+      const byKind = raw.byKind as Record<string, Record<string, unknown>>;
+      const byKindSchemas: Record<string, Record<string, ParamSchemaLike>> = {};
+      let hasByKind = false;
+      for (const [kindName, kindFields] of Object.entries(byKind)) {
+        const kindSchema: Record<string, ParamSchemaLike> = {};
+        let hasKindFields = false;
+        for (const [fk, fv] of Object.entries(kindFields as Record<string, unknown>)) {
+          if (isStructuredParamSchema(fv)) {
+            kindSchema[fk] = { type: (fv as ParamSchemaLike).type, required: (fv as ParamSchemaLike).required, ...(Array.isArray((fv as ParamSchemaLike).enum) ? { enum: [...(fv as ParamSchemaLike).enum!] } : {}) };
+            hasKindFields = true;
+          }
+        }
+        if (hasKindFields) {
+          byKindSchemas[kindName] = kindSchema;
+          hasByKind = true;
+        }
+      }
+      if (hasByKind) schema.byKind = byKindSchemas;
+    }
+    if (raw.of !== undefined && isStructuredParamSchema(raw.of)) {
+      const ofVal = raw.of as ParamSchemaLike;
+      const ofSchema: ParamSchemaLike = {
+        type: ofVal.type,
+        required: ofVal.required,
+        ...(Array.isArray(ofVal.enum) ? { enum: [...ofVal.enum] } : {}),
+      };
+      // Handle of.shape
+      const ofShape = (raw.of as any).shape;
+      if (ofShape && typeof ofShape === 'object') {
+        const ofNested: Record<string, ParamSchemaLike> = {};
+        let hasOfNested = false;
+        for (const [ok, ov] of Object.entries(ofShape as Record<string, unknown>)) {
+          if (isStructuredParamSchema(ov)) {
+            ofNested[ok] = { type: (ov as ParamSchemaLike).type, required: (ov as ParamSchemaLike).required, ...(Array.isArray((ov as ParamSchemaLike).enum) ? { enum: [...(ov as ParamSchemaLike).enum!] } : {}) };
+            hasOfNested = true;
+          }
+        }
+        if (hasOfNested) (ofSchema as any).shape = ofNested;
+      }
+      schema.of = ofSchema;
+    }
+    schemas[key] = schema;
   }
   return schemas;
 }

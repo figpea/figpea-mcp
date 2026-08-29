@@ -139,6 +139,55 @@ function buildInputShape(tool: GeneratedTool): Record<string, z.ZodTypeAny> {
     array: { type: 'array' },
     matrix: { type: 'array' }, // affine transform tuple — advertised as an array (AC-1)
   };
+
+  /** Converts a ParamSchemaLike (with nested shape/byKind/of) to its JSON Schema advertisement fragment.
+   *  Used to advertise inner number/object/array fields so LLMs generate correct types. */
+  function paramSchemaToAdvertised(schema: import('./tools').ParamSchemaLike): Record<string, unknown> {
+    // Enum takes precedence (already handled at top level, but handle here for nested)
+    if (schema.enum && schema.enum.length > 0) {
+      return { type: 'string', enum: [...schema.enum] };
+    }
+    if (schema.type === 'object') {
+      const properties: Record<string, unknown> = {};
+      let hasProps = false;
+      if (schema.shape) {
+        for (const [k, sub] of Object.entries(schema.shape)) {
+          properties[k] = paramSchemaToAdvertised(sub);
+          hasProps = true;
+        }
+      }
+      if (schema.byKind) {
+        const seen = new Set<string>(Object.keys(properties));
+        for (const kindFields of Object.values(schema.byKind)) {
+          for (const [k, sub] of Object.entries(kindFields)) {
+            if (!seen.has(k)) {
+              properties[k] = paramSchemaToAdvertised(sub);
+              seen.add(k);
+              hasProps = true;
+            }
+          }
+        }
+      }
+      if (hasProps) {
+        return { type: 'object', properties, additionalProperties: true };
+      }
+      // Check for nested shape inside array's of
+      return { type: 'object', additionalProperties: true };
+    }
+    if (schema.type === 'array') {
+      if (schema.of) {
+        return { type: 'array', items: paramSchemaToAdvertised(schema.of) };
+      }
+      return { type: 'array' };
+    }
+    if (schema.type === 'matrix') {
+      return { type: 'array' };
+    }
+    const adv = TYPE_TO_ADVERTISED[schema.type];
+    if (adv) return { ...adv };
+    return { type: schema.type };
+  }
+
   for (const key of tool.inputKeys) {
     // Permissive by design (plan §1): descriptor params are informal,
     // human-readable hints, not a machine schema -- z.any() is the faithful
@@ -173,7 +222,15 @@ function buildInputShape(tool: GeneratedTool): Record<string, z.ZodTypeAny> {
     // byte-for-byte (legacy pre-REQ-093 free-text-hint descriptors included).
     const paramSchema = tool.paramSchemas?.[key];
     const enumValues = paramSchema?.enum;
-    const advertised = paramSchema ? TYPE_TO_ADVERTISED[paramSchema.type] : undefined;
+    let advertised: Record<string, unknown> | undefined;
+    if (paramSchema) {
+      if (enumValues && enumValues.length > 0) {
+        // Enum case handled separately, but still need advertised for completeness
+        advertised = { type: 'string', enum: [...enumValues] };
+      } else {
+        advertised = paramSchemaToAdvertised(paramSchema);
+      }
+    }
     if (enumValues && enumValues.length > 0) {
       shape[key] = z.enum(enumValues as [string, ...string[]]).optional();
     } else if (advertised) {
@@ -274,7 +331,168 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     },
   );
 
-  function makeContractHandler(groupName: string, methodName: string, inputKeys: string[]) {
+  /** Coerces a string numeric value to a real number when the declared schema expects a number.
+   *  Handles "1000" and "1000.0" (and other finite numeric strings) that LLMs or JSON-literal UIs
+   *  may produce as strings despite the schema saying number. Leaves non-numeric strings untouched. */
+  function coerceNumericString(value: unknown, schema: { type: string } | undefined): unknown {
+    if (schema?.type === 'number' && typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed !== '') {
+        const num = Number(trimmed);
+        if (Number.isFinite(num) && String(num) === trimmed) {
+          return num;
+        }
+        // Accept "1000.0" -> 1000, "  1000  " -> 1000, scientific, etc., where Number parses finite but String(num) may differ
+        // Use a looser check: if Number is finite and the trimmed string is a valid number literal, coerce
+        if (Number.isFinite(num) && !isNaN(num) && /^[-+]?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?$/.test(trimmed)) {
+          return num;
+        }
+      }
+    }
+    return value;
+  }
+
+  function coerceValue(value: unknown, schema: import('./tools').ParamSchemaLike | undefined): unknown {
+    if (value === null || value === undefined) return value;
+    if (!schema) {
+      // No schema (legacy free-text manifest): still try generic numeric coercion for objects
+      if (typeof value === 'object' && !Array.isArray(value)) {
+        const obj = value as Record<string, unknown>;
+        const GENERIC_NUMERIC_KEYS = new Set([
+          'pageWidth', 'pageHeight', 'rwidth', 'rheight', 'rx', 'ry', 'x2', 'y2', 'x', 'y', 'width', 'height', 'dx', 'dy', 'deg', 'index', 'itemSpacing', 'top', 'right', 'bottom', 'left',
+        ]);
+        let result: Record<string, unknown> | undefined;
+        for (const [k, v] of Object.entries(obj)) {
+          if (GENERIC_NUMERIC_KEYS.has(k) && typeof v === 'string') {
+            const coerced = coerceNumericString(v, { type: 'number' });
+            if (coerced !== v) {
+              if (!result) result = { ...obj };
+              result[k] = coerced;
+            }
+          } else if (typeof v === 'object' && v !== null) {
+            // Recurse for nested objects/arrays without schema
+            const coerced = coerceValue(v, undefined);
+            if (coerced !== v) {
+              if (!result) result = { ...obj };
+              result[k] = coerced;
+            }
+          }
+        }
+        return result ?? value;
+      }
+      if (Array.isArray(value)) {
+        let changed = false;
+        const coercedArr = (value as unknown[]).map((el) => {
+          const c = coerceValue(el, undefined);
+          if (c !== el) changed = true;
+          return c;
+        });
+        return changed ? coercedArr : value;
+      }
+      return value;
+    }
+    // Direct number coercion
+    if (schema.type === 'number') {
+      return coerceNumericString(value, schema);
+    }
+    // Object with shape/byKind: walk its properties
+    if (schema.type === 'object' && typeof value === 'object' && !Array.isArray(value)) {
+      const obj = value as Record<string, unknown>;
+      let result: Record<string, unknown> | undefined;
+      const ensureResult = () => {
+        if (!result) result = { ...obj };
+        return result;
+      };
+      if (schema.shape) {
+        for (const [k, sub] of Object.entries(schema.shape)) {
+          if (k in obj) {
+            const coerced = coerceValue(obj[k], sub);
+            if (coerced !== obj[k]) ensureResult()[k] = coerced;
+            // Also handle nested array case via recursive call (sub may be array)
+          }
+        }
+      }
+      if (schema.byKind) {
+        // Union of all byKind fields for coercion (kind-agnostic, safe: numeric strings for pageWidth etc.)
+        const byKindUnion: Record<string, import('./tools').ParamSchemaLike> = {};
+        for (const kindFields of Object.values(schema.byKind)) {
+          for (const [fk, fv] of Object.entries(kindFields)) {
+            if (!(fk in byKindUnion)) byKindUnion[fk] = fv;
+          }
+        }
+        for (const [k, sub] of Object.entries(byKindUnion)) {
+          if (k in obj && !(schema.shape && k in schema.shape)) {
+            const coerced = coerceValue(obj[k], sub);
+            if (coerced !== obj[k]) ensureResult()[k] = coerced;
+          }
+        }
+      }
+      // For generic object without detailed shape, still try to coerce known numeric geometry keys as fallback
+      // This handles legacy manifests where shape wasn't captured
+      if (!schema.shape && !schema.byKind) {
+        const GENERIC_NUMERIC_KEYS = new Set([
+          'pageWidth',
+          'pageHeight',
+          'rwidth',
+          'rheight',
+          'rx',
+          'ry',
+          'x2',
+          'y2',
+          'x',
+          'y',
+          'width',
+          'height',
+          'rwidth',
+          'rheight',
+          'dx',
+          'dy',
+          'deg',
+          'index',
+          'itemSpacing',
+          'top',
+          'right',
+          'bottom',
+          'left',
+        ]);
+        for (const [k, v] of Object.entries(obj)) {
+          if (GENERIC_NUMERIC_KEYS.has(k) && typeof v === 'string') {
+            const coerced = coerceNumericString(v, { type: 'number' });
+            if (coerced !== v) ensureResult()[k] = coerced;
+          }
+        }
+      }
+      // Handle nested shape's array/of recursively via already-handled sub schemas
+      // For props.style etc., leave as is
+      return result ?? value;
+    }
+    if (schema.type === 'array' && Array.isArray(value) && schema.of) {
+      let changed = false;
+      const arr = value as unknown[];
+      const coercedArr = arr.map((el) => {
+        const c = coerceValue(el, schema.of!);
+        if (c !== el) changed = true;
+        return c;
+      });
+      return changed ? coercedArr : value;
+    }
+    // For matrix (array of numbers) where elements may be string numbers
+    if (schema.type === 'matrix' && Array.isArray(value)) {
+      let changed = false;
+      const coerced = (value as unknown[]).map((el) => {
+        if (typeof el === 'string') {
+          const c = coerceNumericString(el, { type: 'number' });
+          if (c !== el) changed = true;
+          return c;
+        }
+        return el;
+      });
+      return changed ? coerced : value;
+    }
+    return value;
+  }
+
+  function makeContractHandler(groupName: string, methodName: string, inputKeys: string[], tool?: GeneratedTool) {
     return async (rawArgs: Record<string, unknown>): Promise<CallToolResult> => {
       if (!bridge.isTabConnected()) {
         const connectUrl = buildConnectUrl(undefined, undefined);
@@ -387,8 +605,11 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       // from the manifest-args mapping by construction: only `inputKeys` are
       // forwarded positionally to the tab-side method.
       const effectiveTimeoutMs = resolveTimeoutMs(`${groupName}_${methodName}`, rawArgs['_timeoutMs']);
-      // Use effectiveRawArgs for the positional mapping so translated URLs are forwarded
-      const args = inputKeys.map((key) => (effectiveRawArgs as any)[key]);
+      const args = inputKeys.map((key) => {
+        const raw = (effectiveRawArgs as any)[key];
+        const schema = tool?.paramSchemas?.[key];
+        return coerceValue(raw, schema);
+      });
       try {
         const result = (await bridge.callTab(groupName, methodName, args, effectiveTimeoutMs)) as FigpeaCallResultLike;
         return toCallToolResult(resultToContent(result));
@@ -419,7 +640,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     registeredTools.get(tool.name)?.remove();
 
     const inputShape = buildInputShape(tool);
-    const handler = makeContractHandler(groupName, methodName, tool.inputKeys);
+    const handler = makeContractHandler(groupName, methodName, tool.inputKeys, tool);
     // REQ-772: buildInputShape now ALWAYS returns a shape (it carries the
     // reserved `_timeoutMs` key even for zero-param methods), so the former
     // no-schema zero-param registration branch — which dropped ALL arguments
