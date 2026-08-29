@@ -6,6 +6,8 @@
  * with a plain stub bridge and no real WebSocket listener.
  */
 
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { McpServer, type RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
@@ -30,6 +32,8 @@ export interface BridgeServerHandleLike {
   callTab(group: string, method: string, args: unknown[], timeoutMs?: number): Promise<unknown>;
   close(): Promise<void>;
   getContractVersion?(): string | null;
+  getFileUrl?(filePath: string): string;
+  registerBlob?(filePath: string): string;
 }
 
 export interface CreateMcpServerOptions {
@@ -283,11 +287,108 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           }),
         );
       }
+
+      // REQ-1017: filePath → bridge HTTP URL translation (reserved key, not in inputKeys)
+      // This mirrors _timeoutMs's reserved-key pattern — we read rawArgs even when the
+      // manifest's inputKeys don't declare filePath, so stale manifests still work.
+      // We mutate a shallow copy of rawArgs for the translation so the original map
+      // remains intact for logging, but inputKeys.map below sees the URLified value.
+      const effectiveRawArgs: Record<string, unknown> = { ...rawArgs };
+
+      // Helper to validate a local path and return bridge URL or error payload
+      const toBridgeUrl = (filePath: string): string => {
+        if (bridge.getFileUrl) return bridge.getFileUrl(filePath);
+        return `http://127.0.0.1:${bridge.port}/file?path=${encodeURIComponent(filePath)}`;
+      };
+      const isValidFile = async (fp: string): Promise<boolean> => {
+        try {
+          const st = await fs.promises.stat(fp);
+          return st.isFile();
+        } catch {
+          return false;
+        }
+      };
+
+      const toolName = `${groupName}_${methodName}`;
+      if (toolName === 'session_openFile') {
+        // input may be at rawArgs.input or rawArgs itself (some callers pass filePath top-level)
+        const inputAny = (effectiveRawArgs as any).input as Record<string, unknown> | undefined;
+        const filePathVal = (inputAny?.filePath as string | undefined) ?? (effectiveRawArgs as any).filePath as string | undefined;
+        if (typeof filePathVal === 'string' && filePathVal) {
+          if (typeof filePathVal !== 'string') {
+            return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: `filePath must be a string: ${String(filePathVal)}` }));
+          }
+          const okFile = await isValidFile(filePathVal);
+          if (!okFile) {
+            return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: `file not found or not readable: ${filePathVal}` }));
+          }
+          const bridgeUrl = toBridgeUrl(filePathVal);
+          // Build new input with url, preserve fileName/type/name if caller gave them
+          const newInput: Record<string, unknown> = { ...(inputAny ?? {}) };
+          newInput.url = bridgeUrl;
+          if (!newInput.fileName && !newInput.name) newInput.fileName = path.basename(filePathVal);
+          delete (newInput as any).filePath;
+          delete (effectiveRawArgs as any).filePath;
+          effectiveRawArgs.input = newInput;
+          // Ensure inputKeys includes 'input' mapping — already does, but if rawArgs had top-level filePath we cleared it
+        } else if (typeof filePathVal === 'string' && filePathVal.trim() === '') {
+          return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: 'filePath cannot be empty' }));
+        } else if ((effectiveRawArgs as any).filePath !== undefined && typeof (effectiveRawArgs as any).filePath !== 'string') {
+          return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: 'filePath must be a string' }));
+        }
+        // Also handle filePath inside input that is non-string
+        if (inputAny && 'filePath' in inputAny && inputAny.filePath !== undefined && typeof inputAny.filePath !== 'string') {
+          return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: 'input.filePath must be a string' }));
+        }
+      } else if (toolName === 'layer_setImageFill') {
+        const source = (effectiveRawArgs as any).source as Record<string, unknown> | undefined;
+        const fp = source?.filePath as string | undefined;
+        if (typeof fp === 'string' && fp) {
+          const okFile = await isValidFile(fp);
+          if (!okFile) {
+            return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: `file not found or not readable: ${fp}` }));
+          }
+          const bridgeUrl = toBridgeUrl(fp);
+          const newSource: Record<string, unknown> = { ...source };
+          newSource.url = bridgeUrl;
+          delete (newSource as any).filePath;
+          effectiveRawArgs.source = newSource;
+        } else if (fp !== undefined && fp !== null && (typeof fp !== 'string' || (fp as string).trim() === '')) {
+          // fp is present but invalid type/empty
+          if (typeof fp !== 'string') {
+            return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'source.filePath must be a string' }));
+          }
+        } else if (source && 'filePath' in source && source.filePath !== undefined && typeof source.filePath !== 'string') {
+          return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'source.filePath must be a string' }));
+        }
+      } else if (toolName === 'layer_create') {
+        // rawArgs.kind is the kind string, rawArgs.props contains image props
+        const kindVal = (effectiveRawArgs as any).kind;
+        const props = (effectiveRawArgs as any).props as Record<string, unknown> | undefined;
+        const fp = props?.filePath as string | undefined;
+        if (kindVal === 'image' && typeof fp === 'string' && fp) {
+          const okFile = await isValidFile(fp);
+          if (!okFile) {
+            return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: `file not found or not readable: ${fp}` }));
+          }
+          const bridgeUrl = toBridgeUrl(fp);
+          const newProps: Record<string, unknown> = { ...props };
+          newProps.url = bridgeUrl;
+          delete (newProps as any).filePath;
+          effectiveRawArgs.props = newProps;
+        } else if (kindVal === 'image' && props && 'filePath' in props && props.filePath !== undefined && typeof props.filePath !== 'string') {
+          return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'props.filePath must be a string' }));
+        } else if (kindVal === 'image' && typeof fp === 'string' && fp.trim() === '') {
+          return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'filePath cannot be empty' }));
+        }
+      }
+
       // `_timeoutMs` is a reserved top-level key (REQ-772 AC-1), excluded
       // from the manifest-args mapping by construction: only `inputKeys` are
       // forwarded positionally to the tab-side method.
       const effectiveTimeoutMs = resolveTimeoutMs(`${groupName}_${methodName}`, rawArgs['_timeoutMs']);
-      const args = inputKeys.map((key) => rawArgs[key]);
+      // Use effectiveRawArgs for the positional mapping so translated URLs are forwarded
+      const args = inputKeys.map((key) => (effectiveRawArgs as any)[key]);
       try {
         const result = (await bridge.callTab(groupName, methodName, args, effectiveTimeoutMs)) as FigpeaCallResultLike;
         return toCallToolResult(resultToContent(result));

@@ -3,9 +3,16 @@
  * security, OQ-3 multi-tab, OQ-2 loopback). A pure relay: this module owns
  * zero editor logic, only the localhost listener, the per-run pairing-token
  * gate, request/response id-correlation, and newest-wins takeover.
+ *
+ * REQ-1017 — add loopback HTTP file endpoint GET /file?path=… (+ /blob/<token>)
+ * with ACAO:* and MIME, backed by http.createServer + WebSocketServer({server}).
  */
 
 import * as crypto from 'node:crypto';
+import * as http from 'node:http';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
 import WebSocket, { WebSocketServer } from 'ws';
 import type { CallFrame, DescribeFrame } from './protocol';
 import { drillManifest, type DescribeFn, type DescribeResultPayload } from './describeDrill';
@@ -58,6 +65,10 @@ export interface BridgeServerHandle {
   callTab(group: string, method: string, args: unknown[], timeoutMs?: number): Promise<unknown>;
   /** Shuts down the listener and rejects any still-pending calls. */
   close(): Promise<void>;
+  /** REQ-1017: returns a loopback URL for the given absolute filePath (primary endpoint). */
+  getFileUrl(filePath: string): string;
+  /** REQ-1017: registers a blob token alias for the filePath and returns its /blob URL. */
+  registerBlob(filePath: string): string;
 }
 
 interface PendingCall {
@@ -66,19 +77,135 @@ interface PendingCall {
   timer: ReturnType<typeof setTimeout>;
 }
 
-/** Starts the localhost-only bridge WebSocket server (plan §3). */
+/** Starts the localhost-only bridge WebSocket + HTTP file server (plan §3, REQ-1017). */
 export async function startBridgeServer(options?: StartBridgeServerOptions): Promise<BridgeServerHandle> {
   const token = crypto.randomUUID();
 
-  const wss = await new Promise<WebSocketServer>((resolve, reject) => {
-    const server = new WebSocketServer({ host: '127.0.0.1', port: options?.port ?? 0 });
-    const onListenError = (err: Error) => reject(err);
-    server.once('error', onListenError);
-    server.once('listening', () => {
-      server.removeListener('error', onListenError);
-      resolve(server);
+  // --- REQ-1017 file handling helpers ---
+  const blobMap = new Map<string, string>(); // token -> filePath
+
+  function mimeForPath(p: string): string {
+    const ext = path.extname(p).toLowerCase();
+    switch (ext) {
+      case '.jpg':
+      case '.jpeg': return 'image/jpeg';
+      case '.png': return 'image/png';
+      case '.webp': return 'image/webp';
+      case '.svg': return 'image/svg+xml';
+      case '.gif': return 'image/gif';
+      case '.pdf': return 'application/pdf';
+      case '.fp': return 'application/octet-stream';
+      case '.fig': return 'application/octet-stream';
+      case '.psd': return 'image/vnd.adobe.photoshop';
+      case '.json': return 'application/json';
+      case '.txt': return 'text/plain';
+      default: return 'application/octet-stream';
+    }
+  }
+
+  function setCorsHeaders(res: http.ServerResponse): void {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  }
+
+  async function handleFileRequest(res: http.ServerResponse, filePath: string): Promise<void> {
+    // Security: absolute, no null byte
+    if (!path.isAbsolute(filePath) || filePath.includes('\0')) {
+      setCorsHeaders(res);
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, code: 'invalid_path', message: `invalid filePath: ${filePath}` }));
+      return;
+    }
+    const normalized = path.normalize(filePath);
+    // Size guard / existence
+    let stat: fs.Stats;
+    try {
+      stat = await fs.promises.stat(normalized);
+    } catch {
+      setCorsHeaders(res);
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, code: 'not_found', message: `file not found: ${filePath}` }));
+      return;
+    }
+    if (!stat.isFile()) {
+      setCorsHeaders(res);
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, code: 'invalid_path', message: `not a file: ${filePath}` }));
+      return;
+    }
+    const MAX_BYTES = 50 * 1024 * 1024;
+    if (stat.size > MAX_BYTES) {
+      setCorsHeaders(res);
+      res.writeHead(413, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, code: 'too_large', message: `file too large: ${stat.size}` }));
+      return;
+    }
+    const mime = mimeForPath(normalized);
+    setCorsHeaders(res);
+    res.writeHead(200, {
+      'Content-Type': mime,
+      'Content-Length': stat.size,
+      'Cache-Control': 'no-store',
+    });
+    const stream = fs.createReadStream(normalized);
+    stream.on('error', () => {
+      try { res.end(); } catch {}
+    });
+    stream.pipe(res);
+  }
+
+  function requestHandler(req: http.IncomingMessage, res: http.ServerResponse): void {
+    // Always handle CORS preflight
+    if (req.method === 'OPTIONS') {
+      setCorsHeaders(res);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+    if (req.method === 'GET' && url.pathname === '/file') {
+      const fp = url.searchParams.get('path');
+      if (!fp) {
+        setCorsHeaders(res);
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, code: 'invalid_path', message: 'missing path query' }));
+        return;
+      }
+      void handleFileRequest(res, fp);
+      return;
+    }
+    if (req.method === 'GET' && url.pathname.startsWith('/blob/')) {
+      const tok = url.pathname.slice('/blob/'.length);
+      const fp = blobMap.get(tok);
+      if (!fp) {
+        setCorsHeaders(res);
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, code: 'not_found', message: 'unknown blob token' }));
+        return;
+      }
+      void handleFileRequest(res, fp);
+      return;
+    }
+    // Unknown path: 404 with CORS so browser checks don't fail due to missing header
+    setCorsHeaders(res);
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, code: 'not_found' }));
+  }
+
+  const httpServer = http.createServer(requestHandler);
+
+  await new Promise<void>((resolve, reject) => {
+    const onErr = (err: Error) => reject(err);
+    httpServer.once('error', onErr);
+    httpServer.listen(options?.port ?? 0, '127.0.0.1', () => {
+      httpServer.removeListener('error', onErr);
+      resolve();
     });
   });
+
+  const wss = new WebSocketServer({ server: httpServer });
 
   // Lives for the server's whole lifetime (not just startup) -- logs rather
   // than throwing, since a single bad frame from a tab must never take the
@@ -86,12 +213,15 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
   wss.on('error', (err: Error) => {
     console.error('[figpea-mcp] bridge server error:', err);
   });
+  httpServer.on('error', (err: Error) => {
+    console.error('[figpea-mcp] http server error:', err);
+  });
 
-  const address = wss.address();
+  const address = httpServer.address();
   if (address === null || typeof address === 'string') {
     throw new Error('figpea-mcp bridgeServer: failed to determine the bound ephemeral port');
   }
-  const port = address.port;
+  const port = (address as { port: number }).port;
 
   let activeSocket: WebSocket | undefined;
   let contractVersion: string | null = null;
@@ -307,8 +437,21 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
         sendFrame(socket, frame);
       });
     },
+    getFileUrl(filePath: string): string {
+      return `http://127.0.0.1:${port}/file?path=${encodeURIComponent(filePath)}`;
+    },
+    registerBlob(filePath: string): string {
+      const tok = crypto.randomUUID();
+      blobMap.set(tok, filePath);
+      // simple expiry after 5 min
+      setTimeout(() => blobMap.delete(tok), 5 * 60 * 1000).unref?.();
+      return `http://127.0.0.1:${port}/blob/${tok}`;
+    },
     async close(): Promise<void> {
       rejectAllPending(new Error('figpea-mcp bridgeServer: server closed'));
+      await new Promise<void>((resolve, reject) => {
+        httpServer.close((err) => (err ? reject(err) : resolve()));
+      });
       await new Promise<void>((resolve) => wss.close(() => resolve()));
     },
   };
