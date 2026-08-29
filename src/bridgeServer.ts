@@ -217,6 +217,14 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
       }
     }, HELLO_TIMEOUT_MS);
 
+    function safeDecodeAndTrim(s: string): string {
+      let out = s;
+      try {
+        out = decodeURIComponent(out);
+      } catch {}
+      return out.trim();
+    }
+
     const onHelloFrame = (data: WebSocket.RawData): void => {
       clearTimeout(helloTimer);
       socket.off('message', onHelloFrame);
@@ -229,7 +237,10 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
         return;
       }
 
-      if (frame?.type !== 'hello' || frame.token !== token) {
+      const receivedRaw = frame?.token == null ? '' : String(frame.token);
+      const received = safeDecodeAndTrim(receivedRaw);
+      const expected = safeDecodeAndTrim(token);
+      if (frame?.type !== 'hello' || !received || received !== expected) {
         socket.close(CLOSE_CODE_BAD_TOKEN, 'invalid or missing pairing token');
         return;
       }
