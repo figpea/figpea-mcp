@@ -238,7 +238,10 @@ describe('status — reports live bridge state (plan §2 OQ-4)', () => {
     const bridge = fakeBridge({ port: 333, token: 'tok-8', isTabConnected: () => false });
     const client = await connectedClient(bridge);
     const payload = await callToolJson(client, 'status', {});
-    expect(payload).toEqual({ port: 333, tabConnected: false, contractVersion: null, toolCount: 0 });
+    // REQ-1035 adds token+url (additive, backward-compatible) — keep core fields pinned, allow extras
+    expect(payload).toMatchObject({ port: 333, tabConnected: false, contractVersion: null, toolCount: 0 });
+    expect(typeof payload.token).toBe('string');
+    expect(typeof payload.url).toBe('string');
   });
 
   it('reports tabConnected:true once the bridge reports a connected tab', async () => {

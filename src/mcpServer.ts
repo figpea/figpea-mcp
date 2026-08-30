@@ -295,11 +295,13 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     'status',
     {
       description:
-        "Reports the bridge's port, whether an editor tab is connected, the connected tab's contract version (null if none), and how many contract tools are currently registered.",
+        "Reports the bridge's port, whether an editor tab is connected, the connected tab's contract version (null if none), and how many contract tools are currently registered. Also returns token and url so an LLM can construct the paste-ready pairing string without re-launching (REQ-1035).",
     },
     async () => {
       return jsonTextResult({
         port: bridge.port,
+        token: bridge.token,
+        url: buildConnectUrl(undefined, undefined),
         tabConnected: bridge.isTabConnected(),
         contractVersion: bridge.getContractVersion ? bridge.getContractVersion() : null,
         toolCount,
