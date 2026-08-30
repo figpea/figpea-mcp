@@ -71,6 +71,8 @@ Every relayed call has a bridge timeout. Two knobs control it:
 
 When a call does time out, the error says so honestly — `timed out after Nms; the editor may still be executing this call — check state before retrying`. **Do not blindly retry a failed mutation**: the tab keeps working after the relay gives up, so the effect may have landed anyway (retrying a non-idempotent call like `layer_create` duplicates the layer). Check state first (`status`, `session_layerTree`) and re-issue reads and idempotent setters freely.
 
+Every tool also accepts `_rawJson` (boolean, optional) — when `true`, any top-level param that is a JSON string representing an object or array (e.g. `'{"pageWidth":1500}'` or `'[5,0,0,3.5,0,0]'`) is parsed before forwarding, so a client whose harness stringifies nested numbers can send the whole object as a JSON string and recover real numbers. The server also coerces string numerics inside objects/arrays to numbers defensively (harness stringification tolerance) without requiring `_rawJson`.
+
 ## Security model
 
 - The bridge binds **localhost only** (`127.0.0.1`) — never a public interface.

@@ -720,7 +720,8 @@ describe('REQ-769 T3 guard pins — permissiveness, legacy manifests, enum prece
     // EVERY generated contract tool's shape — it joins the advertised
     // properties by design. The pin's original point (the legacy
     // free-text-hint params themselves stay untyped {}) is unchanged.
-    expect(Object.keys(props ?? {}).sort()).toEqual(['_timeoutMs', 'options', 'target']);
+    // REQ-1037 adds `_rawJson` alongside it (same pattern, same never-forwarded semantics).
+    expect(Object.keys(props ?? {}).sort()).toEqual(['_rawJson', '_timeoutMs', 'options', 'target']);
     expect(props._timeoutMs?.type, 'the reserved key advertises as number (REQ-772)').toBe('number');
     // Untyped: today's z.any().optional() serializes to an empty property schema.
     expect(props.target ?? {}).toEqual({});

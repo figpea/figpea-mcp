@@ -116,6 +116,9 @@ function buildInputShape(tool: GeneratedTool): Record<string, z.ZodTypeAny> {
   // `inputKeys`, which never contains `_timeoutMs`), so it is never
   // forwarded to the tab-side method.
   shape['_timeoutMs'] = z.number().optional();
+  // REQ-1037 — reserved `_rawJson` bypass for harness that stringifies nested numbers.
+  // Declared so it survives safeParseAsync, never forwarded (not in inputKeys).
+  shape['_rawJson'] = z.any().optional();
   if (tool.inputKeys.length === 0) return shape;
   // REQ-769 — the type mapping below rests on one mechanic of the MCP SDK,
   // verified empirically against the installed @modelcontextprotocol/sdk +
@@ -360,6 +363,8 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         const obj = value as Record<string, unknown>;
         const GENERIC_NUMERIC_KEYS = new Set([
           'pageWidth', 'pageHeight', 'rwidth', 'rheight', 'rx', 'ry', 'x2', 'y2', 'x', 'y', 'width', 'height', 'dx', 'dy', 'deg', 'index', 'itemSpacing', 'top', 'right', 'bottom', 'left',
+          'count', 'radius', 'startAngle', 'stepAngle', 'rows', 'cols', 'gap', 'spacing',
+          'tolerance', 'fontSize', 'letterSpacing', 'lineHeight', 'opacity', 'cornerRadius', 'strokeWidth', 'fixWidth', 'fixHeight',
         ]);
         let result: Record<string, unknown> | undefined;
         for (const [k, v] of Object.entries(obj)) {
@@ -370,7 +375,13 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
               result[k] = coerced;
             }
           } else if (typeof v === 'object' && v !== null) {
-            // Recurse for nested objects/arrays without schema
+            // Recurse for nested objects/arrays without schema — covers batch args deep nests
+            const coerced = coerceValue(v, undefined);
+            if (coerced !== v) {
+              if (!result) result = { ...obj };
+              result[k] = coerced;
+            }
+          } else if (Array.isArray(v)) {
             const coerced = coerceValue(v, undefined);
             if (coerced !== v) {
               if (!result) result = { ...obj };
@@ -459,6 +470,37 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           if (GENERIC_NUMERIC_KEYS.has(k) && typeof v === 'string') {
             const coerced = coerceNumericString(v, { type: 'number' });
             if (coerced !== v) ensureResult()[k] = coerced;
+          } else if (typeof v === 'object' && v !== null) {
+            const coerced = coerceValue(v, undefined);
+            if (coerced !== v) ensureResult()[k] = coerced;
+          }
+        }
+      } else {
+        // REQ-1037 T2 — schema-aware object but may contain schema-opaque nests
+        // (e.g. layer_batch.ops[0].args[1] = {rwidth:"100"} where args is array without of).
+        // Walk remaining keys not covered by shape/byKind via generic deep walk.
+        const declaredKeys = new Set<string>();
+        if (schema.shape) for (const k of Object.keys(schema.shape)) declaredKeys.add(k);
+        if (schema.byKind) for (const kindFields of Object.values(schema.byKind)) for (const k of Object.keys(kindFields)) declaredKeys.add(k);
+        for (const [k, v] of Object.entries(obj)) {
+          if (declaredKeys.has(k)) continue;
+          if (typeof v === 'object' && v !== null) {
+            const coerced = coerceValue(v, undefined);
+            if (coerced !== v) ensureResult()[k] = coerced;
+          } else if (Array.isArray(v)) {
+            const coerced = coerceValue(v, undefined);
+            if (coerced !== v) ensureResult()[k] = coerced;
+          }
+        }
+        // Also deep-walk already-handled array-typed fields that had no `of` schema
+        // (e.g. ops[].args). Those were not recursed above because no `of`.
+        if (schema.shape) {
+          for (const [k, sub] of Object.entries(schema.shape)) {
+            if (sub.type === 'array' && !sub.of && Array.isArray((obj as any)[k])) {
+              const arrVal = (obj as any)[k] as unknown[];
+              const coercedArr = coerceValue(arrVal, undefined);
+              if (coercedArr !== arrVal) ensureResult()[k] = coercedArr as any;
+            }
           }
         }
       }
@@ -471,6 +513,16 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       const arr = value as unknown[];
       const coercedArr = arr.map((el) => {
         const c = coerceValue(el, schema.of!);
+        if (c !== el) changed = true;
+        return c;
+      });
+      return changed ? coercedArr : value;
+    }
+    if (schema.type === 'array' && Array.isArray(value) && !schema.of) {
+      // REQ-1037 T2 — array without item schema (e.g. batch args): deep generic walk
+      let changed = false;
+      const coercedArr = (value as unknown[]).map((el) => {
+        const c = coerceValue(el, undefined);
         if (c !== el) changed = true;
         return c;
       });
@@ -600,6 +652,51 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'filePath cannot be empty' }));
         }
       }
+
+      // REQ-1037 T3 — `_rawJson` bypass + auto JSON-parse for stringified objects/arrays.
+      // Must run after filePath translation (which may have mutated effectiveRawArgs) but before coercion.
+      const rawJsonFlag =
+        (effectiveRawArgs as any)['_rawJson'] === true ||
+        (effectiveRawArgs as any)['_rawJson'] === 'true' ||
+        (effectiveRawArgs as any)['_rawJson'] === 1 ||
+        (effectiveRawArgs as any)['_rawJson'] === '1';
+      if (rawJsonFlag) {
+        for (const key of inputKeys) {
+          const v = (effectiveRawArgs as any)[key];
+          if (typeof v === 'string') {
+            const trimmed = v.trim();
+            if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+              try {
+                const parsed = JSON.parse(trimmed);
+                if (typeof parsed === 'object' && parsed !== null) {
+                  (effectiveRawArgs as any)[key] = parsed;
+                }
+              } catch {}
+            }
+          }
+        }
+      } else {
+        // Auto-parse heuristic even without flag: schema expects object/array/matrix but received JSON string
+        for (const key of inputKeys) {
+          const v = (effectiveRawArgs as any)[key];
+          if (typeof v !== 'string') continue;
+          const schema = tool?.paramSchemas?.[key];
+          if (!schema) continue;
+          const expectsStructured = schema.type === 'object' || schema.type === 'array' || schema.type === 'matrix';
+          if (!expectsStructured) continue;
+          const trimmed = v.trim();
+          if (!((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']')))) continue;
+          try {
+            const parsed = JSON.parse(trimmed);
+            if (typeof parsed !== 'object' || parsed === null) continue;
+            if (schema.type === 'matrix' && Array.isArray(parsed)) (effectiveRawArgs as any)[key] = parsed;
+            else if (schema.type === 'array' && Array.isArray(parsed)) (effectiveRawArgs as any)[key] = parsed;
+            else if (schema.type === 'object' && !Array.isArray(parsed)) (effectiveRawArgs as any)[key] = parsed;
+          } catch {}
+        }
+      }
+      // Remove reserved keys so they never leak into coercion or logging of effective args
+      delete (effectiveRawArgs as any)['_rawJson'];
 
       // `_timeoutMs` is a reserved top-level key (REQ-772 AC-1), excluded
       // from the manifest-args mapping by construction: only `inputKeys` are
