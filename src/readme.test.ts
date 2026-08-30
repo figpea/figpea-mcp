@@ -12,7 +12,7 @@ import * as path from 'node:path';
 const PACKAGE_ROOT = path.resolve(__dirname, '..');
 const readme = fs.readFileSync(path.join(PACKAGE_ROOT, 'README.md'), 'utf8');
 
-const STATIC_TOOLS = ['open_editor', 'status', 'figpea_skill'];
+const STATIC_TOOLS = ['open_editor', 'status', 'figpea_skill', 'figpea_call'];
 // The literal placeholder pattern name the README uses to describe the
 // live-generated tool naming convention — not a real tool name itself.
 const DOCUMENTED_PLACEHOLDERS = ['group_method'];
@@ -117,5 +117,18 @@ describe('README.md (AC-5)', () => {
     }
     expect(readme, 'the AC-3 ambiguity clause is quoted in the retry guidance').toContain('may still be executing');
     expect(readme, 'never forwarded to the tab-side method is stated').toMatch(/never forwarded|not forwarded/i);
+  });
+
+  // REQ-1018 AC-5 — compact mode default, figpea_call, configuration
+  it('documents compact mode default, figpea_call, and --mode/FIGPEA_TOOL_MODE (REQ-1018 AC-5)', () => {
+    expect(readme).toMatch(/Tool modes.*figpea_call|figpea_call.*Tool modes/i);
+    expect(readme).toContain('figpea_call');
+    expect(readme).toMatch(/compact mode.*default|default.*compact/i);
+    expect(readme).toMatch(/500.*9,500|9,500.*500|90.*95|95.*90/i);
+    expect(readme).toContain('--mode');
+    expect(readme).toContain('FIGPEA_TOOL_MODE');
+    // at least one figpea_call example (layer.create)
+    expect(readme).toMatch(/figpea_call[\s\S]*layer[\s\S]*create|group.*layer.*method.*create/i);
+    expect(readme).toMatch(/when to use full|full mode/i);
   });
 });

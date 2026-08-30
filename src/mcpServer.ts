@@ -47,6 +47,9 @@ export interface CreateMcpServerOptions {
    * or was disabled -- the `figpea_skill` tool degrades gracefully rather
    * than being omitted from `tools/list`. */
   prefetchedSkillBody?: string;
+  /** REQ-1018: tool surface mode — compact (default) exposes only 4 tools
+   * plus figpea_call dispatcher; full restores all contract tools. */
+  toolMode?: 'compact' | 'full';
 }
 
 const DEFAULT_EDITOR_BASE_URL = 'https://editor.figpea.com';
@@ -256,6 +259,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
   const registeredTools = new Map<string, RegisteredTool>();
   const registeredMeta = new Map<string, { description: string; inputKeys: string[] }>();
   let toolCount = 0;
+  const toolMode = options?.toolMode ?? 'full';
 
   function resolveEditorBaseUrl(perCall: string | undefined): string {
     return perCall ?? options?.editorBaseUrl ?? process.env.FIGPEA_EDITOR_URL ?? DEFAULT_EDITOR_BASE_URL;
@@ -335,6 +339,153 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       });
     },
   );
+
+  // REQ-1018 — figpea_call dispatcher (compact mode only)
+  if (toolMode === 'compact') {
+    server.registerTool(
+      'figpea_call',
+      {
+        description:
+          'Universal dispatcher — calls any group.method on the paired editor tab via bridge.callTab(group, method, args, _timeoutMs?). In compact mode this is the only way to reach contract methods; in full mode the individual tools are also available. group/method are the describe() surface names, args is the positional argument array for that method (e.g. ["rect", {rwidth:100}] for layer.create). Image results return MCP image content + a text summary.',
+        inputSchema: {
+          group: z.string().describe('Contract group name (e.g. layer, canvas, session, export)'),
+          method: z.string().describe('Method name within the group (e.g. create, screenshot)'),
+          args: z.array(z.any()).optional().describe('Positional arguments for the method (defaults to [])'),
+          _timeoutMs: z.number().optional().describe('Optional per-call timeout override in ms (clamped to 120000)'),
+          _rawJson: z.any().optional().describe('Reserved passthrough for harness stringification tolerance'),
+        },
+      },
+      async (rawArgs) => {
+        if (!bridge.isTabConnected()) {
+          const connectUrl = buildConnectUrl(undefined, undefined);
+          return toCallToolResult(
+            resultToContent({
+              ok: false,
+              code: 'no_tab',
+              message: 'No editor tab paired. Open this URL in your browser to connect an editor tab:',
+              url: connectUrl,
+            }),
+          );
+        }
+        const group = (rawArgs as any).group;
+        const method = (rawArgs as any).method;
+        if (typeof group !== 'string' || typeof method !== 'string' || !group || !method) {
+          return toCallToolResult(
+            resultToContent({ ok: false, code: 'invalid_params', message: 'group and method are required strings' }),
+          );
+        }
+        let args: unknown[] = (rawArgs as any).args as unknown[] | undefined ?? [];
+        if (!Array.isArray(args)) {
+          return toCallToolResult(
+            resultToContent({ ok: false, code: 'invalid_params', message: 'args must be an array' }),
+          );
+        }
+        // Remove reserved keys so they never leak
+        // args already extracted, now handle _timeoutMs and _rawJson
+        const rawTimeout = (rawArgs as any)._timeoutMs;
+        // _rawJson is declared so it survives safeParseAsync; strip it
+        // No further action needed — args are already positional
+
+        // File-path translation parity (reuse makeContractHandler logic for the three file methods)
+        // Work on a mutable copy of args for translation
+        const toolName = `${group}_${method}`;
+        const toBridgeUrl = (filePath: string): string => {
+          if (bridge.getFileUrl) return bridge.getFileUrl(filePath);
+          return `http://127.0.0.1:${bridge.port}/file?path=${encodeURIComponent(filePath)}`;
+        };
+        const isValidFile = async (fp: string): Promise<boolean> => {
+          try {
+            const st = await fs.promises.stat(fp);
+            return st.isFile();
+          } catch {
+            return false;
+          }
+        };
+
+        // Clone args shallowly for mutation
+        let effectiveArgs: unknown[] = [...args];
+        if (toolName === 'session_openFile') {
+          // args[0] is expected to be input object {filePath?, url?, ...}
+          const input = effectiveArgs[0] as Record<string, unknown> | undefined;
+          const filePathVal = (input as any)?.filePath as string | undefined;
+          if (typeof filePathVal === 'string' && filePathVal) {
+            const okFile = await isValidFile(filePathVal);
+            if (!okFile) {
+              return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: `file not found or not readable: ${filePathVal}` }));
+            }
+            const bridgeUrl = toBridgeUrl(filePathVal);
+            const newInput: Record<string, unknown> = { ...(input ?? {}) };
+            newInput.url = bridgeUrl;
+            if (!newInput.fileName && !(newInput as any).name) newInput.fileName = path.basename(filePathVal);
+            delete (newInput as any).filePath;
+            effectiveArgs[0] = newInput;
+          } else if (typeof filePathVal === 'string' && filePathVal.trim() === '') {
+            return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: 'filePath cannot be empty' }));
+          } else if (input && 'filePath' in input && (input as any).filePath !== undefined && typeof (input as any).filePath !== 'string') {
+            return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: 'input.filePath must be a string' }));
+          }
+        } else if (toolName === 'layer_setImageFill') {
+          const source = effectiveArgs[0] as Record<string, unknown> | undefined;
+          // Actually layer_setImageFill signature is (id, source) — source is args[1] if id is args[0]
+          // Handle both single-arg and two-arg forms defensively: look for any arg that looks like {filePath}
+          let sourceIdx = -1;
+          let sourceObj: Record<string, unknown> | undefined;
+          for (let i = 0; i < effectiveArgs.length; i++) {
+            const cand = effectiveArgs[i] as Record<string, unknown> | undefined;
+            if (cand && typeof cand === 'object' && 'filePath' in cand) {
+              sourceIdx = i;
+              sourceObj = cand;
+              break;
+            }
+          }
+          if (sourceObj) {
+            const fp = sourceObj.filePath as string | undefined;
+            if (typeof fp === 'string' && fp) {
+              const okFile = await isValidFile(fp);
+              if (!okFile) {
+                return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: `file not found or not readable: ${fp}` }));
+              }
+              const bridgeUrl = toBridgeUrl(fp);
+              const newSource: Record<string, unknown> = { ...sourceObj };
+              newSource.url = bridgeUrl;
+              delete (newSource as any).filePath;
+              effectiveArgs[sourceIdx] = newSource;
+            } else if (fp !== undefined && typeof fp !== 'string') {
+              return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'source.filePath must be a string' }));
+            }
+          }
+        } else if (toolName === 'layer_create') {
+          // args: [kind, props] — props may contain filePath when kind==='image'
+          const kindVal = effectiveArgs[0] as string | undefined;
+          const props = effectiveArgs[1] as Record<string, unknown> | undefined;
+          const fp = props?.filePath as string | undefined;
+          if (kindVal === 'image' && typeof fp === 'string' && fp) {
+            const okFile = await isValidFile(fp);
+            if (!okFile) {
+              return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: `file not found or not readable: ${fp}` }));
+            }
+            const bridgeUrl = toBridgeUrl(fp);
+            const newProps: Record<string, unknown> = { ...props };
+            newProps.url = bridgeUrl;
+            delete (newProps as any).filePath;
+            effectiveArgs[1] = newProps;
+          } else if (kindVal === 'image' && props && 'filePath' in props && (props as any).filePath !== undefined && typeof (props as any).filePath !== 'string') {
+            return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'props.filePath must be a string' }));
+          }
+        }
+
+        const effectiveTimeoutMs = resolveTimeoutMs(toolName, rawTimeout);
+        try {
+          const result = (await bridge.callTab(group, method, effectiveArgs, effectiveTimeoutMs)) as FigpeaCallResultLike;
+          return toCallToolResult(resultToContent(result));
+        } catch (e) {
+          return toCallToolResult(
+            resultToContent({ ok: false, code: 'bridge_error', message: e instanceof Error ? e.message : String(e) }),
+          );
+        }
+      },
+    );
+  }
 
   /** Coerces a string numeric value to a real number when the declared schema expects a number.
    *  Handles "1000" and "1000.0" (and other finite numeric strings) that LLMs or JSON-literal UIs
@@ -787,11 +938,12 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     toolCount = generated.length;
   }
 
-  if (options?.prefetchedManifest) {
+  if (toolMode === 'full' && options?.prefetchedManifest) {
     registerContractTools(options.prefetchedManifest);
   }
 
   bridge.onDescribe((manifest) => {
+    if (toolMode !== 'full') return;
     registerContractTools(manifest as ManifestLike);
   });
 

@@ -29,6 +29,35 @@ function parsePortArg(argv: string[]): number | undefined {
   return undefined;
 }
 
+/** REQ-1018 — parses `--mode=compact|full` (last flag wins, case-insensitive, invalid ignored). */
+export function parseModeArg(argv: string[]): string | undefined {
+  let found: string | undefined;
+  for (const arg of argv) {
+    const match = /^--mode=(.+)$/.exec(arg);
+    if (match) {
+      const raw = match[1].trim().toLowerCase();
+      if (raw === 'compact' || raw === 'full') {
+        found = raw;
+      } else {
+        console.error(`[figpea-mcp] ignoring invalid --mode value "${match[1]}" — expected compact or full`);
+      }
+    }
+  }
+  return found;
+}
+
+/** REQ-1018 — resolves effective tool mode: CLI flag > FIGPEA_TOOL_MODE env > default compact. */
+export function resolveToolMode(argv: string[], env: NodeJS.ProcessEnv = process.env): 'compact' | 'full' {
+  const cliMode = parseModeArg(argv);
+  if (cliMode === 'compact' || cliMode === 'full') return cliMode;
+  const envRaw = typeof env.FIGPEA_TOOL_MODE === 'string' ? env.FIGPEA_TOOL_MODE.trim().toLowerCase() : undefined;
+  if (envRaw === 'compact' || envRaw === 'full') return envRaw as 'compact' | 'full';
+  if (envRaw !== undefined && envRaw !== '') {
+    console.error(`[figpea-mcp] ignoring invalid FIGPEA_TOOL_MODE="${env.FIGPEA_TOOL_MODE}" — expected compact or full`);
+  }
+  return 'compact';
+}
+
 function defaultConnectUrl(port: number, token: string): string {
   const base = process.env.FIGPEA_EDITOR_URL ?? 'https://editor.figpea.com';
   const url = new URL(base);
@@ -39,7 +68,9 @@ function defaultConnectUrl(port: number, token: string): string {
 }
 
 async function main(): Promise<void> {
-  const port = parsePortArg(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const port = parsePortArg(argv);
+  const toolMode = resolveToolMode(argv);
   const bridge = await startBridgeServer(port !== undefined ? { port } : undefined);
 
   console.error(`[figpea-mcp] bridge listening on 127.0.0.1:${bridge.port}`);
@@ -65,11 +96,11 @@ async function main(): Promise<void> {
     }
   }
 
-  const serverOptions =
-    prefetchedManifest || prefetchedSkillBody
-      ? { prefetchedManifest, prefetchedSkillBody }
-      : undefined;
-  const server = createMcpServer(bridge, serverOptions);
+  const serverOptions: Record<string, unknown> = {};
+  if (prefetchedManifest) (serverOptions as any).prefetchedManifest = prefetchedManifest;
+  if (prefetchedSkillBody) (serverOptions as any).prefetchedSkillBody = prefetchedSkillBody;
+  (serverOptions as any).toolMode = toolMode;
+  const server = createMcpServer(bridge, Object.keys(serverOptions).length > 0 ? (serverOptions as any) : { toolMode } as any);
   const transport = new StdioServerTransport();
   await server.connect(transport);
 

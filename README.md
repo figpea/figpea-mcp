@@ -63,13 +63,52 @@ Honors `FIGPEA_EDITOR_URL` (default `https://editor.figpea.com`, override for lo
 | `open_editor` | yes | Opens/points at an editor tab wired to this bridge. Returns `{port, token, url}`. |
 | `status` | yes | Reports the bridge's port, token and pairing URL (`port`, `token`, `url`), whether a tab is connected, the connected tab's contract version, and the live tool count. |
 | `figpea_skill` | yes | Returns Figpea's agent skill reference (the craft guidance for using `window.figpea` well), sourced from the editor origin's `/agent/skill.md` at startup — works even with no tab paired. Degrades to a structured `{ok:false, code:"skill_unavailable", message}` (never throws) if the fetch failed or was disabled. |
-| `group_method` (e.g. `layer_setPosition`, `canvas_screenshot`, `export_project`) | generated live | One MCP tool per method in the connected tab's `figpea.describe()` manifest. |
+| `figpea_call` | compact only | Universal dispatcher — `figpea_call({ group, method, args, _timeoutMs })` calls any `group.method` on the paired tab (see below). |
+| `group_method` (e.g. `layer_setPosition`, `canvas_screenshot`, `export_project`) | full mode only | One MCP tool per method in the connected tab's `figpea.describe()` manifest. |
 
-Generated tools advertise structured parameter types (string / number / boolean / object / array) derived from the connected tab's contract manifest, so type-respecting MCP clients pass objects and arrays through intact.
+In **compact mode (default)** the server advertises only `open_editor`, `status`, `figpea_skill`, and `figpea_call` (~500 tokens vs ~9,500 tokens, ~90–95% reduction). In **full mode** (`--mode=full` or `FIGPEA_TOOL_MODE=full`) it advertises `open_editor`, `status`, `figpea_skill` plus every `group_method` contract tool. See [Tool modes & `figpea_call` dispatcher](#tool-modes--figpea_call-dispatcher) below.
+
+Generated tools (full mode) advertise structured parameter types (string / number / boolean / object / array) derived from the connected tab's contract manifest, so type-respecting MCP clients pass objects and arrays through intact.
 
 The contract-tool list reflects whatever the connected editor advertises — it is not hardcoded here, and grows with the editor's contract. `status` and `tools/list` are the source of truth for what's callable right now; there is no version-lock between this bridge and the editor.
 
 Every call returns `{ok: true, value}` or `{ok: false, code, message}`. Image-shaped results (`canvas.screenshot`, raster exports) come back as MCP image content alongside a text summary.
+
+## Tool modes & `figpea_call` dispatcher
+
+By default `figpea-mcp` runs in **compact mode** — only 4 tools (`open_editor`, `status`, `figpea_skill`, `figpea_call`) are advertised to the MCP client. This trims the baseline context from ~9,500 tokens (35+ granular tools) to ~500 tokens, a ~90–95% reduction, while keeping full capability through the dispatcher. Agents that rarely touch design files pay almost nothing until they actually need to.
+
+### `figpea_call` calling conventions
+
+`figpea_call` is the universal dispatcher for compact mode. It forwards to `bridge.callTab(group, method, args, _timeoutMs?)` and returns the result via the same `resultToContent` mapping (including image + text blocks).
+
+```json
+// Create a rect (AC-2)
+{ "group": "layer", "method": "create", "args": ["rect", { "rwidth": 100, "rheight": 50 }] }
+
+// Screenshot (AC-3) — returns MCP image content + text summary
+{ "group": "canvas", "method": "screenshot", "args": [] }
+```
+
+- `group` (string, required) — contract group name (`layer`, `canvas`, `session`, `export`, `history`).
+- `method` (string, required) — method within the group (`create`, `screenshot`, `openFile`, …).
+- `args` (array, optional, defaults to `[]`) — positional arguments for that method, in the order `describe()` lists them.
+- `_timeoutMs` (number, optional) — per-call timeout override, clamped to 120000 ms (same `MAX_CALL_TIMEOUT_MS` and `DEFAULT_TIMEOUT_TABLE_MS` as granular tools).
+
+Image-returning methods (`canvas.screenshot`, raster `export.*`) return both an MCP `image` content block and a `text` summary block.
+
+### Configuration
+
+| Flag / Env var | Values | Default | Precedence |
+|----------------|--------|---------|------------|
+| `--mode=compact\|full` | `compact` or `full` | `compact` | CLI wins over env |
+| `FIGPEA_TOOL_MODE=compact\|full` | `compact` or `full` (case-insensitive) | `compact` | fallback if no CLI flag |
+
+Invalid values are ignored (not rejected) with a `stderr` hint — a typo never crashes the stdio channel.
+
+### When to use full mode
+
+Use **full mode** when your agent harness hardcodes individual tool names (e.g. calls `layer_create` directly) and cannot be updated to use `figpea_call`. Restart the server with `--mode=full` or `FIGPEA_TOOL_MODE=full` to restore the full `group_method` surface (`open_editor`, `status`, `figpea_skill` plus all contract tools). Otherwise stay in compact for the token win. Switching modes requires a restart — it is not a live toggle.
 
 ## Call timeouts
 
@@ -107,6 +146,8 @@ Every tool also accepts `_rawJson` (boolean, optional) — when `true`, any top-
 - `FIGPEA_EDITOR_URL` — overrides the default editor origin (`https://editor.figpea.com`) for contract prefetching, skill prefetching (`figpea_skill`), and `open_editor` links.
 - `FIGPEA_DISABLE_CONTRACT_FETCH=1` — disables BOTH the startup contract prefetch and the startup skill prefetch, falling back to cold-start static tools, drill-on-connect, and a degraded `figpea_skill` result.
 - `--port=<n>` — binds the bridge server to a specific port.
+- `--mode=compact|full` — selects the tool surface mode (default `compact`; `full` restores all `group_method` tools). See [Tool modes & `figpea_call` dispatcher](#tool-modes--figpea_call-dispatcher).
+- `FIGPEA_TOOL_MODE=compact|full` — environment-variable fallback for `--mode` (same values, case-insensitive). CLI wins over env, both default to `compact`.
 
 ## Entitlement boundary
 

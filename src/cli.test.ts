@@ -46,7 +46,8 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
       const { tools } = await client.listTools();
       const names = tools.map((t) => t.name).sort();
       // REQ-705: figpea_skill joins the always-present set.
-      expect(names).toEqual(['figpea_skill', 'open_editor', 'status']);
+      // REQ-1018: figpea_call joins compact default.
+      expect(names).toEqual(['figpea_call', 'figpea_skill', 'open_editor', 'status']);
     } finally {
       await client.close().catch(() => {});
       await transport.close().catch(() => {});
@@ -70,7 +71,8 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
       // even though its own body fetch is gated by the SAME env var and
       // therefore also disabled here -- it just degrades (skill_unavailable)
       // rather than being absent from tools/list.
-      expect(names).toEqual(['figpea_skill', 'open_editor', 'status']);
+      // REQ-1018: compact default adds figpea_call.
+      expect(names).toEqual(['figpea_call', 'figpea_skill', 'open_editor', 'status']);
     } finally {
       await client.close().catch(() => {});
       await transport.close().catch(() => {});
@@ -117,7 +119,7 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
 
     const transport = new StdioClientTransport({
       command: process.execPath,
-      args: [CLI_ENTRY],
+      args: [CLI_ENTRY, '--mode=full'],
       env: { ...process.env, FIGPEA_EDITOR_URL: origin, FIGPEA_DISABLE_CONTRACT_FETCH: '0' },
     });
     const client = new Client({ name: 'req-699-ac4-test', version: '0.0.0' });
@@ -162,7 +164,8 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
       // REQ-705: figpea_skill is still registered (always-present) even
       // though its own prefetch also failed against the same unreachable
       // origin -- it just degrades when called, never absent from the list.
-      expect(names).toEqual(['figpea_skill', 'open_editor', 'status']);
+      // REQ-1018: compact default adds figpea_call.
+      expect(names).toEqual(['figpea_call', 'figpea_skill', 'open_editor', 'status']);
 
       const skillResult = await client.callTool({ name: 'figpea_skill', arguments: {} });
       expect(skillResult).toBeDefined();
