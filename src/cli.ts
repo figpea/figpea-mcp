@@ -29,6 +29,27 @@ function parsePortArg(argv: string[]): number | undefined {
   return undefined;
 }
 
+/**
+ * REQ-1032 AC-5 — resolves the bridge bind port: `--port=` CLI flag first,
+ * then the `FIGPEA_MCP_PORT` env sibling to `FIGPEA_EDITOR_URL`, then
+ * undefined (which preserves bridgeServer's ephemeral `port ?? 0` default).
+ * Invalid env values (non-numeric or outside 1-65535) are ignored with a
+ * stderr warning, mirroring resolveToolMode's invalid-FIGPEA_TOOL_MODE
+ * handling. Exported for unit tests (same pattern as resolveToolMode).
+ */
+export function resolveBridgePort(argv: string[], env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const cliPort = parsePortArg(argv);
+  if (cliPort !== undefined) return cliPort;
+  const raw = typeof env.FIGPEA_MCP_PORT === 'string' ? env.FIGPEA_MCP_PORT.trim() : undefined;
+  if (raw === undefined || raw === '') return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) {
+    console.error(`[figpea-mcp] ignoring invalid FIGPEA_MCP_PORT="${env.FIGPEA_MCP_PORT}" — expected a port 1-65535`);
+    return undefined;
+  }
+  return n;
+}
+
 /** REQ-1018 — parses `--mode=compact|full` (last flag wins, case-insensitive, invalid ignored). */
 export function parseModeArg(argv: string[]): string | undefined {
   let found: string | undefined;
@@ -69,7 +90,7 @@ function defaultConnectUrl(port: number, token: string): string {
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
-  const port = parsePortArg(argv);
+  const port = resolveBridgePort(argv);
   const toolMode = resolveToolMode(argv);
   const bridge = await startBridgeServer(port !== undefined ? { port } : undefined);
 
