@@ -36,7 +36,11 @@ beforeAll(() => {
 
   installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'figpea-mcp-install-'));
   execFileSync('npm', ['init', '-y'], { cwd: installDir, stdio: 'pipe' });
-  execFileSync('npm', ['install', tarballPath], { cwd: installDir, stdio: 'pipe' });
+  // --no-audit --no-fund: the audit bulk POST hangs indefinitely from some
+  // networks (the advisory service is unrelated to what this suite asserts —
+  // manifest contents, shebang, stdio handshake — so skip it rather than
+  // letting beforeAll hit the 60s hook timeout). Standard CI flags.
+  execFileSync('npm', ['install', tarballPath, '--no-audit', '--no-fund'], { cwd: installDir, stdio: 'pipe' });
 }, 60_000);
 
 afterAll(() => {
