@@ -27,6 +27,10 @@ const REAL_CONTRACT_TOOL_EXAMPLES = [
   // advice — all real v3 contract tools.
   'layer_create',
   'session_layerTree',
+  // REQ-1020 T7: the image-returning tools newly documented for returnAs —
+  // all real v3 contract tools (export group's layer/artboard methods).
+  'export_layer',
+  'export_artboard',
 ];
 // REQ-772 AC-5 — the known-slow methods whose raised defaults the README's
 // "Call timeouts" section documents. All six are real contract tools.
@@ -130,5 +134,18 @@ describe('README.md (AC-5)', () => {
     // at least one figpea_call example (layer.create)
     expect(readme).toMatch(/figpea_call[\s\S]*layer[\s\S]*create|group.*layer.*method.*create/i);
     expect(readme).toMatch(/when to use full|full mode/i);
+  });
+
+  // REQ-1020 T7 — off-band image returns: reserved key, payload shape, coded
+  // write failure, and the token-saving rule of thumb.
+  it('documents returnAs path mode: reserved key, session file payload, and coded failure (REQ-1020 AC-1/AC-4)', () => {
+    expect(readme).toContain('returnAs');
+    expect(readme).toMatch(/"path"|path.*mode/i);
+    expect(readme, 'the three image tools are named').toContain('canvas_screenshot');
+    expect(readme).toContain('export_layer');
+    expect(readme).toContain('export_artboard');
+    expect(readme, 'coded write failure is documented').toContain('return_path_write_failed');
+    expect(readme, 'fail-loud on typos is documented').toContain('invalid_params');
+    expect(readme, 'the token-saving rule of thumb is stated').toMatch(/1\.3 tokens/);
   });
 });

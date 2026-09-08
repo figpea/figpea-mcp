@@ -74,6 +74,10 @@ The contract-tool list reflects whatever the connected editor advertises — it 
 
 Every call returns `{ok: true, value}` or `{ok: false, code, message}`. Image-shaped results (`canvas.screenshot`, raster exports) come back as MCP image content alongside a text summary.
 
+### Off-band image returns (`returnAs: "path"`)
+
+A full-page screenshot runs 500 KB – 2 MB raw → ~500K – 2M tokens when inlined as base64. For large captures, pass the reserved `returnAs: "path"` key on `canvas_screenshot`, `export_layer`, `export_artboard` (full mode) or on `figpea_call` (compact mode): the bytes are written to a per-session file under `<tmpdir>/figpea-mcp/<session>/` and the result is a single `text` block `{ok: true, path, mime, width, height, bytes, url}` — no `image` block crosses the wire. Open the file with your host's own file-reading tool (the `url` is the bridge's token-gated `/blob/<token>` alias; the `path` is also fetchable via the existing `GET /file?path=` loopback endpoint). Omit `returnAs` (or pass `"inline"`) for today's behavior, byte-identical. Any other value fails loud with `invalid_params`; a write failure returns `{ok: false, code: "return_path_write_failed"}` with `isError: true` and never partial bytes. The session's temp dir is removed when the bridge session ends (`close()`). Rule of thumb: for >1 MB screenshots, pass `returnAs: "path"` and read the file with your host's file tool; saves ~1.3 tokens/raw byte.
+
 ## Tool modes & `figpea_call` dispatcher
 
 By default `figpea-mcp` runs in **compact mode** — only 4 tools (`open_editor`, `status`, `figpea_skill`, `figpea_call`) are advertised to the MCP client. This trims the baseline context from ~9,500 tokens (35+ granular tools) to ~500 tokens, a ~90–95% reduction, while keeping full capability through the dispatcher. Agents that rarely touch design files pay almost nothing until they actually need to.
@@ -94,6 +98,7 @@ By default `figpea-mcp` runs in **compact mode** — only 4 tools (`open_editor`
 - `method` (string, required) — method within the group (`create`, `screenshot`, `openFile`, …).
 - `args` (array, optional, defaults to `[]`) — positional arguments for that method, in the order `describe()` lists them.
 - `_timeoutMs` (number, optional) — per-call timeout override, clamped to 120000 ms (same `MAX_CALL_TIMEOUT_MS` and `DEFAULT_TIMEOUT_TABLE_MS` as granular tools).
+- `returnAs` (string, optional) — `"inline"` (default) or `"path"`; `"path"` writes image results to a session file and returns `{ok, path, mime, width, height, bytes, url}` as text (see "Off-band image returns" above). Typos fail with `invalid_params`.
 
 Image-returning methods (`canvas.screenshot`, raster `export.*`) return both an MCP `image` content block and a `text` summary block.
 

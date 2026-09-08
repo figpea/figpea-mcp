@@ -306,13 +306,52 @@ function asImageValue(value: unknown): ImageValueLike | undefined {
 }
 
 /**
+ * REQ-1020 T2 (AC-1/AC-2/AC-4, plan D2) — off-band return options.
+ *
+ * `tools.ts` stays dependency-free (see the module header): the writer is
+ * injected, never imported — production passes `returnPath.ts`'s
+ * `writeImageReturn`, tests pass fakes. `tool`/`sessionDir` are forwarded to
+ * the writer for filename + placement; `fileUrlFor` builds the token-gated
+ * fetch URL for the written bytes (plan D4: the bridge's `registerBlob()`).
+ * A `url` returned by the writer itself wins over `fileUrlFor` (lets fakes
+ * stay one-function).
+ */
+export interface ReturnAsOptions {
+  returnAs?: string;
+  tool?: string;
+  sessionDir?: string;
+  writeImage?: (args: {
+    bytesB64: string;
+    mime: string;
+    width: number;
+    height: number;
+    tool: string;
+    sessionDir: string;
+  }) => { path: string; mime: string; width: number; height: number; bytes: number; url?: string };
+  fileUrlFor?: (absPath: string) => string;
+}
+
+/** figpea-mcp-only write-failure code (plan D3, AC-6) — mirrored here (not
+ * imported) so this module keeps its zero-runtime-cost importability. */
+const RETURN_PATH_WRITE_FAILED = 'return_path_write_failed';
+
+/**
  * Runtime-derived result -> MCP content mapping (plan §1 OQ-D): success ->
  * JSON text (`isError:false`); `{ok:false}` -> JSON text preserving
  * `code`/`message` (`isError:true`); an image-shaped success value -> MCP
  * image content plus a short text summary. Never a hardcoded tool-name
  * special case.
+ *
+ * REQ-1020: with `opts.returnAs === "path"` an image-shaped success value is
+ * instead written off-band and mapped to a single text block
+ * `{ok:true, path, mime, width, height, bytes, url?}` (AC-1/AC-2). A
+ * non-image result ignores the key (no-op, never an error); an unknown value
+ * fails loud with `invalid_params` (a typo must not silently inline
+ * megabytes); a write failure maps to `return_path_write_failed` with
+ * `isError:true` (AC-4). Default/`"inline"` is byte-identical to before
+ * (AC-3).
  */
-export function resultToContent(result: FigpeaCallResultLike): MappedToolResultLike {
+export function resultToContent(result: FigpeaCallResultLike, opts?: ReturnAsOptions): MappedToolResultLike {
   if (!result.ok) {
     return {
       isError: true,
@@ -321,6 +360,41 @@ export function resultToContent(result: FigpeaCallResultLike): MappedToolResultL
   }
 
   const imageValue = asImageValue(result.value);
+  const mode = opts?.returnAs ?? 'inline';
+  if (imageValue && mode !== 'inline') {
+    if (mode !== 'path') {
+      return {
+        isError: true,
+        content: [{ type: 'text', text: JSON.stringify({ ok: false, code: 'invalid_params', message: `returnAs must be "inline" or "path", got ${JSON.stringify(mode)}` }) }],
+      };
+    }
+    try {
+      const writer = opts?.writeImage;
+      if (!writer) {
+        throw Object.assign(new Error('no image writer wired for returnAs:"path"'), { code: RETURN_PATH_WRITE_FAILED });
+      }
+      const written = writer({
+        bytesB64: imageValue.bytes,
+        mime: imageValue.mime,
+        width: typeof imageValue.width === 'number' ? imageValue.width : 0,
+        height: typeof imageValue.height === 'number' ? imageValue.height : 0,
+        tool: opts?.tool ?? 'image',
+        sessionDir: opts?.sessionDir ?? '',
+      });
+      const url = written.url ?? opts?.fileUrlFor?.(written.path);
+      return {
+        isError: false,
+        content: [{ type: 'text', text: JSON.stringify({ ok: true, path: written.path, mime: written.mime, width: written.width, height: written.height, bytes: written.bytes, ...(url !== undefined ? { url } : {}) }) }],
+      };
+    } catch (e) {
+      const code = typeof (e as { code?: unknown })?.code === 'string' ? (e as { code: string }).code : RETURN_PATH_WRITE_FAILED;
+      return {
+        isError: true,
+        content: [{ type: 'text', text: JSON.stringify({ ok: false, code, message: e instanceof Error ? e.message : String(e) }) }],
+      };
+    }
+  }
+
   if (imageValue) {
     const { bytes, mime, ...rest } = imageValue;
     return {

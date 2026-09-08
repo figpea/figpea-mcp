@@ -20,6 +20,7 @@ import {
   type ManifestLike,
   type McpContentBlockLike,
 } from './tools';
+import { writeImageReturn, sessionDirFor } from './returnPath';
 
 /** What this module needs from a started bridge (bridgeServer.ts's real
  * `BridgeServerHandle` is a superset — `getContractVersion` is optional here
@@ -89,6 +90,43 @@ function resolveTimeoutMs(toolName: string, rawOverride: unknown): number | unde
   return DEFAULT_TIMEOUT_TABLE_MS[toolName];
 }
 
+/** REQ-1020 — the three image-returning tools whose results may be returned
+ * off-band via the reserved `returnAs` key (plan D1). `returnAs` is NOT a
+ * contract param (AC-6: no v3 change) — it follows the REQ-772 `_timeoutMs`
+ * reserved-key pattern: declared in the shape so it survives the SDK's
+ * `safeParseAsync` stripping, never in `inputKeys`, never forwarded. */
+export const IMAGE_PATH_TOOLS: ReadonlySet<string> = new Set([
+  'canvas_screenshot',
+  'export_layer',
+  'export_artboard',
+]);
+
+/** REQ-1020 — validates one `returnAs` value, failing loud (plan D1): a typo
+ * must error, never silently inline megabytes. Returns the normalized mode or
+ * an error payload. */
+function resolveReturnAs(raw: unknown): { mode: 'inline' | 'path' } | { error: { ok: false; code: string; message: string } } {
+  if (raw === undefined) return { mode: 'inline' };
+  if (raw === 'inline' || raw === 'path') return { mode: raw };
+  return { error: { ok: false, code: 'invalid_params', message: `returnAs must be "inline" or "path", got ${JSON.stringify(raw)}` } };
+}
+
+/** REQ-1020 — builds the `resultToContent` off-band options for one image
+ * tool call: real writer + session dir + token-gated fetch URL (plan D4:
+ * the bridge's existing `registerBlob()`, falling back to `getFileUrl()`). */
+function returnAsOpts(bridge: BridgeServerHandleLike, toolName: string, mode: 'inline' | 'path'): Parameters<typeof resultToContent>[1] {
+  return {
+    returnAs: mode,
+    tool: toolName,
+    sessionDir: sessionDirFor(bridge.token),
+    writeImage: writeImageReturn,
+    fileUrlFor: bridge.registerBlob
+      ? (p: string) => bridge.registerBlob!(p)
+      : bridge.getFileUrl
+        ? (p: string) => bridge.getFileUrl!(p)
+        : undefined,
+  };
+}
+
 function toCallToolResult(mapped: { content: McpContentBlockLike[]; isError: boolean }): CallToolResult {
   // `McpContentBlockLike` mirrors the SDK's own TextContent/ImageContent
   // shapes exactly (plan §1) but is declared independently in the
@@ -122,6 +160,14 @@ function buildInputShape(tool: GeneratedTool): Record<string, z.ZodTypeAny> {
   // REQ-1037 — reserved `_rawJson` bypass for harness that stringifies nested numbers.
   // Declared so it survives safeParseAsync, never forwarded (not in inputKeys).
   shape['_rawJson'] = z.any().optional();
+  // REQ-1020 — reserved `returnAs` for the three image tools (plan D1):
+  // declared (permissive `z.any`, like every other hint-mapped key) so it
+  // survives safeParseAsync; advertised via meta; validated manually in the
+  // handler so a typo fails loud with `invalid_params`. Never in inputKeys,
+  // so never forwarded to the tab.
+  if (IMAGE_PATH_TOOLS.has(tool.name)) {
+    shape['returnAs'] = z.any().meta({ type: 'string', enum: ['inline', 'path'] }).optional();
+  }
   if (tool.inputKeys.length === 0) return shape;
   // REQ-769 — the type mapping below rests on one mechanic of the MCP SDK,
   // verified empirically against the installed @modelcontextprotocol/sdk +
@@ -346,13 +392,14 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       'figpea_call',
       {
         description:
-          'Universal dispatcher — calls any group.method on the paired editor tab via bridge.callTab(group, method, args, _timeoutMs?). In compact mode this is the only way to reach contract methods; in full mode the individual tools are also available. group/method are the describe() surface names, args is the positional argument array for that method (e.g. ["rect", {rwidth:100}] for layer.create). Image results return MCP image content + a text summary.',
+          'Universal dispatcher — calls any group.method on the paired editor tab via bridge.callTab(group, method, args, _timeoutMs?). In compact mode this is the only way to reach contract methods; in full mode the individual tools are also available. group/method are the describe() surface names, args is the positional argument array for that method (e.g. ["rect", {rwidth:100}] for layer.create). Image results return MCP image content + a text summary. Pass returnAs:"path" (canvas_screenshot, export_layer, export_artboard) to receive the image off-band as a session file path instead of inline base64.',
         inputSchema: {
           group: z.string().describe('Contract group name (e.g. layer, canvas, session, export)'),
           method: z.string().describe('Method name within the group (e.g. create, screenshot)'),
           args: z.array(z.any()).optional().describe('Positional arguments for the method (defaults to [])'),
           _timeoutMs: z.number().optional().describe('Optional per-call timeout override in ms (clamped to 120000)'),
           _rawJson: z.any().optional().describe('Reserved passthrough for harness stringification tolerance'),
+          returnAs: z.any().optional().describe('Reserved: "inline" (default) or "path" — "path" writes image results to a session file and returns {ok, path, mime, width, height, bytes, url} as text'),
         },
       },
       async (rawArgs) => {
@@ -476,8 +523,14 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
 
         const effectiveTimeoutMs = resolveTimeoutMs(toolName, rawTimeout);
         try {
+          // REQ-1020 — reserved `returnAs` (plan D1/D2): validated fail-loud
+          // like the full-mode handler above; top-level so never forwarded.
+          const resolvedReturnAs = resolveReturnAs((rawArgs as any).returnAs);
+          if ('error' in resolvedReturnAs) {
+            return toCallToolResult(resultToContent(resolvedReturnAs.error));
+          }
           const result = (await bridge.callTab(group, method, effectiveArgs, effectiveTimeoutMs)) as FigpeaCallResultLike;
-          return toCallToolResult(resultToContent(result));
+          return toCallToolResult(resultToContent(result, returnAsOpts(bridge, toolName, resolvedReturnAs.mode)));
         } catch (e) {
           return toCallToolResult(
             resultToContent({ ok: false, code: 'bridge_error', message: e instanceof Error ? e.message : String(e) }),
@@ -851,6 +904,17 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       // Remove reserved keys so they never leak into coercion or logging of effective args
       delete (effectiveRawArgs as any)['_rawJson'];
 
+      // REQ-1020 — reserved `returnAs` (plan D1/D2): validated here (fail
+      // loud on typos, before spending a bridge round trip), stripped like
+      // `_rawJson` above — it is not in `inputKeys`, so the positional
+      // mapping below can never forward it to the tab.
+      const returnAsRaw = (effectiveRawArgs as any)['returnAs'];
+      delete (effectiveRawArgs as any)['returnAs'];
+      const resolvedReturnAs = resolveReturnAs(returnAsRaw);
+      if ('error' in resolvedReturnAs) {
+        return toCallToolResult(resultToContent(resolvedReturnAs.error));
+      }
+
       // `_timeoutMs` is a reserved top-level key (REQ-772 AC-1), excluded
       // from the manifest-args mapping by construction: only `inputKeys` are
       // forwarded positionally to the tab-side method.
@@ -862,7 +926,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       });
       try {
         const result = (await bridge.callTab(groupName, methodName, args, effectiveTimeoutMs)) as FigpeaCallResultLike;
-        return toCallToolResult(resultToContent(result));
+        return toCallToolResult(resultToContent(result, returnAsOpts(bridge, toolName, resolvedReturnAs.mode)));
       } catch (e) {
         return toCallToolResult(
           resultToContent({ ok: false, code: 'bridge_error', message: e instanceof Error ? e.message : String(e) }),

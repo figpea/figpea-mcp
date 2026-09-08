@@ -16,6 +16,7 @@ import * as os from 'node:os';
 import WebSocket, { WebSocketServer } from 'ws';
 import type { CallFrame, DescribeFrame } from './protocol';
 import { drillManifest, type DescribeFn, type DescribeResultPayload } from './describeDrill';
+import { sessionDirFor, removeSessionDir } from './returnPath';
 
 /** Distinct WebSocket close codes for the two server-initiated close paths
  * (AC-3, OQ-3) — both >=4000 (RFC 6455 private-use range), unambiguously
@@ -80,6 +81,13 @@ interface PendingCall {
 /** Starts the localhost-only bridge WebSocket + HTTP file server (plan §3, REQ-1017). */
 export async function startBridgeServer(options?: StartBridgeServerOptions): Promise<BridgeServerHandle> {
   const token = crypto.randomUUID();
+
+  // REQ-1020 D5 — per-session dir for off-band image returns
+  // (`<tmpdir>/figpea-mcp/<token>/`, created lazily by the writer on first
+  // path-return, removed in `close()` below). Tab takeover under the same
+  // token keeps the session, so no cleanup there; a new server run mints a
+  // new token and a new dir.
+  const sessionDir = sessionDirFor(token);
 
   // --- REQ-1017 file handling helpers ---
   const blobMap = new Map<string, string>(); // token -> filePath
@@ -453,6 +461,8 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
         httpServer.close((err) => (err ? reject(err) : resolve()));
       });
       await new Promise<void>((resolve) => wss.close(() => resolve()));
+      // REQ-1020 D5 (AC-5): the session's temp dir goes with the session.
+      removeSessionDir(sessionDir);
     },
   };
 }
