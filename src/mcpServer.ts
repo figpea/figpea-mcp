@@ -55,7 +55,7 @@ export interface CreateMcpServerOptions {
 
 const DEFAULT_EDITOR_BASE_URL = 'https://editor.figpea.com';
 const SERVER_NAME = 'figpea-mcp';
-const SERVER_VERSION = '2.2.0';
+const SERVER_VERSION = '2.3.0';
 
 /** REQ-772 AC-1 — the documented maximum a per-call `_timeoutMs` override may
  * raise a single bridge call's timeout to. Values above it are clamped (not
