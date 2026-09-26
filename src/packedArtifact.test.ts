@@ -113,7 +113,8 @@ describe('installed tarball — stdio MCP handshake (AC-4)', () => {
       const names = tools.map((t) => t.name).sort();
       // REQ-705: figpea_skill joins the always-present set.
       // REQ-1018: compact default adds figpea_call.
-      expect(names).toEqual(['figpea_call', 'figpea_skill', 'open_editor', 'status']);
+      // REQ-1268: compact default also adds figpea_describe (AC-1).
+      expect(names).toEqual(['figpea_call', 'figpea_describe', 'figpea_skill', 'open_editor', 'status']);
     } finally {
       await client.close().catch(() => {});
       await transport.close().catch(() => {});

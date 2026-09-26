@@ -47,7 +47,7 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
       const names = tools.map((t) => t.name).sort();
       // REQ-705: figpea_skill joins the always-present set.
       // REQ-1018: figpea_call joins compact default.
-      expect(names).toEqual(['figpea_call', 'figpea_skill', 'open_editor', 'status']);
+      expect(names).toEqual(['figpea_call', 'figpea_describe', 'figpea_skill', 'open_editor', 'status']);
     } finally {
       await client.close().catch(() => {});
       await transport.close().catch(() => {});
@@ -72,7 +72,7 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
       // therefore also disabled here -- it just degrades (skill_unavailable)
       // rather than being absent from tools/list.
       // REQ-1018: compact default adds figpea_call.
-      expect(names).toEqual(['figpea_call', 'figpea_skill', 'open_editor', 'status']);
+      expect(names).toEqual(['figpea_call', 'figpea_describe', 'figpea_skill', 'open_editor', 'status']);
     } finally {
       await client.close().catch(() => {});
       await transport.close().catch(() => {});
@@ -165,7 +165,7 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
       // though its own prefetch also failed against the same unreachable
       // origin -- it just degrades when called, never absent from the list.
       // REQ-1018: compact default adds figpea_call.
-      expect(names).toEqual(['figpea_call', 'figpea_skill', 'open_editor', 'status']);
+      expect(names).toEqual(['figpea_call', 'figpea_describe', 'figpea_skill', 'open_editor', 'status']);
 
       const skillResult = await client.callTool({ name: 'figpea_skill', arguments: {} });
       expect(skillResult).toBeDefined();

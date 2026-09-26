@@ -21,6 +21,8 @@ import {
   type McpContentBlockLike,
 } from './tools';
 import { writeImageReturn, sessionDirFor } from './returnPath';
+import { groupNamesFromCompactIndex } from './describeDrill';
+import { findArgShapeMismatch, renderSchemaExample } from './argShape';
 
 /** What this module needs from a started bridge (bridgeServer.ts's real
  * `BridgeServerHandle` is a superset — `getContractVersion` is optional here
@@ -48,8 +50,10 @@ export interface CreateMcpServerOptions {
    * or was disabled -- the `figpea_skill` tool degrades gracefully rather
    * than being omitted from `tools/list`. */
   prefetchedSkillBody?: string;
-  /** REQ-1018: tool surface mode — compact (default) exposes only 4 tools
-   * plus figpea_call dispatcher; full restores all contract tools. */
+  /** REQ-1018: tool surface mode — compact (default) exposes only 5 tools:
+   * `open_editor`, `status`, `figpea_skill`, the `figpea_call` dispatcher, and
+   * (REQ-1268) `figpea_describe`; full restores all contract tools instead of
+   * the two compact-only ones. */
   toolMode?: 'compact' | 'full';
 }
 
@@ -386,17 +390,180 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     },
   );
 
+  // REQ-1268 T2 (AC-1) — `figpea_describe`: a describe-equivalent for
+  // COMPACT mode, which is the default (cli.ts:79) and otherwise the only way
+  // to reach a contract method. Before this, the descriptor knowledge was in
+  // memory (the prefetched manifest) but nothing published it: the agent had
+  // to blind-guess `figpea_call(group:"session", method:"describe")` or read
+  // a Markdown doc, so `layer.batch`'s nested positional shape was
+  // undiscoverable — the exact cause of the REQ-1268 incident payload.
+  //
+  // Registered in compact mode ONLY. In full mode every generated tool's
+  // description already carries `doc + Params: + Result:` (tools.ts
+  // buildDescription), so a describe tool there would be dead surface, and
+  // registering it in both modes would churn the full-mode tool-list pins for
+  // no benefit. Compact-only also keeps full mode byte-identical.
+  //
+  // It is a real tool rather than a selector argument on `figpea_call` on
+  // purpose: a tool is discoverable in `tools/list`, whereas a selector has to
+  // be guessed — which is the failure being fixed.
+  if (toolMode === 'compact') {
+    server.registerTool(
+      'figpea_describe',
+      {
+        description:
+          "Returns the agent contract surface for a group or method — the same doc/params/result the editor's own describe() returns, served from the manifest this server already holds in memory (no round trip to the tab). Call it with no arguments for the group index, {group} for one group's methods, or {group, method} for one method's wire shape. In compact mode this is how you learn a method's argument shape instead of probing: e.g. figpea_describe({group:'layer', method:'batch'}) returns the ops shape, whose args is a POSITIONAL array of {method, args} ops.",
+        inputSchema: {
+          group: z.string().optional().describe("Contract group name (e.g. layer, canvas, session, export). Omit for the index of all groups."),
+          method: z.string().optional().describe('Method name within the group (e.g. create, batch). Requires group.'),
+        },
+      },
+      async (rawArgs) => {
+        const manifest = activeManifest;
+        if (!manifest) {
+          // Degrade exactly like figpea_skill: a named failure with both
+          // alternative routes, never a throw and never an empty object.
+          return jsonTextResult({
+            ok: false,
+            code: 'describe_unavailable',
+            message:
+              'The contract manifest is not available (the startup fetch failed, or was disabled via FIGPEA_DISABLE_CONTRACT_FETCH, and no editor tab has described itself yet). ' +
+              'Get it another way: call figpea_call with group "session" and method "describe" from a connected editor tab, or GET <editor-origin>/agent/contract.json directly.',
+          });
+        }
+
+        const group = (rawArgs as { group?: unknown }).group;
+        const method = (rawArgs as { method?: unknown }).method;
+        const knownGroups = groupNamesFromCompactIndex(manifest);
+
+        if (typeof group === 'string' && group !== '') {
+          if (!knownGroups.includes(group)) {
+            return jsonTextResult({
+              ok: false,
+              code: 'unknown_group',
+              message: `Unknown group "${group}". Known groups: ${knownGroups.join(', ')}`,
+            });
+          }
+          const methods = manifest[group];
+          if (typeof method === 'string' && method !== '') {
+            const descriptor = methods[method];
+            if (!descriptor) {
+              return jsonTextResult({
+                ok: false,
+                code: 'unknown_method',
+                message: `Unknown method "${group}.${method}". Known methods in ${group}: ${Object.keys(methods).join(', ')}`,
+              });
+            }
+            return jsonTextResult({ ok: true, group, method, ...descriptor });
+          }
+          return jsonTextResult({ ok: true, group, methods });
+        }
+
+        // Bare index, mirroring the editor's own compact index: a reserved
+        // `version` string plus one doc-string entry per method, so an agent
+        // can see what exists before paying for a drill.
+        const index: Record<string, unknown> = {};
+        if (typeof (manifest as Record<string, unknown>)['version'] === 'string') {
+          index['version'] = (manifest as Record<string, unknown>)['version'];
+        }
+        for (const name of knownGroups) {
+          const perGroup: Record<string, string> = {};
+          for (const [methodName, descriptor] of Object.entries(manifest[name])) {
+            perGroup[methodName] = descriptor?.doc ?? '';
+          }
+          index[name] = perGroup;
+        }
+        return jsonTextResult({ ok: true, groups: index });
+      },
+    );
+  }
+
+  // REQ-1268 T4 (AC-3) — compact/full coercion parity.
+  //
+  // `coerceValue` had exactly ONE call site, inside `makeContractHandler`,
+  // which only exists in FULL mode. So in compact mode — the default, and the
+  // only way to reach a contract method — `pageWidth:"100"` reached the tab as
+  // a string, and the identical call succeeded in full mode. That is the
+  // "correct envelope but still fails" half of the incident.
+  //
+  // This reuses the SAME function on the default path rather than writing a
+  // second coercion: one lazy index over the manifest we already hold, looked
+  // up by `group_method`, and the same positional↔schema correspondence
+  // `makeContractHandler` already relies on (`paramKeys()` is
+  // `Object.keys(descriptor.params)` in declaration order).
+  //
+  // Lazy, never at startup: the index is built on first use and rebuilt only
+  // when the manifest identity changes (a new describe() event). It is built
+  // SEPARATELY from `registerContractTools` and never assigns `toolCount`, so
+  // compact mode's `status.toolCount === 0` is untouched.
+  let contractIndex: Map<string, GeneratedTool> | null = null;
+  let contractIndexFor: ManifestLike | undefined;
+
+  /** REQ-1268 T5 — belt-and-braces half of AC-5.
+   *
+   * The pre-flight above catches every shape the declared schema can
+   * classify. This catches the rest: when the tab itself rejects the call and
+   * the relayed message teaches nothing, append the route to the descriptor
+   * instead of leaving the agent with a bare editor error. It never rewrites
+   * the code or the original message — only adds the missing next step — and
+   * it is idempotent, so a message that already carries a hint is untouched. */
+  function appendShapeHint<T>(result: T, group: string, method: string): T {
+    const r = result as { ok?: unknown; code?: unknown; message?: unknown };
+    if (r?.ok !== false) return result;
+    if (r.code !== 'invalid_params') return result;
+    if (typeof r.message !== 'string') return result;
+    if (r.message.includes('figpea_describe')) return result;
+    r.message =
+      `${r.message} — to see this method's exact argument shape, call figpea_describe({group:"${group}", method:"${method}"}).`;
+    return result;
+  }
+  function contractToolFor(groupName: string, methodName: string): GeneratedTool | undefined {
+    const manifest = activeManifest;
+    if (!manifest) return undefined;
+    if (contractIndex === null || contractIndexFor !== manifest) {
+      contractIndex = new Map(buildToolsFromManifest(manifest).map((tool) => [tool.name, tool]));
+      contractIndexFor = manifest;
+    }
+    return contractIndex.get(`${groupName}_${methodName}`);
+  }
+
   // REQ-1018 — figpea_call dispatcher (compact mode only)
   if (toolMode === 'compact') {
     server.registerTool(
       'figpea_call',
       {
         description:
-          'Universal dispatcher — calls any group.method on the paired editor tab via bridge.callTab(group, method, args, _timeoutMs?). In compact mode this is the only way to reach contract methods; in full mode the individual tools are also available. group/method are the describe() surface names, args is the positional argument array for that method (e.g. ["rect", {rwidth:100}] for layer.create). Image results return MCP image content + a text summary. Pass returnAs:"path" (canvas_screenshot, export_layer, export_artboard) to receive the image off-band as a session file path instead of inline base64.',
+          'Universal dispatcher — calls any group.method on the paired editor tab via bridge.callTab(group, method, args, _timeoutMs?). In compact mode this is the only way to reach contract methods; in full mode the individual tools are also available. group/method are the describe() surface names, and args is the POSITIONAL argument array for that method, in that method\'s own parameter order. FLAT example: ["rect", {rwidth:100}] for layer.create. NESTED example — when a parameter is itself an array (e.g. layer.batch\'s ops), that parameter is passed as ONE element of args, so the element is an array of {method, args} ops: {"group":"layer","method":"batch","args":[[{"method":"create","args":["page",{"name":"probe","pageWidth":100,"pageHeight":100}]}]]}. Each op\'s own args is likewise a positional ARRAY, never an object. Unsure of a method\'s shape? Call figpea_describe({group, method}) first — it returns that method\'s doc and params from the manifest with no round trip to the tab. Image results return MCP image content + a text summary. Pass returnAs:"path" (canvas_screenshot, export_layer, export_artboard) to receive the image off-band as a session file path instead of inline base64.',
         inputSchema: {
           group: z.string().describe('Contract group name (e.g. layer, canvas, session, export)'),
           method: z.string().describe('Method name within the group (e.g. create, screenshot)'),
-          args: z.array(z.any()).optional().describe('Positional arguments for the method (defaults to [])'),
+          // REQ-1268 T3 (AC-2): the rule that generalises past the one nested
+          // example above. `.describe()` because that is the mechanism already
+          // proven in this file (and asserted in mcpServer.test.ts), and
+          // `.meta()` in the REQ-769 idiom so a type-respecting client sees
+          // the array-of-array shape in the advertised JSON Schema.
+          //
+          // VERIFIED, not assumed (plan D2's verify-then-pin): the SDK's
+          // zod→JSON Schema conversion takes the `meta` description in
+          // PREFERENCE to `.describe()` — a scratch dump of `tools/list` showed
+          // the meta text winning outright. So the nested rule is carried in
+          // BOTH, or the advertised half (the half AC-2 actually asserts, and
+          // the half a type-respecting client reads) would be the one that lost
+          // it. req1268.test.ts pins what `tools/list` really advertises.
+          //
+          // Parse behaviour is deliberately UNCHANGED — still `z.array(z.any())`
+          // — so this adds guidance and zero new rejections.
+          args: z
+            .array(z.any())
+            .optional()
+            .describe(
+              'Positional arguments for the method, in that method\'s own parameter order (defaults to []). When a parameter is itself an array (e.g. layer.batch\'s ops), pass it as ONE element of args — that element is an array of {method, args} ops, e.g. [[{method:"create", args:["rect",{rwidth:100}]}]]. Each op\'s args is an array too, never an object.',
+            )
+            .meta({
+              type: 'array',
+              description:
+                'Positional argument array, in the method\'s own parameter order. An array-typed parameter (e.g. layer.batch\'s ops) is passed as ONE element of args, and that element is itself an array of {method, args} ops — e.g. [[{method:"create", args:["rect",{rwidth:100}]}]]. Each op\'s args is an array, never an object.',
+            }),
           _timeoutMs: z.number().optional().describe('Optional per-call timeout override in ms (clamped to 120000)'),
           _rawJson: z.any().optional().describe('Reserved passthrough for harness stringification tolerance'),
           returnAs: z.any().optional().describe('Reserved: "inline" (default) or "path" — "path" writes image results to a session file and returns {ok, path, mime, width, height, bytes, url} as text'),
@@ -522,6 +689,44 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         }
 
         const effectiveTimeoutMs = resolveTimeoutMs(toolName, rawTimeout);
+        // REQ-1268 T4 (AC-3) — parity pass, applied AFTER the file-path
+        // translation above (so a translated bridge URL is never re-coerced)
+        // and BEFORE the round trip (so a coercion problem costs no bridge
+        // call). Same `coerceValue`, same positional mapping as full mode.
+        const contractTool = contractToolFor(group, method);
+        if (contractTool) {
+          effectiveArgs = effectiveArgs.map((value, i) =>
+            coerceValue(value, contractTool.paramSchemas?.[contractTool.inputKeys[i]]),
+          );
+          // REQ-1268 T5 (AC-5) — shape pre-flight, AFTER coercion and BEFORE
+          // the round trip, so a mangled payload costs zero bridge calls. The
+          // message has to be actionable on its own: it names the offending
+          // path, renders the expected positional shape for THIS method, and
+          // points at the one call that teaches it.
+          for (let i = 0; i < effectiveArgs.length; i++) {
+            const key = contractTool.inputKeys[i];
+            if (key === undefined) break;
+            const mismatch = findArgShapeMismatch(effectiveArgs[i], contractTool.paramSchemas?.[key], `args[${i}]`);
+            if (!mismatch) continue;
+            const expectedArgs = contractTool.inputKeys
+              .map((k, idx) => {
+                const sch = contractTool.paramSchemas?.[k];
+                return sch ? renderSchemaExample(sch) : '…';
+              })
+              .join(', ');
+            return toCallToolResult(
+              resultToContent({
+                ok: false,
+                code: 'invalid_params',
+                message:
+                  `${toolName}: ${mismatch.path} must be ${mismatch.expected}, but it arrived as ${mismatch.got}. ` +
+                  `${mismatch.hint} ` +
+                  `Expected ${toolName} args: [${expectedArgs}]. ` +
+                  `Learn the exact shape first: figpea_describe({group:"${group}", method:"${method}"}).`,
+              }),
+            );
+          }
+        }
         try {
           // REQ-1020 — reserved `returnAs` (plan D1/D2): validated fail-loud
           // like the full-mode handler above; top-level so never forwarded.
@@ -530,7 +735,9 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             return toCallToolResult(resultToContent(resolvedReturnAs.error));
           }
           const result = (await bridge.callTab(group, method, effectiveArgs, effectiveTimeoutMs)) as FigpeaCallResultLike;
-          return toCallToolResult(resultToContent(result, returnAsOpts(bridge, toolName, resolvedReturnAs.mode)));
+          return toCallToolResult(
+            resultToContent(appendShapeHint(result, `${group}`, `${method}`), returnAsOpts(bridge, toolName, resolvedReturnAs.mode)),
+          );
         } catch (e) {
           return toCallToolResult(
             resultToContent({ ok: false, code: 'bridge_error', message: e instanceof Error ? e.message : String(e) }),
@@ -1006,7 +1213,18 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     registerContractTools(options.prefetchedManifest);
   }
 
+  // REQ-1268 T2 (AC-1) — the manifest ref that `figpea_describe` reads.
+  // Seeded from the startup prefetch (already in memory, so this costs
+  // nothing) and refreshed on every describe event. Compact mode registers NO
+  // contract tool from it, which is what keeps `status.toolCount === 0` in
+  // compact mode (REQ-1018's pin) exactly as before.
+  let activeManifest: ManifestLike | undefined = options?.prefetchedManifest;
+
   bridge.onDescribe((manifest) => {
+    // The assignment comes BEFORE the full-mode early return on purpose: a
+    // compact-mode session also learns the manifest when a tab describes
+    // itself, and must not be the one surface that throws that knowledge away.
+    activeManifest = manifest as ManifestLike;
     if (toolMode !== 'full') return;
     registerContractTools(manifest as ManifestLike);
   });

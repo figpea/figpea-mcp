@@ -64,9 +64,10 @@ Honors `FIGPEA_EDITOR_URL` (default `https://editor.figpea.com`, override for lo
 | `status` | yes | Reports the bridge's port, token and pairing URL (`port`, `token`, `url`), whether a tab is connected, the connected tab's contract version, and the live tool count. |
 | `figpea_skill` | yes | Returns Figpea's agent skill reference (the craft guidance for using `window.figpea` well), sourced from the editor origin's `/agent/skill.md` at startup — works even with no tab paired. Degrades to a structured `{ok:false, code:"skill_unavailable", message}` (never throws) if the fetch failed or was disabled. |
 | `figpea_call` | compact only | Universal dispatcher — `figpea_call({ group, method, args, _timeoutMs })` calls any `group.method` on the paired tab (see below). |
+| `figpea_describe` | compact only | Returns the contract surface for a group or method — the same `doc`/`params`/`result` the editor's own `describe()` returns, from the manifest this server already holds in memory (no tab round trip). `figpea_describe()` → group index, `{group}` → that group's methods, `{group, method}` → one method's wire shape. Degrades to `{ok:false, code:"describe_unavailable"}` (never throws) when the manifest was never fetched. |
 | `group_method` (e.g. `layer_setPosition`, `canvas_screenshot`, `export_project`) | full mode only | One MCP tool per method in the connected tab's `figpea.describe()` manifest. |
 
-In **compact mode (default)** the server advertises only `open_editor`, `status`, `figpea_skill`, and `figpea_call` (~500 tokens vs ~9,500 tokens, ~90–95% reduction). In **full mode** (`--mode=full` or `FIGPEA_TOOL_MODE=full`) it advertises `open_editor`, `status`, `figpea_skill` plus every `group_method` contract tool. See [Tool modes & `figpea_call` dispatcher](#tool-modes--figpea_call-dispatcher) below.
+In **compact mode (default)** the server advertises only `open_editor`, `status`, `figpea_skill`, `figpea_call` and `figpea_describe` — 5 tools, ~600 tokens vs ~9,500 tokens, a ~90–95% reduction. In **full mode** (`--mode=full` or `FIGPEA_TOOL_MODE=full`) it advertises `open_editor`, `status`, `figpea_skill` plus every `group_method` contract tool. See [Tool modes & `figpea_call` dispatcher](#tool-modes--figpea_call-dispatcher) below.
 
 Generated tools (full mode) advertise structured parameter types (string / number / boolean / object / array) derived from the connected tab's contract manifest, so type-respecting MCP clients pass objects and arrays through intact.
 
@@ -80,7 +81,7 @@ A full-page screenshot runs 500 KB – 2 MB raw → ~500K – 2M tokens when inl
 
 ## Tool modes & `figpea_call` dispatcher
 
-By default `figpea-mcp` runs in **compact mode** — only 4 tools (`open_editor`, `status`, `figpea_skill`, `figpea_call`) are advertised to the MCP client. This trims the baseline context from ~9,500 tokens (35+ granular tools) to ~500 tokens, a ~90–95% reduction, while keeping full capability through the dispatcher. Agents that rarely touch design files pay almost nothing until they actually need to.
+By default `figpea-mcp` runs in **compact mode** — only 5 tools (`open_editor`, `status`, `figpea_skill`, `figpea_call`, `figpea_describe`) are advertised to the MCP client. This trims the baseline context from ~9,500 tokens (35+ granular tools) to ~600 tokens, a ~90–95% reduction, while keeping full capability through the dispatcher. Agents that rarely touch design files pay almost nothing until they actually need to.
 
 ### `figpea_call` calling conventions
 
@@ -92,7 +93,13 @@ By default `figpea-mcp` runs in **compact mode** — only 4 tools (`open_editor`
 
 // Screenshot (AC-3) — returns MCP image content + text summary
 { "group": "canvas", "method": "screenshot", "args": [] }
+
+// NESTED — layer.batch's `ops` is itself an array, so it is passed as ONE
+// element of `args`, and each op's own `args` is an array too (never an object)
+{ "group": "layer", "method": "batch", "args": [[{ "method": "create", "args": ["page", { "name": "probe", "pageWidth": 100, "pageHeight": 100 }] }]] }
 ```
+
+**Nesting rule.** `args` is the positional array in the method's own parameter order. When a parameter is itself an array — `layer.batch`'s `ops` is the one that bites — that parameter goes in as **one element of `args`**, and the element is an array of `{method, args}` ops. Each op's `args` is a positional array as well. So `ops` is `[[{…}]]`, never `{ops: […]}` and never `{"item": […]}` (the latter is what some host harnesses produce when they collapse a nested array; `figpea_call` answers that with an `invalid_params` naming the path and the expected shape, without spending a tab round trip). When in doubt, call `figpea_describe({ group: "layer", method: "batch" })` first — it returns the authoritative shape from the manifest.
 
 - `group` (string, required) — contract group name (`layer`, `canvas`, `session`, `export`, `history`).
 - `method` (string, required) — method within the group (`create`, `screenshot`, `openFile`, …).

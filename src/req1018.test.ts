@@ -85,14 +85,14 @@ describe('REQ-1018 AC-1 — compact mode default: tools/list returns only open_e
     const client = await connectedClient(fakeBridge(), { toolMode: 'compact' } as any);
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual(['figpea_call', 'figpea_skill', 'open_editor', 'status']);
+    expect(names).toEqual(['figpea_call', 'figpea_describe', 'figpea_skill', 'open_editor', 'status']);
   });
 
   it('with prefetchedManifest but still compact (default compact), contract tools are NOT registered', async () => {
     const client = await connectedClient(fakeBridge(), { prefetchedManifest: FIXTURE_MANIFEST as any, toolMode: 'compact' } as any);
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual(['figpea_call', 'figpea_skill', 'open_editor', 'status']);
+    expect(names).toEqual(['figpea_call', 'figpea_describe', 'figpea_skill', 'open_editor', 'status']);
     expect(names).not.toContain('layer_create');
     expect(names).not.toContain('session_status');
   });
