@@ -1,10 +1,16 @@
 /**
- * REQ-1020 T1 — off-band image-return writer (plan D3).
+ * REQ-1020 T1 / REQ-1279 T3 — off-band binary-return writer.
  *
- * `canvas.screenshot` / `export.layer` / `export.artboard` already hand
- * `figpea-mcp` the decoded bytes; this module is the *write* half of the
- * `returnAs:"path"` mode: it persists one image result under a per-session
- * temp dir and returns the absolute path + raw size for the text payload.
+ * `canvas.screenshot` / `export.layer` / `export.artboard` / every other
+ * binary export already hand `figpea-mcp` the decoded bytes; this module is
+ * the *write* half of the `returnAs:"path"` mode: it persists one result
+ * under a per-session temp dir and returns the absolute path + raw size for
+ * the text payload.
+ *
+ * REQ-1279: the writer was image-only end to end — the on-disk extension came
+ * from a five-entry image mime table, so a `.fp` project export could only
+ * ever land as `.bin`. It now takes the payload's own `filename` and derives
+ * both the extension and a recognisable stem from it (see `resolveName`).
  *
  * Deliberately dependency-free apart from node builtins (`fs`/`os`/`path`/
  * `crypto`): `bridgeServer.ts` and `mcpServer.ts` already depend on those.
@@ -28,13 +34,23 @@ export const RETURN_PATH_WRITE_FAILED = 'return_path_write_failed';
  * coded error rather than filling the disk. */
 export const MAX_SESSION_BYTES = 500 * 1024 * 1024;
 
+/** Fallback extension by mime, used when the payload carries no usable name of
+ *  its own. REQ-1279 added the three non-image mimes the v3 export contract
+ *  actually declares, so a *known* mime never reaches `.bin`; `.bin` stays
+ *  reachable for a genuinely unknown one. */
 const MIME_TO_EXT: Record<string, string> = {
   'image/png': 'png',
   'image/jpeg': 'jpg',
   'image/webp': 'webp',
   'image/gif': 'gif',
   'image/svg+xml': 'svg',
+  'application/zip': 'zip',
+  'application/pdf': 'pdf',
+  'application/json': 'json',
 };
+
+/** Longest stem kept from a tab-supplied filename. */
+const MAX_STEM = 80;
 
 export interface WriteImageReturnArgs {
   bytesB64: string;
@@ -45,6 +61,13 @@ export interface WriteImageReturnArgs {
   tool: string;
   /** Session-scoped dir, from `sessionDirFor(token)` — created on demand. */
   sessionDir: string;
+  /**
+   * REQ-1279 — the payload's own filename, when it has one. The v3 export
+   * contract declares `{bytes, mime, filename}` on every binary export, so
+   * this is what makes a `.fp` land as `.fp` instead of `.bin`. Absent for
+   * `canvas.screenshot`, the one binary result that carries no filename.
+   */
+  filename?: string;
 }
 
 export interface WrittenImageReturn {
@@ -97,13 +120,56 @@ function sessionBytes(sessionDir: string): number {
 }
 
 /**
- * Persists one image result and returns its path + raw size (plan D3).
+ * REQ-1279 — the on-disk name for one off-band return.
  *
- * Filename `<tool>-<isoTimestamp>-<uuid>.<ext>` (per-call UUID: concurrent
- * calls in one session never collide). Exclusive create (`'wx'`) into a
- * temp name + rename, so a failed write can never leave partial bytes behind
- * (temp is unlinked on error). Every failure path throws an Error carrying
- * `code: 'return_path_write_failed'` (AC-4).
+ * `<tool>-<stamp>-<uuid>` keeps REQ-1020's per-call uniqueness (two exports of
+ * the same project in one session must not collide), and the payload's own
+ * `filename` contributes:
+ *
+ *   - `ext`  — the payload filename's own extension when it is a sane token
+ *              (`x.fp` → `fp`), else `MIME_TO_EXT[mime]`, else `bin`.
+ *   - `stem` — its basename without that extension, so the written file is
+ *              recognisable (`My Design.fp` → `…-My_Design.fp`).
+ *
+ * **The stem is also the path-traversal guard.** `filename` is tab-supplied and
+ * reaches this module untrusted. It is taken through `path.basename` and then
+ * reduced to `[A-Za-z0-9._-]`, so it can never contain a separator and can
+ * never be `..`; a stem left with no alphanumeric character is dropped
+ * entirely. The result is always one path segment inside `sessionDir`.
+ *
+ * A payload with no usable name gets no stem segment at all — which is what
+ * keeps `canvas.screenshot` (the one binary result with no `filename`)
+ * byte-identical on disk to what REQ-1020 wrote.
+ */
+function resolveName(tool: string, mime: string, filename: string | undefined): string {
+  const safeTool = tool.replace(/[^A-Za-z0-9_-]/g, '_') || 'image';
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const prefix = `${safeTool}-${stamp}-${crypto.randomUUID()}`;
+
+  let stem = '';
+  let ext = MIME_TO_EXT[mime] ?? 'bin';
+  if (typeof filename === 'string' && filename.length > 0) {
+    const base = path.basename(filename);
+    const rawExt = path.extname(base);
+    if (/^[A-Za-z0-9]{1,8}$/.test(rawExt.replace(/^\./, ''))) ext = rawExt.replace(/^\./, '');
+    const sanitized = base
+      .slice(0, base.length - rawExt.length)
+      .replace(/[^A-Za-z0-9._-]/g, '_')
+      .slice(0, MAX_STEM);
+    if (/[A-Za-z0-9]/.test(sanitized)) stem = sanitized;
+  }
+
+  return `${prefix}${stem ? `-${stem}` : ''}.${ext}`;
+}
+
+/**
+ * Persists one binary result and returns its path + raw size (plan D3).
+ *
+ * Filename `<tool>-<isoTimestamp>-<uuid>[-<stem>].<ext>` (per-call UUID:
+ * concurrent calls in one session never collide). Exclusive create (`'wx'`)
+ * into a temp name + rename, so a failed write can never leave partial bytes
+ * behind (temp is unlinked on error). Every failure path throws an Error
+ * carrying `code: 'return_path_write_failed'` (AC-4).
  */
 export function writeImageReturn(args: WriteImageReturnArgs): WrittenImageReturn {
   const { bytesB64, mime, width, height, tool, sessionDir } = args;
@@ -111,13 +177,10 @@ export function writeImageReturn(args: WriteImageReturnArgs): WrittenImageReturn
   try {
     bytes = Buffer.from(bytesB64, 'base64');
   } catch (e) {
-    throw codedError(`cannot decode image bytes: ${e instanceof Error ? e.message : String(e)}`);
+    throw codedError(`cannot decode result bytes: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  const safeTool = tool.replace(/[^A-Za-z0-9_-]/g, '_') || 'image';
-  const ext = MIME_TO_EXT[mime] ?? 'bin';
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const name = `${safeTool}-${stamp}-${crypto.randomUUID()}.${ext}`;
+  const name = resolveName(tool, mime, args.filename);
 
   try {
     fs.mkdirSync(sessionDir, { recursive: true });

@@ -724,8 +724,15 @@ describe('REQ-769 T3 guard pins — permissiveness, legacy manifests, enum prece
     // properties by design. The pin's original point (the legacy
     // free-text-hint params themselves stay untyped {}) is unchanged.
     // REQ-1037 adds `_rawJson` alongside it (same pattern, same never-forwarded semantics).
-    expect(Object.keys(props ?? {}).sort()).toEqual(['_rawJson', '_timeoutMs', 'options', 'target']);
+    // REQ-1279 adds `returnAs` to the same list for the same reason: it was
+    // declared on only the three IMAGE_PATH_TOOLS, which made off-band returns
+    // unreachable for every other binary export (the key was stripped by
+    // safeParseAsync before the handler ran). One-line fixture update, planned
+    // for in REQ-1279's Risks.
+    expect(Object.keys(props ?? {}).sort()).toEqual(['_rawJson', '_timeoutMs', 'options', 'returnAs', 'target']);
     expect(props._timeoutMs?.type, 'the reserved key advertises as number (REQ-772)').toBe('number');
+    expect(props.returnAs?.type, 'the reserved key advertises as a constrained string (REQ-1279)').toBe('string');
+    expect(props.returnAs?.enum).toEqual(['inline', 'path']);
     // Untyped: today's z.any().optional() serializes to an empty property schema.
     expect(props.target ?? {}).toEqual({});
     expect(props.options ?? {}).toEqual({});

@@ -94,11 +94,14 @@ function resolveTimeoutMs(toolName: string, rawOverride: unknown): number | unde
   return DEFAULT_TIMEOUT_TABLE_MS[toolName];
 }
 
-/** REQ-1020 — the three image-returning tools whose results may be returned
- * off-band via the reserved `returnAs` key (plan D1). `returnAs` is NOT a
- * contract param (AC-6: no v3 change) — it follows the REQ-772 `_timeoutMs`
- * reserved-key pattern: declared in the shape so it survives the SDK's
- * `safeParseAsync` stripping, never in `inputKeys`, never forwarded. */
+/** REQ-1020 — the three tools whose off-band return is *documented* as an image
+ * return, and the worked example set the README uses. This used to gate the
+ * `returnAs` declaration in `buildInputShape`; REQ-1279 removed that gate,
+ * because a gate over three image names made `returnAs:"path"` unreachable in
+ * full mode for every other binary export — the key was stripped by
+ * `safeParseAsync` before the handler ran, one layer *above* the payload
+ * predicate. Kept as a named set because the docs, and anyone reading them,
+ * still need to know which tools the image framing describes. */
 export const IMAGE_PATH_TOOLS: ReadonlySet<string> = new Set([
   'canvas_screenshot',
   'export_layer',
@@ -164,14 +167,21 @@ function buildInputShape(tool: GeneratedTool): Record<string, z.ZodTypeAny> {
   // REQ-1037 — reserved `_rawJson` bypass for harness that stringifies nested numbers.
   // Declared so it survives safeParseAsync, never forwarded (not in inputKeys).
   shape['_rawJson'] = z.any().optional();
-  // REQ-1020 — reserved `returnAs` for the three image tools (plan D1):
-  // declared (permissive `z.any`, like every other hint-mapped key) so it
-  // survives safeParseAsync; advertised via meta; validated manually in the
-  // handler so a typo fails loud with `invalid_params`. Never in inputKeys,
-  // so never forwarded to the tab.
-  if (IMAGE_PATH_TOOLS.has(tool.name)) {
-    shape['returnAs'] = z.any().meta({ type: 'string', enum: ['inline', 'path'] }).optional();
-  }
+  // REQ-1020 / REQ-1279 — reserved `returnAs` on EVERY generated contract
+  // tool: declared (permissive `z.any`, like every other hint-mapped key) so
+  // it survives safeParseAsync; advertised via meta; validated manually in the
+  // handler so a typo fails loud with `invalid_params`. Never in inputKeys, so
+  // never forwarded to the tab — it follows the REQ-772 `_timeoutMs`
+  // reserved-key pattern exactly.
+  //
+  // REQ-1020 declared it only for `IMAGE_PATH_TOOLS`. That was correct while
+  // the feature was image-only, and it became a second, independent gate the
+  // moment any non-image binary needed the key: in full mode `export_project`
+  // with `returnAs:"path"` was not merely ignored downstream, the key never
+  // reached the server at all. Every tool is a no-op for the key when its
+  // result is not a binary payload, so declaring it everywhere costs nothing
+  // and removes the class of "works on three tools" surprise.
+  shape['returnAs'] = z.any().meta({ type: 'string', enum: ['inline', 'path'] }).optional();
   if (tool.inputKeys.length === 0) return shape;
   // REQ-769 — the type mapping below rests on one mechanic of the MCP SDK,
   // verified empirically against the installed @modelcontextprotocol/sdk +
@@ -533,7 +543,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       'figpea_call',
       {
         description:
-          'Universal dispatcher — calls any group.method on the paired editor tab via bridge.callTab(group, method, args, _timeoutMs?). In compact mode this is the only way to reach contract methods; in full mode the individual tools are also available. group/method are the describe() surface names, and args is the POSITIONAL argument array for that method, in that method\'s own parameter order. FLAT example: ["rect", {rwidth:100}] for layer.create. NESTED example — when a parameter is itself an array (e.g. layer.batch\'s ops), that parameter is passed as ONE element of args, so the element is an array of {method, args} ops: {"group":"layer","method":"batch","args":[[{"method":"create","args":["page",{"name":"probe","pageWidth":100,"pageHeight":100}]}]]}. Each op\'s own args is likewise a positional ARRAY, never an object. Unsure of a method\'s shape? Call figpea_describe({group, method}) first — it returns that method\'s doc and params from the manifest with no round trip to the tab. Image results return MCP image content + a text summary. Pass returnAs:"path" (canvas_screenshot, export_layer, export_artboard) to receive the image off-band as a session file path instead of inline base64.',
+          'Universal dispatcher — calls any group.method on the paired editor tab via bridge.callTab(group, method, args, _timeoutMs?). In compact mode this is the only way to reach contract methods; in full mode the individual tools are also available. group/method are the describe() surface names, and args is the POSITIONAL argument array for that method, in that method\'s own parameter order. FLAT example: ["rect", {rwidth:100}] for layer.create. NESTED example — when a parameter is itself an array (e.g. layer.batch\'s ops), that parameter is passed as ONE element of args, so the element is an array of {method, args} ops: {"group":"layer","method":"batch","args":[[{"method":"create","args":["page",{"name":"probe","pageWidth":100,"pageHeight":100}]}]]}. Each op\'s own args is likewise a positional ARRAY, never an object. Unsure of a method\'s shape? Call figpea_describe({group, method}) first — it returns that method\'s doc and params from the manifest with no round trip to the tab. Image results return MCP image content + a text summary. Pass returnAs:"path" to receive a binary result off-band as a session file path instead of inline base64 — it reaches every binary export, e.g. canvas_screenshot / export_layer / export_artboard for images and export_project for a native .fp.',
         inputSchema: {
           group: z.string().describe('Contract group name (e.g. layer, canvas, session, export)'),
           method: z.string().describe('Method name within the group (e.g. create, screenshot)'),
@@ -566,7 +576,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             }),
           _timeoutMs: z.number().optional().describe('Optional per-call timeout override in ms (clamped to 120000)'),
           _rawJson: z.any().optional().describe('Reserved passthrough for harness stringification tolerance'),
-          returnAs: z.any().optional().describe('Reserved: "inline" (default) or "path" — "path" writes image results to a session file and returns {ok, path, mime, width, height, bytes, url} as text'),
+          returnAs: z.any().optional().describe('Reserved: "inline" (default) or "path" — "path" writes a binary result to a session file and returns {ok, path, mime, width, height, bytes, filename?, url} as text, so a non-image export (e.g. a native .fp project) never crosses the wire as base64'),
         },
       },
       async (rawArgs) => {

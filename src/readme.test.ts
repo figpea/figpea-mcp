@@ -148,4 +148,22 @@ describe('README.md (AC-5)', () => {
     expect(readme, 'fail-loud on typos is documented').toContain('invalid_params');
     expect(readme, 'the token-saving rule of thumb is stated').toMatch(/1\.3 tokens/);
   });
+
+  // REQ-1279 T6 — the rot-guard for the change that made the section above
+  // stop being true as written: the key is no longer scoped to three image
+  // tools, and the payload is no longer image-shaped. The three image tool
+  // names stay pinned above — they are still examples, just not the limit.
+  it('documents returnAs path mode as reaching every binary export, not only image tools (REQ-1279)', () => {
+    expect(readme, 'the section is no longer image-scoped').toContain('Off-band binary returns');
+    expect(readme, 'the old image-only section title is gone').not.toContain('Off-band image returns');
+    expect(readme, 'the qualifying payload shape is stated, image or not').toMatch(/\{bytes, mime, filename\}/);
+    expect(readme, 'the key is stated to reach every binary result').toMatch(/every|any/i);
+    // The worked example is the case the requirement exists for.
+    expect(readme, 'the native .fp export is the worked example').toMatch(/export_project[\s\S]{0,600}?\.fp/);
+    // The naming rule: a payload names itself, so a .fp never lands as .bin.
+    expect(readme, 'the naming rule and its .bin contrast are documented').toMatch(/\.bin/);
+    // The conditional key: canvas.screenshot carries no filename, and an
+    // agent deciding whether a key is missing should be told why.
+    expect(readme, 'the conditional filename key is documented').toMatch(/only when the payload carried one/i);
+  });
 });

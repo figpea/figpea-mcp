@@ -288,25 +288,34 @@ export interface MappedToolResultLike {
   isError: boolean;
 }
 
-interface ImageValueLike {
+interface BinaryValueLike {
   bytes: string;
   mime: string;
+  filename?: string;
   [key: string]: unknown;
 }
 
-/** A success value shaped `{bytes:<base64>, mime:"image/*"}` (plan §1 OQ-D) —
- * matches both `canvas.screenshot`'s and raster `export.*`'s result shape
- * with no per-tool special-casing. */
-function asImageValue(value: unknown): ImageValueLike | undefined {
+/**
+ * A success value shaped `{bytes:<base64>, mime:<any>, filename?}` — the shape
+ * the v3 contract declares on *every* binary export (REQ-1279: this used to
+ * require `mime` to start with `image/`, which made every non-image binary
+ * invisible to `returnAs:"path"`).
+ *
+ * Still no per-tool special-casing: it matches `canvas.screenshot`'s and
+ * raster `export.*`'s shape as before, and now a `.fp`/zip/pdf project export
+ * with it.
+ */
+function asBinaryValue(value: unknown): BinaryValueLike | undefined {
   if (typeof value !== 'object' || value === null) return undefined;
   const candidate = value as Record<string, unknown>;
   if (typeof candidate.bytes !== 'string') return undefined;
-  if (typeof candidate.mime !== 'string' || !candidate.mime.startsWith('image/')) return undefined;
-  return candidate as ImageValueLike;
+  if (typeof candidate.mime !== 'string') return undefined;
+  if (candidate.filename !== undefined && typeof candidate.filename !== 'string') return undefined;
+  return candidate as BinaryValueLike;
 }
 
 /**
- * REQ-1020 T2 (AC-1/AC-2/AC-4, plan D2) — off-band return options.
+ * REQ-1020 T2 / REQ-1279 T4 (AC-1/AC-2/AC-4, plan D2) — off-band return options.
  *
  * `tools.ts` stays dependency-free (see the module header): the writer is
  * injected, never imported — production passes `returnPath.ts`'s
@@ -315,6 +324,10 @@ function asImageValue(value: unknown): ImageValueLike | undefined {
  * fetch URL for the written bytes (plan D4: the bridge's `registerBlob()`).
  * A `url` returned by the writer itself wins over `fileUrlFor` (lets fakes
  * stay one-function).
+ *
+ * `filename` is the payload's own name, forwarded so the writer can derive the
+ * on-disk extension and stem from it (REQ-1279). It is optional and only ever
+ * present when the payload carried one.
  */
 export interface ReturnAsOptions {
   returnAs?: string;
@@ -327,6 +340,7 @@ export interface ReturnAsOptions {
     height: number;
     tool: string;
     sessionDir: string;
+    filename?: string;
   }) => { path: string; mime: string; width: number; height: number; bytes: number; url?: string };
   fileUrlFor?: (absPath: string) => string;
 }
@@ -342,14 +356,24 @@ const RETURN_PATH_WRITE_FAILED = 'return_path_write_failed';
  * image content plus a short text summary. Never a hardcoded tool-name
  * special case.
  *
- * REQ-1020: with `opts.returnAs === "path"` an image-shaped success value is
+ * REQ-1020: with `opts.returnAs === "path"` a binary-shaped success value is
  * instead written off-band and mapped to a single text block
- * `{ok:true, path, mime, width, height, bytes, url?}` (AC-1/AC-2). A
- * non-image result ignores the key (no-op, never an error); an unknown value
+ * `{ok:true, path, mime, width, height, bytes, filename?, url?}` (AC-1/AC-2). A
+ * non-binary result ignores the key (no-op, never an error); an unknown value
  * fails loud with `invalid_params` (a typo must not silently inline
  * megabytes); a write failure maps to `return_path_write_failed` with
- * `isError:true` (AC-4). Default/`"inline"` is byte-identical to before
- * (AC-3).
+ * `isError:true` (AC-4).
+ *
+ * REQ-1279: the predicate is no longer image-only, so **the inline branch is
+ * split by mime** — and this is the sharp edge of the whole change. Widening
+ * `asBinaryValue` alone would route every non-image binary's *default* lane
+ * into the image branch and emit `{type:'image', mimeType:'application/zip'}`,
+ * an invalid content block a real client rejects — turning a working default
+ * into a broken one. So: `image/*` keeps the image-content + summary pair
+ * exactly as before, and every other mime keeps falling through to the final
+ * `{ok:true, value}` branch exactly as before. `filename` rides along in both
+ * (it is part of the payload's own shape), and reaches the path payload only
+ * when the payload actually carried one.
  */
 export function resultToContent(result: FigpeaCallResultLike, opts?: ReturnAsOptions): MappedToolResultLike {
   if (!result.ok) {
@@ -359,9 +383,9 @@ export function resultToContent(result: FigpeaCallResultLike, opts?: ReturnAsOpt
     };
   }
 
-  const imageValue = asImageValue(result.value);
+  const binaryValue = asBinaryValue(result.value);
   const mode = opts?.returnAs ?? 'inline';
-  if (imageValue && mode !== 'inline') {
+  if (binaryValue && mode !== 'inline') {
     if (mode !== 'path') {
       return {
         isError: true,
@@ -371,20 +395,21 @@ export function resultToContent(result: FigpeaCallResultLike, opts?: ReturnAsOpt
     try {
       const writer = opts?.writeImage;
       if (!writer) {
-        throw Object.assign(new Error('no image writer wired for returnAs:"path"'), { code: RETURN_PATH_WRITE_FAILED });
+        throw Object.assign(new Error('no binary writer wired for returnAs:"path"'), { code: RETURN_PATH_WRITE_FAILED });
       }
       const written = writer({
-        bytesB64: imageValue.bytes,
-        mime: imageValue.mime,
-        width: typeof imageValue.width === 'number' ? imageValue.width : 0,
-        height: typeof imageValue.height === 'number' ? imageValue.height : 0,
+        bytesB64: binaryValue.bytes,
+        mime: binaryValue.mime,
+        width: typeof binaryValue.width === 'number' ? binaryValue.width : 0,
+        height: typeof binaryValue.height === 'number' ? binaryValue.height : 0,
         tool: opts?.tool ?? 'image',
         sessionDir: opts?.sessionDir ?? '',
+        ...(binaryValue.filename !== undefined ? { filename: binaryValue.filename } : {}),
       });
       const url = written.url ?? opts?.fileUrlFor?.(written.path);
       return {
         isError: false,
-        content: [{ type: 'text', text: JSON.stringify({ ok: true, path: written.path, mime: written.mime, width: written.width, height: written.height, bytes: written.bytes, ...(url !== undefined ? { url } : {}) }) }],
+        content: [{ type: 'text', text: JSON.stringify({ ok: true, path: written.path, mime: written.mime, width: written.width, height: written.height, bytes: written.bytes, ...(binaryValue.filename !== undefined ? { filename: binaryValue.filename } : {}), ...(url !== undefined ? { url } : {}) }) }],
       };
     } catch (e) {
       const code = typeof (e as { code?: unknown })?.code === 'string' ? (e as { code: string }).code : RETURN_PATH_WRITE_FAILED;
@@ -395,8 +420,8 @@ export function resultToContent(result: FigpeaCallResultLike, opts?: ReturnAsOpt
     }
   }
 
-  if (imageValue) {
-    const { bytes, mime, ...rest } = imageValue;
+  if (binaryValue && binaryValue.mime.startsWith('image/')) {
+    const { bytes, mime, ...rest } = binaryValue;
     return {
       isError: false,
       content: [
