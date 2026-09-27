@@ -27,6 +27,14 @@ import { findArgShapeMismatch, renderSchemaExample } from './argShape';
 // (full mode's contract handler and compact mode's `figpea_call`) so they
 // cannot drift (AC-7).
 import { isRawJsonFlag, applyRawJson, rawJsonFailureMessage } from './rawJson';
+// REQ-1296 — the pure "did I understand every key I was given?" predicate and
+// the two reserved-key sets. Ordered below REQ-1280's import because this
+// branch is rebased on top of it; the two are independent helpers and neither
+// shadows the other. The one region both REQs touched is `figpea_call`'s
+// schema literal, where REQ-1280 rewrote the `_rawJson` description and
+// REQ-1296 wraps the whole literal in `z.looseObject` — REQ-1280's text is
+// preserved verbatim inside REQ-1296's wrapper, which is the correct merge.
+import { findUnknownTopLevelKeys, FULL_MODE_RESERVED, COMPACT_RESERVED } from './unknownParams';
 
 /** What this module needs from a started bridge (bridgeServer.ts's real
  * `BridgeServerHandle` is a superset — `getContractVersion` is optional here
@@ -121,6 +129,34 @@ function resolveReturnAs(raw: unknown): { mode: 'inline' | 'path' } | { error: {
   return { error: { ok: false, code: 'invalid_params', message: `returnAs must be "inline" or "path", got ${JSON.stringify(raw)}` } };
 }
 
+/** REQ-1296 D3 — the fail-loud message for a key this server does not
+ *  understand.
+ *
+ *  Deliberately the same `{ok:false, code, message}` envelope (and NOT an MCP
+ *  protocol-level throw) that `resolveReturnAs` above, the REQ-1268 shape
+ *  pre-flight below and every other figpea-mcp validation failure already use:
+ *  an agent has to be able to READ the body and learn from it. A raw SDK
+ *  `-32602` would be the opposite — an opaque path array naming a position in
+ *  a payload the agent never wrote.
+ *
+ *  Wording mirrors v3's own `openFile()` (`session.impl.ts:141-147`:
+ *  `openFile() received unknown parameter "${key}"` + `ERR_CODES.INVALID_PARAMS`)
+ *  so one failure class reads the same on both sides of the wire, then adds
+ *  the two things a caller can act on without spending a second round trip:
+ *  what IS accepted, and the lane that actually persists a file. The second
+ *  half is the point — an agent that guessed `filePath` because it wanted the
+ *  bytes on disk has to be told the real way in the same breath, or it invents
+ *  a third key. */
+function renderUnknownParameterMessage(toolName: string, unknownKeys: string[], accepted: string[]): string {
+  const one = unknownKeys.length === 1;
+  const named = unknownKeys.map((k) => `"${k}"`).join(', ');
+  return (
+    `${toolName}: unknown parameter${one ? '' : 's'} ${named}. Accepted parameters: ${accepted.join(', ')}. ` +
+    `To get a result onto disk, pass returnAs:"path" — the bytes are written to a per-session file and its path is returned. ` +
+    `Never pass a file path as a parameter.`
+  );
+}
+
 /** REQ-1020 — builds the `resultToContent` off-band options for one image
  * tool call: real writer + session dir + token-gated fetch URL (plan D4:
  * the bridge's existing `registerBlob()`, falling back to `getFileUrl()`). */
@@ -157,7 +193,41 @@ function textResult(text: string): CallToolResult {
   return toCallToolResult({ content: [{ type: 'text', text }], isError: false });
 }
 
-function buildInputShape(tool: GeneratedTool): Record<string, z.ZodTypeAny> {
+/** REQ-1296 D1 — the argument shape every contract tool registers.
+ *
+ * The return value is a **loose** zod object, and the looseness is the whole
+ * point. `registerTool` wraps a raw shape with `objectFromShape` →
+ * `z4mini.object(shape)`, and zod v4's `object()` STRIPS every undeclared key
+ * before `validateToolInput` hands `parseResult.data` to the handler. So with
+ * a bare shape this server was structurally unable to know that a caller sent
+ * a key it did not understand: the evidence was destroyed one layer above the
+ * handler, which is why an evidence-persistence param like `filePath` on
+ * `canvas.screenshot` could never be named, only silently dropped, and the
+ * answer was `ok:true` either way (REQ-1296 AC-1/AC-3).
+ *
+ * Verified against the installed @modelcontextprotocol/sdk 1.29.0 + zod
+ * 4.4.3, driving a real `McpServer` and a real SDK `Client` over
+ * `InMemoryTransport` (REQ-769 style verify-then-pin):
+ *   - raw shape, called `{options, filePath}` → handler saw `["options"]`.
+ *   - `z.looseObject(shape)` → the SDK's `normalizeObjectSchema` returns the
+ *     schema instance unchanged (it is already a v4 object), and the handler
+ *     saw `["options","filePath"]` WITH the value intact.
+ *   - a call with no unknown key is byte-for-byte unchanged either way.
+ *   - the `tools/list` advertisement gains exactly one thing, a permissive
+ *     top-level `additionalProperties: {}`; every `properties` entry is
+ *     identical. That addition is load-bearing, not cosmetic: a strict
+ *     `false` here would make a schema-respecting client refuse to SEND the
+ *     bad key at all, and the agent would get an opaque client-side error
+ *     instead of our named one.
+ *   - a `z.enum` key inside the loose object still rejects an invalid value,
+ *     so REQ-093's enum advertising/validation is not weakened.
+ *
+ * The looseness alone is a real (brief) widening: an unknown key now reaches
+ * the handler instead of dying in the parse, and the handler is the only thing
+ * between it and a silently-dropped argument. That is why the rejection in
+ * `makeContractHandler` is part of the same change, not a follow-up.
+ */
+function buildInputShape(tool: GeneratedTool): z.ZodType {
   const shape: Record<string, z.ZodTypeAny> = {};
   // REQ-772 AC-1 — every generated contract tool accepts the reserved
   // `_timeoutMs` key to raise that single call's bridge timeout (capped at
@@ -186,7 +256,11 @@ function buildInputShape(tool: GeneratedTool): Record<string, z.ZodTypeAny> {
   // result is not a binary payload, so declaring it everywhere costs nothing
   // and removes the class of "works on three tools" surprise.
   shape['returnAs'] = z.any().meta({ type: 'string', enum: ['inline', 'path'] }).optional();
-  if (tool.inputKeys.length === 0) return shape;
+  if (tool.inputKeys.length === 0) return z.looseObject(shape);
+  // REQ-1296 D1 — the early return above carries the same loose wrap, so a
+  // zero-param method's unrecognised key is observable too (and not merely
+  // reserved-key-visible, which is what REQ-772's removal of the no-schema
+  // branch had achieved for `_timeoutMs`).
   // REQ-769 — the type mapping below rests on one mechanic of the MCP SDK,
   // verified empirically against the installed @modelcontextprotocol/sdk +
   // zod v4 (plan REQ-769 §Tech design): every registered zod shape serves
@@ -309,7 +383,7 @@ function buildInputShape(tool: GeneratedTool): Record<string, z.ZodTypeAny> {
       shape[key] = z.any().optional();
     }
   }
-  return shape;
+  return z.looseObject(shape);
 }
 
 /**
@@ -548,7 +622,14 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       {
         description:
           'Universal dispatcher — calls any group.method on the paired editor tab via bridge.callTab(group, method, args, _timeoutMs?). In compact mode this is the only way to reach contract methods; in full mode the individual tools are also available. group/method are the describe() surface names, and args is the POSITIONAL argument array for that method, in that method\'s own parameter order. FLAT example: ["rect", {rwidth:100}] for layer.create. NESTED example — when a parameter is itself an array (e.g. layer.batch\'s ops), that parameter is passed as ONE element of args, so the element is an array of {method, args} ops: {"group":"layer","method":"batch","args":[[{"method":"create","args":["page",{"name":"probe","pageWidth":100,"pageHeight":100}]}]]}. Each op\'s own args is likewise a positional ARRAY, never an object. Unsure of a method\'s shape? Call figpea_describe({group, method}) first — it returns that method\'s doc and params from the manifest with no round trip to the tab. Image results return MCP image content + a text summary. Pass returnAs:"path" to receive a binary result off-band as a session file path instead of inline base64 — it reaches every binary export, e.g. canvas_screenshot / export_layer / export_artboard for images and export_project for a native .fp.',
-        inputSchema: {
+        // REQ-1296 D1 — loose for the SAME reason as buildInputShape, and it is
+        // load-bearing rather than cosmetic here: `figpea_call` is the ONLY way
+        // to reach a contract method in compact mode, so if its schema keeps
+        // stripping, AC-3's blanket rule ("no contract method accepts an
+        // unrecognised param and returns ok:true") is simply false in the
+        // default mode — the agent's `{group, method, args, filePath}` would be
+        // answered with a success, in the mode ~90–95% of agents run in.
+        inputSchema: z.looseObject({
           group: z.string().describe('Contract group name (e.g. layer, canvas, session, export)'),
           method: z.string().describe('Method name within the group (e.g. create, screenshot)'),
           // REQ-1268 T3 (AC-2): the rule that generalises past the one nested
@@ -597,9 +678,32 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
               'Set _rawJson:true on your figpea_call when your harness STRINGIFIED an object or array argument: every element of args that is a string whose trimmed form starts with { or [ and ends with } or ] is JSON-parsed before it reaches the editor, e.g. {"group":"layer","method":"create","args":["page","{\\"name\\":\\"probe\\",\\"pageWidth\\":300,\\"pageHeight\\":200}"],"_rawJson":true}. Omit it and a stringified object/array is forwarded as the string it is and the editor rejects it. If a value looks like JSON but cannot be parsed, and its parameter is declared an object/array, the call is refused by name (invalid_params) instead of being forwarded — nothing is silently ignored.',
             ),
           returnAs: z.any().optional().describe('Reserved: "inline" (default) or "path" — "path" writes a binary result to a session file and returns {ok, path, mime, width, height, bytes, filename?, url} as text, so a non-image export (e.g. a native .fp project) never crosses the wire as base64'),
-        },
+        }),
       },
       async (rawArgs) => {
+        // REQ-1296 D4 (AC-3) — the compact half of the same rule, and the
+        // half that matters most: `figpea_call` is the ONLY way to reach a
+        // contract method in compact mode, so "no contract method accepts an
+        // unrecognised param and returns ok:true" is false in the default mode
+        // unless it is enforced here.
+        //
+        // FIRST, for the same reason and with the same trade-off as the
+        // full-mode check in makeContractHandler: an unrecognised top-level
+        // key is a defect in the call, true regardless of connection state, and
+        // `COMPACT_RESERVED` is the whole surface here — there is no
+        // `inputKeys` to union it with and no REQ-1017 exemption to make,
+        // because the dispatcher's own `filePath` lives inside `args[0]`
+        // (nested, and out of scope by this requirement's stated decision).
+        const unknownTopLevelKeys = findUnknownTopLevelKeys(rawArgs as Record<string, unknown>, new Set<string>(COMPACT_RESERVED));
+        if (unknownTopLevelKeys.length > 0) {
+          return toCallToolResult(
+            resultToContent({
+              ok: false,
+              code: 'invalid_params',
+              message: renderUnknownParameterMessage('figpea_call', unknownTopLevelKeys, [...COMPACT_RESERVED]),
+            }),
+          );
+        }
         if (!bridge.isTabConnected()) {
           const connectUrl = buildConnectUrl(undefined, undefined);
           return toCallToolResult(
@@ -763,6 +867,42 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         // call). Same `coerceValue`, same positional mapping as full mode.
         const contractTool = contractToolFor(group, method);
         if (contractTool) {
+          // REQ-1296 D4 (AC-3) — the SURPLUS POSITIONAL argument, the second
+          // spelling of the very same defect and the one the loop below used
+          // to walk straight past. The pre-flight `break`s the instant
+          // `inputKeys[i]` is undefined, so everything past the declared arity
+          // went unvalidated AND unmentioned: the handler forwards
+          // `effectiveArgs` whole, the tab's own parameter list simply ends
+          // first, and the agent gets `ok:true` for an argument that was never
+          // read. An agent that miscounts `canvas.screenshot`'s single
+          // `options` parameter is asking for a second capture and silently
+          // getting the first.
+          //
+          // Guarded on `contractTool` being defined, deliberately: an unknown
+          // METHOD is the tab's error to name (as today), because this server
+          // has no `inputKeys` to compare an arity against, and guessing one
+          // would report a surplus argument for a call that is wrong in a more
+          // fundamental way.
+          if (effectiveArgs.length > contractTool.inputKeys.length) {
+            const surplusIndex = contractTool.inputKeys.length;
+            const arity = contractTool.inputKeys.length;
+            const expectedArgs = contractTool.inputKeys
+              .map((k, idx) => {
+                const sch = contractTool.paramSchemas?.[k];
+                return sch ? renderSchemaExample(sch) : '…';
+              })
+              .join(', ');
+            return toCallToolResult(
+              resultToContent({
+                ok: false,
+                code: 'invalid_params',
+                message:
+                  `${toolName}: args[${surplusIndex}] has no matching parameter — ${toolName} takes ${arity} positional argument${arity === 1 ? '' : 's'}: [${expectedArgs}]. ` +
+                  `Expected ${toolName} args: [${expectedArgs}]. ` +
+                  `Learn the exact shape first: figpea_describe({group:"${group}", method:"${method}"}).`,
+              }),
+            );
+          }
           // REQ-1280 T3 STEP 2 — the VERDICT, late, where the declared schema
           // finally is reachable. Same `applyRawJson` as step 1 and full mode,
           // now with the schema: a value that looks like JSON but does not
@@ -771,6 +911,15 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           // tab would have rejected it after a wasted round trip. The values
           // are already parsed, so this re-run is a cheap no-op on the array;
           // what it supplies is the schema, the only thing the verdict needs.
+          //
+          // Rebase note: this now runs AFTER the REQ-1296 arity check above,
+          // and the order is deliberate rather than incidental. An arity error
+          // is the more fundamental finding — it names a position that does
+          // not exist, so every per-value complaint about that position is
+          // downstream of it. REQ-1280's own guard is safe either way
+          // (`inputKeys[i]` is `undefined` past the declared arity, so
+          // `schemaAt` yields no schema and no failure is recorded), so this
+          // is about which error an agent reads first, not about correctness.
           if (rawJsonRequested) {
             const verdict = applyRawJson(effectiveArgs, {
               schemaAt: (i) => contractTool.paramSchemas?.[contractTool.inputKeys[i] ?? ''],
@@ -1047,6 +1196,41 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
 
   function makeContractHandler(groupName: string, methodName: string, inputKeys: string[], tool?: GeneratedTool) {
     return async (rawArgs: Record<string, unknown>): Promise<CallToolResult> => {
+      // REQ-1296 D3 (AC-1/AC-3) — "did I understand every key I was given?",
+      // asked FIRST, before anything consumes the payload and before any
+      // bridge round trip. Reachable only because `buildInputShape` now keeps
+      // undeclared keys (REQ-1296 D1); before that the evidence was gone by
+      // the time this ran, which is the whole reason the defect was possible.
+      //
+      // It deliberately precedes the `no_tab` gate below. An unrecognised key
+      // is a defect in the call itself, true regardless of connection state,
+      // and naming it is deterministic — whereas `no_tab` sends the agent off
+      // to pair a tab for a call that was malformed to begin with. Both
+      // orders satisfy AC-3 (it asks that a bad key never answer `ok:true`,
+      // not which of two errors wins); this one never makes an agent pay for
+      // a pairing round trip against a call it has to rewrite anyway.
+      //
+      // The allowed set is `inputKeys` ∪ the reserved keys, PLUS a top-level
+      // `filePath` for `session_openFile` alone — REQ-1017's compatibility
+      // shim, which reads exactly that key at :1009 (a key the manifest does
+      // not declare) and deletes it before relaying. It is the one tool with a
+      // legitimate undeclared key, and excluding it would break a shipped
+      // feature; it is the reason the exemption is named per tool rather than
+      // folded into the reserved set.
+      const toolNameForCheck = `${groupName}_${methodName}`;
+      const allowedKeys = new Set<string>([...inputKeys, ...FULL_MODE_RESERVED]);
+      if (toolNameForCheck === 'session_openFile') allowedKeys.add('filePath');
+      const unknownKeys = findUnknownTopLevelKeys(rawArgs, allowedKeys);
+      if (unknownKeys.length > 0) {
+        return toCallToolResult(
+          resultToContent({
+            ok: false,
+            code: 'invalid_params',
+            message: renderUnknownParameterMessage(toolNameForCheck, unknownKeys, [...inputKeys, ...FULL_MODE_RESERVED]),
+          }),
+        );
+      }
+
       if (!bridge.isTabConnected()) {
         const connectUrl = buildConnectUrl(undefined, undefined);
         return toCallToolResult(

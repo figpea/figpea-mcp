@@ -188,4 +188,24 @@ describe('README.md (AC-5)', () => {
     // agent deciding whether a key is missing should be told why.
     expect(readme, 'the conditional filename key is documented').toMatch(/only when the payload carried one/i);
   });
+
+  // REQ-1296 T5 — the rot-guard for the failure class this change closed. The
+  // requirement found its way: an agent passed `filePath` to
+  // `canvas_screenshot`, was answered `ok: true` with the image inline, and
+  // wrote nothing — so a run's own log asserted evidence that did not exist.
+  // An unrecognised parameter is now an `invalid_params` error naming the key,
+  // and the README has to say so in the same section that teaches `returnAs`,
+  // because that is the place an agent looks when it wonders what to do with a
+  // capture. Pinning the KEY (`filePath`) and the real lane, not just the word
+  // "invalid_params" (which the REQ-1020 pins above already cover), is what
+  // stops the sentence rotting into a vaguer one that teaches nothing.
+  it('documents that an unrecognised parameter is an invalid_params error naming the key (REQ-1296)', () => {
+    expect(readme, 'the undeclared-parameter failure is documented in the README').toMatch(/invalid_params/);
+    expect(readme, 'the message is documented as naming the offending key').toMatch(/unknown parameter/i);
+    expect(readme, 'the evidence-persistence key that caused the incident is named').toContain('filePath');
+    expect(readme, 'the real lane to disk is stated, not just the reserved key').toMatch(/returnAs: "path"/);
+    expect(readme, 'the never-do-this is stated so an agent does not invent a second key').toMatch(
+      /never pass a file path as a parameter/i,
+    );
+  });
 });

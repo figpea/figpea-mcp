@@ -176,13 +176,20 @@ describe('REQ-1020 AC-4/AC-6: write failure → {ok:false, code:"return_path_wri
     expect(payload.code, 'AC-6: figpea-mcp-only code name').toBe('return_path_write_failed');
   });
 
-  it('a failed path-return leaves no partial file behind (e2e: unwritable session dir)', async () => {
+  // REQ-1296: this test's `_sessionDir` probe key is GONE, and that is the
+  // change being made to it rather than a weakening of it. The key was never a
+  // product surface — the comment here used to say so outright ("a probe-only
+  // key the handler ignores") — and REQ-1296 AC-3 makes "the handler ignores an
+  // undeclared key" precisely the bug: an unrecognised parameter now returns
+  // `invalid_params` naming the key, so the call below can no longer carry it.
+  // What the test actually pins is unchanged and still asserted in full — the
+  // AC-4 envelope: a path-mode call never silently inlines bytes, and success
+  // carries a real path rather than partial ones. The second leg keeps the old
+  // probe's discovery (that a path-mode call CAN fail) represented honestly, as
+  // the failure it is now: a named one.
+  it('a path-return never silently inlines bytes, and never returns partial ones', async () => {
     const { client } = await createHarnessedClient('full');
-    // `_sessionDir` is a probe-only key the handler ignores (no such product
-    // surface): the call succeeds with a real path payload. What this test
-    // pins is the AC-4 envelope — never silently inline, never partial bytes:
-    // success carries a path, and any failure would carry the coded error.
-    const res: any = await client.callTool({ name: 'canvas_screenshot', arguments: { returnAs: 'path', _sessionDir: '/proc/req1020-unwritable' } as any });
+    const res: any = await client.callTool({ name: 'canvas_screenshot', arguments: { returnAs: 'path' } as any });
     const hasImage = (res.content as any[]).some((c: any) => c.type === 'image');
     expect(hasImage, 'a path-mode call must not silently inline bytes').toBe(false);
     const payload = textPayload(res);
@@ -192,6 +199,17 @@ describe('REQ-1020 AC-4/AC-6: write failure → {ok:false, code:"return_path_wri
       expect(res.isError).toBe(true);
       expect(payload.code).toBe('return_path_write_failed');
     }
+  });
+
+  it('a path-mode call carrying an undeclared key fails by NAMING it, never by silently succeeding (REQ-1296 AC-3)', async () => {
+    const { client } = await createHarnessedClient('full');
+    const res: any = await client.callTool({ name: 'canvas_screenshot', arguments: { returnAs: 'path', _sessionDir: '/proc/req1020-unwritable' } as any });
+    const hasImage = (res.content as any[]).some((c: any) => c.type === 'image');
+    expect(hasImage, 'a rejected path-mode call inlines nothing either').toBe(false);
+    expect(res.isError).toBe(true);
+    const payload = textPayload(res);
+    expect(payload.code).toBe('invalid_params');
+    expect(payload.message, 'the undeclared key is named in the message body').toContain('"_sessionDir"');
   });
 });
 
