@@ -23,6 +23,10 @@ import {
 import { writeImageReturn, sessionDirFor } from './returnPath';
 import { groupNamesFromCompactIndex } from './describeDrill';
 import { findArgShapeMismatch, renderSchemaExample } from './argShape';
+// REQ-1280 — the single `_rawJson` implementation, called by BOTH relay paths
+// (full mode's contract handler and compact mode's `figpea_call`) so they
+// cannot drift (AC-7).
+import { isRawJsonFlag, applyRawJson, rawJsonFailureMessage } from './rawJson';
 
 /** What this module needs from a started bridge (bridgeServer.ts's real
  * `BridgeServerHandle` is a superset — `getContractVersion` is optional here
@@ -575,7 +579,23 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
                 'Positional argument array, in the method\'s own parameter order. An array-typed parameter (e.g. layer.batch\'s ops) is passed as ONE element of args, and that element is itself an array of {method, args} ops — e.g. [[{method:"create", args:["rect",{rwidth:100}]}]]. Each op\'s args is an array, never an object.',
             }),
           _timeoutMs: z.number().optional().describe('Optional per-call timeout override in ms (clamped to 120000)'),
-          _rawJson: z.any().optional().describe('Reserved passthrough for harness stringification tolerance'),
+          // REQ-1280 T3 — this flag was advertised as a "reserved passthrough"
+          // on the ONE tool compact mode registers, and was inert here: an
+          // agent that set it got the editor's own rejection back with nothing
+          // connecting the error to the flag. It is now a real, working escape
+          // hatch, and REQ-1268 measured this exact failure mode for this exact
+          // tool — an agent that does not know the flag works never sets it.
+          // The worked example is the REQ-1268 idiom: a payload to copy, not
+          // an abstract rule. It promises what the guard delivers (stringified
+          // objects/arrays are parsed) and no more (it does not claim every
+          // string is parsed). The zod TYPE stays `z.any().optional()`, so
+          // this adds zero new safeParseAsync rejections.
+          _rawJson: z
+            .any()
+            .optional()
+            .describe(
+              'Set _rawJson:true on your figpea_call when your harness STRINGIFIED an object or array argument: every element of args that is a string whose trimmed form starts with { or [ and ends with } or ] is JSON-parsed before it reaches the editor, e.g. {"group":"layer","method":"create","args":["page","{\\"name\\":\\"probe\\",\\"pageWidth\\":300,\\"pageHeight\\":200}"],"_rawJson":true}. Omit it and a stringified object/array is forwarded as the string it is and the editor rejects it. If a value looks like JSON but cannot be parsed, and its parameter is declared an object/array, the call is refused by name (invalid_params) instead of being forwarded — nothing is silently ignored.',
+            ),
           returnAs: z.any().optional().describe('Reserved: "inline" (default) or "path" — "path" writes a binary result to a session file and returns {ok, path, mime, width, height, bytes, filename?, url} as text, so a non-image export (e.g. a native .fp project) never crosses the wire as base64'),
         },
       },
@@ -599,16 +619,54 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           );
         }
         let args: unknown[] = (rawArgs as any).args as unknown[] | undefined ?? [];
+        const rawJsonRequested = isRawJsonFlag((rawArgs as any)._rawJson);
         if (!Array.isArray(args)) {
           return toCallToolResult(
-            resultToContent({ ok: false, code: 'invalid_params', message: 'args must be an array' }),
+            resultToContent({
+              ok: false,
+              code: 'invalid_params',
+              // AC-8: with the flag set, this is a path where the escape hatch
+              // provably CANNOT apply, so it is named — a flag that is
+              // silently dropped here is the defect this REQ exists to close.
+              message: rawJsonRequested
+                ? 'args must be an array — _rawJson parses each element of the positional args array, so it cannot apply when args is not one'
+                : 'args must be an array',
+            }),
           );
         }
+        // REQ-1280 T3 STEP 1 — honour the flag, EARLY.
+        //
+        // It runs here, before the file-path translation below and before
+        // `coerceValue`, because both read the value structurally:
+        //  - `findArgShapeMismatch` fires on a plain OBJECT at an array/matrix
+        //    position and lets a string through untouched, which is why
+        //    today's failure reaches the editor at all;
+        //  - the `session_openFile` / `layer_setImageFill` / `layer_create`
+        //    blocks read `args[0]`/`args[1]` as `{filePath}`, so parsing after
+        //    them would mean a stringified `{"filePath":"/tmp/x.png"}` never
+        //    gets translated and the editor is handed a local path it cannot
+        //    fetch. On this path the flag is the ONLY way a structured value
+        //    can arrive, so it has to compose with the translation rather
+        //    than shadow it.
+        //
+        // `schemaAt: () => undefined` is deliberate: the declared schema is
+        // not reachable until `contractToolFor` below, and a flag that needed
+        // a manifest would be dead on exactly the first-call situation an
+        // agent is most likely to hit. With no schema, a failed parse is NOT
+        // recorded (the guard's safe default), so this step can only ever
+        // PARSE, never refuse — the verdict is step 2, below.
+        //
+        // AC-6, structurally: `_rawJson` is read from `rawArgs` and never
+        // merged into `args`, so it cannot reach the tab — there is no strip
+        // statement to add here, and adding one would be a lie about a leak
+        // that cannot happen.
+        if (rawJsonRequested) {
+          args = applyRawJson(args, { schemaAt: () => undefined, pathAt: (i) => `args[${i}]` }).value;
+        }
+
         // Remove reserved keys so they never leak
-        // args already extracted, now handle _timeoutMs and _rawJson
+        // args already extracted, now handle _timeoutMs
         const rawTimeout = (rawArgs as any)._timeoutMs;
-        // _rawJson is declared so it survives safeParseAsync; strip it
-        // No further action needed — args are already positional
 
         // File-path translation parity (reuse makeContractHandler logic for the three file methods)
         // Work on a mutable copy of args for translation
@@ -645,7 +703,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             effectiveArgs[0] = newInput;
           } else if (typeof filePathVal === 'string' && filePathVal.trim() === '') {
             return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: 'filePath cannot be empty' }));
-          } else if (input && 'filePath' in input && (input as any).filePath !== undefined && typeof (input as any).filePath !== 'string') {
+          } else if (input !== null && typeof input === 'object' && 'filePath' in input && (input as any).filePath !== undefined && typeof (input as any).filePath !== 'string') {
             return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: 'input.filePath must be a string' }));
           }
         } else if (toolName === 'layer_setImageFill') {
@@ -693,7 +751,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             newProps.url = bridgeUrl;
             delete (newProps as any).filePath;
             effectiveArgs[1] = newProps;
-          } else if (kindVal === 'image' && props && 'filePath' in props && (props as any).filePath !== undefined && typeof (props as any).filePath !== 'string') {
+          } else if (kindVal === 'image' && props !== null && typeof props === 'object' && 'filePath' in props && (props as any).filePath !== undefined && typeof (props as any).filePath !== 'string') {
             return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'props.filePath must be a string' }));
           }
         }
@@ -705,6 +763,26 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         // call). Same `coerceValue`, same positional mapping as full mode.
         const contractTool = contractToolFor(group, method);
         if (contractTool) {
+          // REQ-1280 T3 STEP 2 — the VERDICT, late, where the declared schema
+          // finally is reachable. Same `applyRawJson` as step 1 and full mode,
+          // now with the schema: a value that looks like JSON but does not
+          // parse is refused by name ONLY where the schema proves a
+          // structured value was intended (AC-8) — which is exactly where the
+          // tab would have rejected it after a wasted round trip. The values
+          // are already parsed, so this re-run is a cheap no-op on the array;
+          // what it supplies is the schema, the only thing the verdict needs.
+          if (rawJsonRequested) {
+            const verdict = applyRawJson(effectiveArgs, {
+              schemaAt: (i) => contractTool.paramSchemas?.[contractTool.inputKeys[i] ?? ''],
+              pathAt: (i) => `args[${i}]${contractTool.inputKeys[i] ? ` (${contractTool.inputKeys[i]})` : ''}`,
+            });
+            const failure = verdict.structuredFailures[0];
+            if (failure) {
+              return toCallToolResult(
+                resultToContent({ ok: false, code: 'invalid_params', message: rawJsonFailureMessage(toolName, failure.path, failure.raw) }),
+              );
+            }
+          }
           effectiveArgs = effectiveArgs.map((value, i) =>
             coerceValue(value, contractTool.paramSchemas?.[contractTool.inputKeys[i]]),
           );
@@ -1078,25 +1156,37 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
 
       // REQ-1037 T3 — `_rawJson` bypass + auto JSON-parse for stringified objects/arrays.
       // Must run after filePath translation (which may have mutated effectiveRawArgs) but before coercion.
-      const rawJsonFlag =
-        (effectiveRawArgs as any)['_rawJson'] === true ||
-        (effectiveRawArgs as any)['_rawJson'] === 'true' ||
-        (effectiveRawArgs as any)['_rawJson'] === 1 ||
-        (effectiveRawArgs as any)['_rawJson'] === '1';
+      const rawJsonFlag = isRawJsonFlag((effectiveRawArgs as any)['_rawJson']);
       if (rawJsonFlag) {
-        for (const key of inputKeys) {
-          const v = (effectiveRawArgs as any)[key];
-          if (typeof v === 'string') {
-            const trimmed = v.trim();
-            if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
-              try {
-                const parsed = JSON.parse(trimmed);
-                if (typeof parsed === 'object' && parsed !== null) {
-                  (effectiveRawArgs as any)[key] = parsed;
-                }
-              } catch {}
-            }
-          }
+        // REQ-1280 T2 — the flag's parse now lives in the ONE shared
+        // implementation (rawJson.ts) that compact mode calls too, so the two
+        // paths cannot drift (AC-7). `keys: inputKeys` is load-bearing: the
+        // loop visits the DECLARED positions in order, which is what makes
+        // `schemaAt`/`pathAt` line up, and it keeps the reserved keys
+        // (`_rawJson`/`_timeoutMs`/`returnAs`) out of the parse — exactly the
+        // key set the inline loop this replaced visited.
+        //
+        // A failed parse is now RECORDED, not swallowed, and the caller
+        // refuses it below — but only where the declared schema expects a
+        // structured value. That guard is the safety claim: at a
+        // `string`/`number`/`boolean` position, or with no schema at all, a
+        // JSON-looking string that does not parse is still forwarded verbatim
+        // (the `setName(id, '[Hero]')` class), so no call that works today
+        // changes. It also makes the failure LOUD and FREE: today such a value
+        // is forwarded and the tab rejects it after a wasted round trip.
+        const applied = applyRawJson(effectiveRawArgs, {
+          keys: inputKeys,
+          schemaAt: (i) => tool?.paramSchemas?.[inputKeys[i] ?? ''],
+          pathAt: (i) => inputKeys[i] ?? `arg[${i}]`,
+        });
+        for (const [key, value] of Object.entries(applied.value)) {
+          (effectiveRawArgs as any)[key] = value;
+        }
+        const failure = applied.structuredFailures[0];
+        if (failure) {
+          return toCallToolResult(
+            resultToContent({ ok: false, code: 'invalid_params', message: rawJsonFailureMessage(toolName, failure.path, failure.raw) }),
+          );
         }
       } else {
         // Auto-parse heuristic even without flag: schema expects object/array/matrix but received JSON string

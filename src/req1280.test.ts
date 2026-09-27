@@ -1,0 +1,807 @@
+import { describe, it, expect, afterEach } from 'vitest';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { createMcpServer } from './mcpServer';
+import type { ManifestLike } from './tools';
+
+/**
+ * REQ-1280 — `_rawJson` is declared on `figpea_call` (the ONLY tool compact
+ * mode registers) and never honoured.
+ *
+ * The incident (card REQ-1280, found by `/design` on
+ * `designs/runs/2026-09-26-tessera-api-docs`): a compact-mode agent set the
+ * documented escape hatch for a stringified `props` object and got the
+ * editor's own rejection back — `create(): props must be object (got string)` —
+ * with nothing connecting the error to the flag it had set. One run's ~775
+ * elements became ~600 sequential round trips instead of ~200, because the
+ * flag that was supposed to rescue `layer.batch` and `create(transform)` is
+ * stripped-and-ignored on the default dispatcher.
+ *
+ * Vehicle: this repo has no Playwright lane, so "e2e" is a real MCP SDK
+ * `Client` over `InMemoryTransport` driving the real server — a genuine
+ * `registerTool` → `safeParseAsync` → handler → `callTab` round trip, with a
+ * **stub tab** standing in for the paired editor. The stub applies v3's real
+ * `validateArgs` rule (`v3/src/agent/validateArgs.ts:48-70, 166`) to the
+ * declared fixture schema, so the AC-1 repro is deterministic in CI rather
+ * than a claim about a live tab, and it captures the exact positional array
+ * the tab would receive — the thing every AC here is about.
+ *
+ * AC map (see `docs/plans/REQ-1280-6ab85e20.md` §Use cases → task → test):
+ *  - AC-1  deterministic repro, carried in BOTH directions: the unflagged call
+ *          still returns the editor's envelope verbatim (so the repro stays
+ *          runnable cold, forever), and the flagged one no longer does
+ *  - AC-2  the stringified `props` arrives at the tab as a real object
+ *  - AC-3  a nested `transform` array survives as a real 6-number matrix
+ *  - AC-4  a `layer.batch` ops array sent as one JSON string arrives as a real
+ *          array, complete and in order, in a single `callTab`
+ *  - AC-5  with no flag, behaviour is byte-identical to today
+ *  - AC-6  `_rawJson:false`/absent is a no-op, and the flag can never be
+ *          forwarded at any depth
+ *  - AC-7  compact and full produce deep-equal positional args for the same
+ *          input, and agree on the loud failure
+ *  - AC-8  loud where the schema proves a structured value was intended;
+ *          unchanged (and NOT an error) at a `string` position or with no
+ *          manifest; loud when `args` is not an array
+ *  - AC-9  the three flag behaviours, stated as their own AC
+ *
+ * RED on the unfixed worktree: the compact handler reads `args` verbatim and
+ * never consults the flag, so every flagged test below fails with either the
+ * captured arg still being a string or the editor's own `invalid_params`
+ * envelope coming back after a wasted round trip.
+ */
+
+// ── fixture manifest ────────────────────────────────────────────────────────
+// Purpose-built, in the REQ-1268 fixture's shape: `layer.create` (`kind`
+// string, `props` object carrying CREATE_COMMON_FIELDS including a `matrix`
+// `transform`, per v3/src/agent/createSchema.ts:87-91), `layer.batch` (`ops`:
+// array of `{method, args}`), `layer.setName` (`name`: **string** — the
+// round-1 guard row) and `layer.setTransform` (`matrix`).
+
+const MANIFEST = {
+  layer: {
+    create: {
+      doc: 'Creates a layer of the given kind.',
+      params: {
+        kind: { type: 'string', required: true, enum: ['page', 'rect', 'text', 'image'] },
+        props: {
+          type: 'object',
+          required: false,
+          shape: {
+            name: { type: 'string', required: false },
+            pageWidth: { type: 'number', required: false },
+            pageHeight: { type: 'number', required: false },
+            rwidth: { type: 'number', required: false },
+            rheight: { type: 'number', required: false },
+            parentId: { type: 'string', required: false },
+            url: { type: 'string', required: false },
+            filePath: { type: 'string', required: false },
+            transform: { type: 'matrix', required: false },
+          },
+        },
+      },
+      result: { id: 'string', name: 'string (stored layer name; absent when unnamed)' },
+    },
+    batch: {
+      doc: 'Applies a sequence of layer ops as ONE undo step, all-or-nothing.',
+      params: {
+        ops: {
+          type: 'array',
+          required: true,
+          of: {
+            type: 'object',
+            required: true,
+            shape: {
+              method: { type: 'string', required: true },
+              args: { type: 'array', required: true },
+            },
+          },
+        },
+      },
+      result: { results: 'OpResult[]' },
+    },
+    setName: {
+      doc: 'Renames a layer or page by id.',
+      params: {
+        id: { type: 'string', required: true },
+        name: { type: 'string', required: true },
+      },
+      result: 'void',
+    },
+    setTransform: {
+      doc: 'Sets a layer transform matrix.',
+      params: {
+        id: { type: 'string', required: true },
+        matrix: { type: 'matrix', required: true },
+      },
+      result: 'void',
+    },
+  },
+  session: {
+    openFile: {
+      doc: 'Opens a file in the editor.',
+      params: {
+        input: {
+          type: 'object',
+          required: true,
+          shape: {
+            url: { type: 'string', required: false },
+            filePath: { type: 'string', required: false },
+          },
+        },
+      },
+      result: 'void',
+    },
+  },
+} as unknown as ManifestLike;
+
+// ── the stub tab: v3's real answer, not a plausible one ────────────────────
+
+/** v3's `receivedTypeName` (validateArgs.ts:35-45), verbatim in behaviour. */
+function receivedTypeName(v: unknown): string {
+  if (Array.isArray(v) || v instanceof ArrayBuffer) return 'array';
+  if (v === null) return 'null';
+  return typeof v;
+}
+
+/** v3's `matchesDeclaredType` (validateArgs.ts:48-70) for the top-level types
+ *  this fixture declares. */
+function matchesDeclaredType(declared: string, v: unknown): boolean {
+  switch (declared) {
+    case 'string':
+      return typeof v === 'string';
+    case 'number':
+      return typeof v === 'number' && Number.isFinite(v);
+    case 'boolean':
+      return typeof v === 'boolean';
+    case 'object':
+      return v !== null && typeof v === 'object' && !Array.isArray(v);
+    case 'array':
+    case 'matrix':
+      return Array.isArray(v);
+    default:
+      return true;
+  }
+}
+
+/** The fixture's declared positional types, in declaration order — keyed by the
+ *  BARE method name, because `callTab(group, method, args)` receives `method`
+ *  without its group prefix on BOTH paths (mcpServer.ts:747 and :1145). */
+const DECLARED: Record<string, Record<string, string>> = {
+  create: { kind: 'string', props: 'object' },
+  batch: { ops: 'array' },
+  setName: { id: 'string', name: 'string' },
+  setTransform: { id: 'string', matrix: 'matrix' },
+  openFile: { input: 'object' },
+};
+
+/** v3's `validateArgs` (validateArgs.ts:154-170): the FIRST positional arg
+ *  that does not match its declared type is rejected with exactly
+ *  `${methodName}(): ${key} must be ${declared} (got ${receivedTypeName(arg)})`
+ *  and code `invalid_params`. That string is AC-1's. */
+function editorRejection(method: string, args: unknown[]): { ok: false; code: string; message: string } | undefined {
+  const declared = DECLARED[method];
+  if (!declared) return undefined;
+  const keys = Object.keys(declared);
+  for (let i = 0; i < args.length; i++) {
+    const key = keys[i];
+    if (key === undefined) break;
+    const arg = args[i];
+    if (arg === undefined) continue;
+    if (!matchesDeclaredType(declared[key]!, arg)) {
+      return {
+        ok: false,
+        code: 'invalid_params',
+        message: `${method}(): ${key} must be ${declared[key]} (got ${receivedTypeName(arg)})`,
+      };
+    }
+  }
+  return undefined;
+}
+
+/** A successful editor answer that ECHOES what it was given, so "the tab
+ *  received a real object" is never satisfiable by a stub that ignores its
+ *  input. */
+function editorSuccess(method: string, args: unknown[]): unknown {
+  switch (method) {
+    case 'create': {
+      const props = args[1] as Record<string, unknown> | undefined;
+      return { id: 'L_probe', name: props?.name, ...(props?.transform ? { transform: props.transform } : {}) };
+    }
+    case 'batch': {
+      const ops = args[0] as Array<{ method: string }>;
+      return { results: ops.map((op, i) => ({ opIndex: i, ok: true, value: { id: `L_${op.method}_${i}` } })) };
+    }
+    case 'setTransform':
+      return { id: args[0], matrix: args[1] };
+    default:
+      return null;
+  }
+}
+
+interface Capture {
+  group: string;
+  method: string;
+  args: unknown[];
+}
+
+function makeStub(opts?: { deliverManifest?: unknown }) {
+  const captured: Capture[] = [];
+  const deliver = 'deliverManifest' in (opts ?? {}) ? opts!.deliverManifest : MANIFEST;
+  const stub = {
+    port: 54397,
+    token: 'test-token-1280',
+    isTabConnected: () => true,
+    onDescribe: (h: (m: unknown) => void) => {
+      if (deliver !== undefined) h(deliver);
+    },
+    callTab: async (group: string, method: string, args: unknown[]) => {
+      captured.push({ group, method, args: structuredClone(args) });
+      return editorRejection(method, args) ?? { ok: true, value: editorSuccess(method, args) };
+    },
+    close: async () => {},
+  };
+  return { stub, captured };
+}
+
+let cleanup: Array<() => Promise<void>> = [];
+let tempDirs: string[] = [];
+afterEach(async () => {
+  for (const fn of cleanup) await fn();
+  cleanup = [];
+  for (const d of tempDirs) fs.rmSync(d, { recursive: true, force: true });
+  tempDirs = [];
+});
+
+type Mode = 'compact' | 'full';
+
+async function connect(bridge: unknown, mode: Mode) {
+  const server = createMcpServer(bridge as never, { toolMode: mode } as never);
+  const client = new Client({ name: 'req-1280-test', version: '0.0.0' });
+  const [ct, st] = InMemoryTransport.createLinkedPair();
+  await Promise.all([client.connect(ct), server.connect(st)]);
+  cleanup.push(async () => {
+    await client.close();
+    await server.close();
+  });
+  return client;
+}
+
+async function callToolJson(client: Client, name: string, args: Record<string, unknown> = {}): Promise<any> {
+  const result: any = await client.callTool({ name, arguments: args } as any);
+  const content = result.content as Array<{ type: string; text?: string }>;
+  const textBlock = content.find((c) => c.type === 'text');
+  expect(textBlock, `${name} returned a text block`).toBeDefined();
+  const text = textBlock!.text ?? '';
+  if (!text.trimStart().startsWith('{')) {
+    // A handler that throws (or a tool the SDK could not route) reaches the
+    // client as plain text. Surface it as an envelope so the failure reads as
+    // the defect it is instead of a JSON parse error in the helper.
+    return { ok: false, code: 'non_envelope', message: text };
+  }
+  return JSON.parse(text);
+}
+
+/** True if `key` appears as an own key anywhere in the payload, at any depth. */
+function hasKeyAtAnyDepth(value: unknown, key: string): boolean {
+  if (Array.isArray(value)) return value.some((el) => hasKeyAtAnyDepth(el, key));
+  if (value !== null && typeof value === 'object') {
+    const rec = value as Record<string, unknown>;
+    if (Object.prototype.hasOwnProperty.call(rec, key)) return true;
+    return Object.values(rec).some((v) => hasKeyAtAnyDepth(v, key));
+  }
+  return false;
+}
+
+function tempImageFile(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'req1280-'));
+  tempDirs.push(dir);
+  const file = path.join(dir, 'probe.png');
+  fs.writeFileSync(file, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  return file;
+}
+
+/** The editor's answer to a `props` string at a position declared `object`,
+ *  quoted verbatim by AC-1 and reproduced from v3's `validateArgs`
+ *  (validateArgs.ts:166) + `layer.create`'s `props: {type:"object"}` decl
+ *  (layer.descriptor.ts:103). */
+const AC1_REPRO_MESSAGE = 'create(): props must be object (got string)';
+
+/** A JSON-looking string that is NOT valid JSON — starts `{`/ends `}` (or
+ *  `[`/`]`) so the escape hatch engages, then fails to parse. */
+const BROKEN_OBJECT = '{name: "probe"}';
+const BROKEN_ARRAY = '[5,0,zz,0,0,0]';
+/** The round-1 guard row: a `string`-declared parameter whose value is
+ *  bracket-wrapped but not valid JSON. Works today, and must keep working. */
+const LEGIT_STRING = '[Hero]';
+
+// ───────────────────────────────────────────────────── AC-1 / AC-2 / AC-9 ──
+
+describe('REQ-1280 AC-1 — the deterministic repro, in both directions', () => {
+  it('without the flag the editor answer is relayed verbatim (the repro stays runnable cold)', async () => {
+    const { stub, captured } = makeStub();
+    const client = await connect(stub, 'compact');
+    const result = await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'create',
+      args: ['page', '{"name":"probe","pageWidth":300,"pageHeight":200}'],
+    });
+    // The envelope AC-1 quotes, produced by the tab and relayed. The relayed
+    // message carries REQ-1268's shape-hint suffix on top of the tab's own
+    // answer (already pinned by req1268.test.ts), so AC-1's string is asserted
+    // as the prefix it is — the tab's verbatim answer, unchanged by the relay.
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('invalid_params');
+    expect(result.message).toContain(AC1_REPRO_MESSAGE);
+    expect(result.message.startsWith(AC1_REPRO_MESSAGE)).toBe(true);
+    // …and the string really did reach the tab: the flag-less relay defect.
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.args[1]).toBe('{"name":"probe","pageWidth":300,"pageHeight":200}');
+  });
+
+  it('AC-1/AC-2/AC-9 — with the flag the very same call succeeds and the tab receives a real object', async () => {
+    const { stub, captured } = makeStub();
+    const client = await connect(stub, 'compact');
+    const result = await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'create',
+      args: ['page', '{"name":"probe","pageWidth":300,"pageHeight":200}'],
+      _rawJson: true,
+    });
+    expect(result.ok).toBe(true);
+    // Parsed BEFORE the round trip: the captured arg is a real object…
+    expect(captured).toHaveLength(1);
+    const props = captured[0]!.args[1];
+    expect(typeof props).toBe('object');
+    expect(Array.isArray(props)).toBe(false);
+    expect(props).toEqual({ name: 'probe', pageWidth: 300, pageHeight: 200 });
+    // …and the numbers are REAL numbers, not strings the tab would reject.
+    expect((props as any).pageWidth).toBe(300);
+    expect(typeof (props as any).pageWidth).toBe('number');
+    // The stub echoes what it received, so the tab's own answer carries the
+    // parsed name too — the assertion cannot be satisfied by an ignoring stub.
+    expect(result.value).toEqual({ id: 'L_probe', name: 'probe' });
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────── AC-3 ──
+
+describe('REQ-1280 AC-3 — a nested array survives the flag', () => {
+  it('create(transform) arrives as a real 6-number matrix and is read back as one', async () => {
+    const { stub, captured } = makeStub();
+    const client = await connect(stub, 'compact');
+    const result = await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'create',
+      args: ['rect', '{"parentId":"P1","rwidth":100,"rheight":50,"transform":[1,0,0,1,0,0]}'],
+      _rawJson: true,
+    });
+    expect(result.ok).toBe(true);
+    const props = captured[0]!.args[1] as any;
+    expect(props.parentId).toBe('P1');
+    expect(props.rwidth).toBe(100);
+    expect(props.rheight).toBe(50);
+    // The nested array inside the stringified object is a real 6-number matrix.
+    expect(Array.isArray(props.transform)).toBe(true);
+    expect(props.transform).toHaveLength(6);
+    expect(props.transform.every((n: unknown) => typeof n === 'number')).toBe(true);
+    // "read back" is the tab's read: the stub echoes the value it received.
+    expect(result.value.transform).toEqual([1, 0, 0, 1, 0, 0]);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────── AC-4 ──
+
+describe('REQ-1280 AC-4 — a layer.batch ops array sent as one JSON string applies as one call', () => {
+  it('the whole batch arrives as a real, complete, ordered array in ONE callTab', async () => {
+    const { stub, captured } = makeStub();
+    const client = await connect(stub, 'compact');
+    const ops = [
+      { method: 'create', args: ['page', { name: 'p1', pageWidth: 300, pageHeight: 200 }] },
+      { method: 'create', args: ['rect', { parentId: 'P1', rwidth: 100, rheight: 50 }] },
+      { method: 'setName', args: ['L_rect', 'hero'] },
+    ];
+    const result = await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'batch',
+      args: [JSON.stringify(ops)],
+      _rawJson: true,
+    });
+    expect(result.ok).toBe(true);
+    // The batch is delivered whole in a SINGLE callTab — this REQ's half of
+    // "one undo step": the editor can only make the batch atomic if it
+    // receives the complete ops array in one call.
+    expect(captured).toHaveLength(1);
+    const received = captured[0]!.args[0];
+    expect(Array.isArray(received)).toBe(true);
+    // Not a `{"item": …}` envelope, not a string.
+    expect(received).not.toBe('{"item":…}');
+    const list = received as Array<{ method: string; args: unknown[] }>;
+    expect(list).toHaveLength(ops.length);
+    for (const op of list) {
+      expect(typeof op.method).toBe('string');
+      expect(Array.isArray(op.args)).toBe(true);
+    }
+    // Complete and in order — nothing dropped or reordered by the parse.
+    expect(list.map((op) => op.method)).toEqual(['create', 'create', 'setName']);
+    expect(list[1]!.args[1]).toEqual({ parentId: 'P1', rwidth: 100, rheight: 50 });
+    // The tab applied all three, in order.
+    expect(result.value.results).toHaveLength(3);
+    expect(result.value.results.map((r: any) => r.opIndex)).toEqual([0, 1, 2]);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────── AC-5 ──
+
+describe('REQ-1280 AC-5 — without the flag behaviour is byte-identical to today', () => {
+  it('the flag-less envelope is the same code and the same message (pinned in the AC-1 repro above)', async () => {
+    const { stub, captured } = makeStub();
+    const client = await connect(stub, 'compact');
+    const withoutFlag = await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'create',
+      args: ['page', '{"name":"probe","pageWidth":300,"pageHeight":200}'],
+    });
+    const withFalse = await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'create',
+      args: ['page', '{"name":"probe","pageWidth":300,"pageHeight":200}'],
+      _rawJson: false,
+    });
+    expect(withoutFlag.code).toBe('invalid_params');
+    expect(withoutFlag.message).toContain(AC1_REPRO_MESSAGE);
+    expect(withFalse).toEqual(withoutFlag);
+    // The fix is opt-in only: the string still reaches the tab in both cases.
+    expect(captured.every((c) => typeof c.args[1] === 'string')).toBe(true);
+  });
+
+  it('a legitimate props object with the flag absent is forwarded untouched', async () => {
+    const { stub, captured } = makeStub();
+    const client = await connect(stub, 'compact');
+    const props = { name: 'probe', pageWidth: 300, pageHeight: 200 };
+    const result = await callToolJson(client, 'figpea_call', { group: 'layer', method: 'create', args: ['page', props] });
+    expect(result.ok).toBe(true);
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.args).toEqual(['page', props]);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────── AC-6 ──
+
+describe('REQ-1280 AC-6 — _rawJson:false/absent is a no-op and never leaks', () => {
+  it('the flag never appears in the forwarded positional args, at any depth', async () => {
+    const { stub, captured } = makeStub();
+    const client = await connect(stub, 'compact');
+    const ops = [{ method: 'create', args: ['rect', { parentId: 'P1', rwidth: 10, rheight: 5 }] }];
+    await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'create',
+      args: ['page', '{"name":"probe","pageWidth":300,"pageHeight":200}'],
+      _rawJson: true,
+    });
+    await callToolJson(client, 'figpea_call', { group: 'layer', method: 'batch', args: [JSON.stringify(ops)], _rawJson: '1' });
+    await callToolJson(client, 'figpea_call', { group: 'layer', method: 'create', args: ['page', { name: 'x' }], _rawJson: false });
+    expect(captured.length).toBeGreaterThanOrEqual(3);
+    for (const call of captured) {
+      expect(hasKeyAtAnyDepth(call.args, '_rawJson'), `leaked into ${call.method}`).toBe(false);
+    }
+  });
+
+  it('args.length is unchanged by the flag\'s presence', async () => {
+    const { stub, captured } = makeStub();
+    const client = await connect(stub, 'compact');
+    const args = ['page', { name: 'probe', pageWidth: 300, pageHeight: 200 }];
+    await callToolJson(client, 'figpea_call', { group: 'layer', method: 'create', args });
+    await callToolJson(client, 'figpea_call', { group: 'layer', method: 'create', args, _rawJson: true });
+    expect(captured).toHaveLength(2);
+    expect(captured[0]!.args).toHaveLength(2);
+    expect(captured[1]!.args).toHaveLength(2);
+    expect(captured[0]!.args).toEqual(captured[1]!.args);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────── AC-7 ──
+
+describe('REQ-1280 AC-7 — compact and full cannot drift', () => {
+  it('the same stringified object produces deep-equal positional args on both paths', async () => {
+    const compactRun = makeStub();
+    const compactClient = await connect(compactRun.stub, 'compact');
+    await callToolJson(compactClient, 'figpea_call', {
+      group: 'layer',
+      method: 'create',
+      args: ['page', '{"name":"probe","pageWidth":300,"pageHeight":200}'],
+      _rawJson: true,
+    });
+
+    const fullRun = makeStub();
+    const fullClient = await connect(fullRun.stub, 'full');
+    await callToolJson(fullClient, 'layer_create', {
+      kind: 'page',
+      props: '{"name":"probe","pageWidth":300,"pageHeight":200}',
+      _rawJson: true,
+    });
+
+    expect(compactRun.captured[0]!.args).toEqual(fullRun.captured[0]!.args);
+    expect(compactRun.captured[0]!.args).toEqual(['page', { name: 'probe', pageWidth: 300, pageHeight: 200 }]);
+  });
+
+  it('the same stringified array produces deep-equal positional args on both paths', async () => {
+    const compactRun = makeStub();
+    const compactClient = await connect(compactRun.stub, 'compact');
+    await callToolJson(compactClient, 'figpea_call', {
+      group: 'layer',
+      method: 'setTransform',
+      args: ['L1', '[5,0,0,3.5,0,0]'],
+      _rawJson: true,
+    });
+
+    const fullRun = makeStub();
+    const fullClient = await connect(fullRun.stub, 'full');
+    await callToolJson(fullClient, 'layer_setTransform', { id: 'L1', matrix: '[5,0,0,3.5,0,0]', _rawJson: true });
+
+    expect(compactRun.captured[0]!.args).toEqual(fullRun.captured[0]!.args);
+    expect(compactRun.captured[0]!.args[1]).toEqual([5, 0, 0, 3.5, 0, 0]);
+  });
+
+  it('a value that fails to parse: both paths return the same code and the same _rawJson clause', async () => {
+    const compactRun = makeStub();
+    const compactClient = await connect(compactRun.stub, 'compact');
+    const compactResult = await callToolJson(compactClient, 'figpea_call', {
+      group: 'layer',
+      method: 'setTransform',
+      args: ['L1', BROKEN_ARRAY],
+      _rawJson: true,
+    });
+
+    const fullRun = makeStub();
+    const fullClient = await connect(fullRun.stub, 'full');
+    const fullResult = await callToolJson(fullClient, 'layer_setTransform', {
+      id: 'L1',
+      matrix: BROKEN_ARRAY,
+      _rawJson: true,
+    });
+
+    expect(compactResult.code).toBe('invalid_params');
+    expect(fullResult.code).toBe(compactResult.code);
+    // Each names the flag and its own position…
+    expect(compactResult.message).toContain('_rawJson');
+    expect(fullResult.message).toContain('_rawJson');
+    expect(compactResult.message).toContain('args[1]');
+    expect(fullResult.message).toContain('matrix');
+    // …and the guidance after the position is byte-equal, so the two writers
+    // cannot disagree about what the agent should do next.
+    const tail = (m: string) => m.slice(m.indexOf('could not be parsed as JSON'));
+    expect(tail(compactResult.message)).toBe(tail(fullResult.message));
+    // Neither path spends a round trip on a payload it already knows is broken.
+    expect(compactRun.captured).toHaveLength(0);
+    expect(fullRun.captured).toHaveLength(0);
+  });
+
+  it('guard row: a string-declared value that is not valid JSON still works on BOTH paths', async () => {
+    const compactRun = makeStub();
+    const compactClient = await connect(compactRun.stub, 'compact');
+    const compactResult = await callToolJson(compactClient, 'figpea_call', {
+      group: 'layer',
+      method: 'setName',
+      args: ['L1', LEGIT_STRING],
+      _rawJson: true,
+    });
+
+    const fullRun = makeStub();
+    const fullClient = await connect(fullRun.stub, 'full');
+    const fullResult = await callToolJson(fullClient, 'layer_setName', { id: 'L1', name: LEGIT_STRING, _rawJson: true });
+
+    expect(compactResult.ok).toBe(true);
+    expect(fullResult.ok).toBe(true);
+    expect(compactRun.captured).toHaveLength(1);
+    expect(fullRun.captured).toHaveLength(1);
+    // Forwarded as the literal string it is — untouched, and not an error.
+    expect(compactRun.captured[0]!.args[1]).toBe(LEGIT_STRING);
+    expect(fullRun.captured[0]!.args[1]).toBe(LEGIT_STRING);
+    expect(compactRun.captured[0]!.args).toEqual(fullRun.captured[0]!.args);
+    expect(compactResult.message).toBeUndefined();
+  });
+
+  it('guard row: with NO manifest the flag still parses and never refuses (schema unknown ⇒ safe default)', async () => {
+    const { stub, captured } = makeStub({ deliverManifest: undefined });
+    const client = await connect(stub, 'compact');
+    // No manifest at all: `contractToolFor` returns undefined, so no position
+    // can be proven structured. A string-declared-looking value is untouched…
+    const legit = await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'setName',
+      args: ['L1', LEGIT_STRING],
+      _rawJson: true,
+    });
+    expect(legit.ok).toBe(true);
+    expect(captured[0]!.args[1]).toBe(LEGIT_STRING);
+    // …and a stringified object is still parsed, because the parse itself is
+    // schema-blind (that is what makes the flag usable on a first call).
+    const parsed = await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'create',
+      args: ['page', '{"name":"probe","pageWidth":300,"pageHeight":200}'],
+      _rawJson: true,
+    });
+    expect(parsed.ok).toBe(true);
+    expect(captured[1]!.args[1]).toEqual({ name: 'probe', pageWidth: 300, pageHeight: 200 });
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────── AC-8 ──
+
+describe('REQ-1280 AC-8 — a flag that cannot apply fails loudly', () => {
+  it('at a position the schema declares object: invalid_params naming _rawJson, at zero round trips', async () => {
+    const { stub, captured } = makeStub();
+    const client = await connect(stub, 'compact');
+    const result = await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'create',
+      args: ['page', BROKEN_OBJECT],
+      _rawJson: true,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('invalid_params');
+    // Names the flag, the position, and that the value could not be parsed.
+    expect(result.message).toContain('_rawJson');
+    expect(result.message).toContain('props');
+    expect(result.message).toContain('could not be parsed as JSON');
+    // The agent's belief that the escape hatch was honoured is provably false,
+    // so we say so for free — the tab is never asked.
+    expect(captured).toHaveLength(0);
+  });
+
+  it('the same loud failure on a declared array position (layer.batch ops)', async () => {
+    const { stub, captured } = makeStub();
+    const client = await connect(stub, 'compact');
+    const result = await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'batch',
+      args: ['[{"method": "create", }]'],
+      _rawJson: true,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('invalid_params');
+    expect(result.message).toContain('_rawJson');
+    expect(result.message).toContain('ops');
+    expect(captured).toHaveLength(0);
+  });
+
+  it('at a string-declared position the same broken value is NOT an error — it is forwarded as the literal string', async () => {
+    const { stub, captured } = makeStub();
+    const client = await connect(stub, 'compact');
+    const result = await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'setName',
+      args: ['L1', LEGIT_STRING],
+      _rawJson: true,
+    });
+    // The complementary case, pinned as a non-error: a call that works today
+    // must keep working, so a loud failure here would be a regression.
+    expect(result.ok).toBe(true);
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.args[1]).toBe(LEGIT_STRING);
+  });
+
+  it('a residual, deliberately not fixed: a string position holding VALID json is still parsed (documenting test)', async () => {
+    // `setName(id, '[1,2,3]')` with the flag on parses to an array and the tab
+    // rejects it. That is the price of an opt-in, schema-blind parse and it
+    // matches full mode since REQ-1037, so it is parity, not drift. This test
+    // documents the behaviour instead of hiding it: if the parse is ever
+    // schema-guarded, this fails and the change is a deliberate one.
+    const compactRun = makeStub();
+    const compactClient = await connect(compactRun.stub, 'compact');
+    const compactResult = await callToolJson(compactClient, 'figpea_call', {
+      group: 'layer',
+      method: 'setName',
+      args: ['L1', '[1,2,3]'],
+      _rawJson: true,
+    });
+    const fullRun = makeStub();
+    const fullClient = await connect(fullRun.stub, 'full');
+    const fullResult = await callToolJson(fullClient, 'layer_setName', { id: 'L1', name: '[1,2,3]', _rawJson: true });
+
+    expect(compactResult.ok).toBe(false);
+    expect(compactResult.message).toContain('setName(): name must be string (got array)');
+    // The tab's answer is identical on both paths (compact relays it with
+    // REQ-1268's shape-hint suffix appended, which is pre-existing behaviour
+    // of the compact path and not this REQ's business).
+    expect(compactResult.message.startsWith(fullResult.message)).toBe(true);
+    expect(fullResult.message).toBe('setName(): name must be string (got array)');
+    expect(compactRun.captured[0]!.args[1]).toEqual([1, 2, 3]);
+  });
+
+  it('flag truthy with args present but not an array: a loud failure that names args', async () => {
+    const { stub, captured } = makeStub();
+    const client = await connect(stub, 'compact');
+    const result: any = await client.callTool({
+      name: 'figpea_call',
+      arguments: { group: 'layer', method: 'create', args: 'not-an-array', _rawJson: true },
+    } as any);
+    const text = (result.content as Array<{ type: string; text?: string }>).find((c) => c.type === 'text')?.text ?? '';
+    // Never silently ignored. VERIFIED (scratch dump of the real SDK): the
+    // tool's own `z.array` shape (mcpServer.ts:566) rejects a non-array
+    // before the handler runs, so the observable loud failure today is the
+    // SDK's validation error naming `args`; the handler keeps its own
+    // `_rawJson`-naming clause as the defensive second layer, because the card
+    // puts the inputSchema shape out of scope.
+    expect(result.isError === true || JSON.parse(text).ok === false).toBe(true);
+    expect(text).toMatch(/args/);
+    expect(text).toMatch(/expected array|args must be an array/);
+    if (result.isError !== true) expect(text).toContain('_rawJson');
+    expect(captured).toHaveLength(0);
+  });
+});
+
+// ───────────────────────────── T3's own assertions: placement & advertisement ──
+
+describe('REQ-1280 — the flag composes with the rest of the compact path', () => {
+  it('a stringified filePath in a flagged layer.create("image") still reaches the bridge as a URL', async () => {
+    const { stub, captured } = makeStub();
+    const client = await connect(stub, 'compact');
+    const file = tempImageFile();
+    const result = await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'create',
+      args: ['image', JSON.stringify({ name: 'probe', rwidth: 10, rheight: 10, filePath: file })],
+      _rawJson: true,
+    });
+    expect(result.ok).toBe(true);
+    expect(captured).toHaveLength(1);
+    const props = captured[0]!.args[1] as any;
+    // Translation (REQ-1017) sees a PARSED object, not a string — so the flag
+    // composes with the file-path translation instead of shadowing it.
+    expect(typeof props).toBe('object');
+    expect(props.filePath).toBeUndefined();
+    expect(String(props.url)).toContain('/file?path=');
+    expect(String(props.url)).toContain(encodeURIComponent(file));
+  });
+
+  it('an unflagged stringified payload is answered by the tab on both file-translation branches', async () => {
+    // The file-translation blocks guard their `in` tests with the value itself
+    // (`input && 'filePath' in input`, `props && 'filePath' in props`), and the
+    // `in` operator REJECTS a string primitive — so an unflagged stringified
+    // payload threw a TypeError out of the handler, before the `try` that
+    // turns failures into envelopes. Hardened, the string is simply forwarded
+    // and the tab answers it like any other wrong input.
+    for (const call of [
+      { group: 'session', method: 'openFile', args: ['{"filePath":123}'], message: 'openFile(): input must be object (got string)' },
+      { group: 'layer', method: 'create', args: ['image', '{"filePath":123}'], message: 'create(): props must be object (got string)' },
+    ]) {
+      const { stub, captured } = makeStub();
+      const client = await connect(stub, 'compact');
+      const result = await callToolJson(client, 'figpea_call', {
+        group: call.group,
+        method: call.method,
+        args: call.args,
+      });
+      // The tab is asked, and its own answer comes back as a normal envelope
+      // (compact relays it with REQ-1268's shape-hint suffix appended).
+      expect(captured, call.method).toHaveLength(1);
+      expect(captured[0]!.args[0], call.method).toBe(call.args[0]);
+      expect(result, call.method).toHaveProperty('ok');
+      expect(result.message, call.method).toContain(call.message);
+    }
+  });
+
+  it('tools/list advertises _rawJson as a working escape hatch with a worked figpea_call example', async () => {
+    const { stub } = makeStub();
+    const client = await connect(stub, 'compact');
+    const { tools } = await client.listTools();
+    const call = tools.find((t) => t.name === 'figpea_call')!;
+    const description: string = (call as any).inputSchema.properties._rawJson.description;
+    // VERIFIED, not assumed: the advertised text is today exactly
+    // "Reserved passthrough for harness stringification tolerance" — a claim
+    // no compact-mode caller could rely on, since the flag was inert here.
+    expect(description).not.toBe('Reserved passthrough for harness stringification tolerance');
+    expect(description).toContain('_rawJson');
+    // A concrete payload an agent can copy, in the REQ-1268 idiom.
+    expect(description).toMatch(/figpea_call/);
+    expect(description).toMatch(/\{["']?group["']?:["']?layer/);
+    // It advertises that stringified objects/arrays are parsed — and does not
+    // promise more than the guard delivers.
+    expect(description).toMatch(/object|array/i);
+  });
+});

@@ -153,6 +153,28 @@ describe('README.md (AC-5)', () => {
   // stop being true as written: the key is no longer scoped to three image
   // tools, and the payload is no longer image-shaped. The three image tool
   // names stay pinned above — they are still examples, just not the limit.
+  // REQ-1280 T4 — the rot-guard for the paragraph that stopped being true as
+  // written: it described `_rawJson` as a top-level-param feature, which is
+  // the FULL mode's surface. Compact mode is the default, and there the only
+  // thing that takes a payload is `figpea_call`'s positional `args`.
+  it('documents _rawJson on both tool modes, with a figpea_call example and the loud-failure rule (REQ-1280)', () => {
+    expect(readme).toContain('_rawJson');
+    // The full-mode statement stays true and is kept…
+    expect(readme).toMatch(/figpea_layer_create/);
+    // …and the compact path is documented beside it, with a copyable payload.
+    expect(readme).toMatch(/figpea_call[\s\S]{0,400}?"_rawJson":\s*true/);
+    expect(readme, 'the batch ops example is the nested case the flag exists for').toMatch(/"method":\s*"batch"/);
+    // Both modes are named as places the flag works, so "every tool" is no
+    // longer a full-mode-only claim.
+    expect(readme).toMatch(/\*\*Full mode\*\*/);
+    expect(readme).toMatch(/\*\*Compact mode/);
+    // The loud-failure behaviour is stated, not implied.
+    expect(readme).toMatch(/invalid_params/);
+    expect(readme, 'the refusal is documented as naming the flag').toMatch(/naming `_rawJson`|names `_rawJson`/);
+    // Opt-in-ness is stated, so the fix is not read as changing the default.
+    expect(readme).toMatch(/opt-in/i);
+  });
+
   it('documents returnAs path mode as reaching every binary export, not only image tools (REQ-1279)', () => {
     expect(readme, 'the section is no longer image-scoped').toContain('Off-band binary returns');
     expect(readme, 'the old image-only section title is gone').not.toContain('Off-band image returns');

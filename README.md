@@ -146,7 +146,14 @@ Every relayed call has a bridge timeout. Two knobs control it:
 
 When a call does time out, the error says so honestly — `timed out after Nms; the editor may still be executing this call — check state before retrying`. **Do not blindly retry a failed mutation**: the tab keeps working after the relay gives up, so the effect may have landed anyway (retrying a non-idempotent call like `layer_create` duplicates the layer). Check state first (`status`, `session_layerTree`) and re-issue reads and idempotent setters freely.
 
-Every tool also accepts `_rawJson` (boolean, optional) — when `true`, any top-level param that is a JSON string representing an object or array (e.g. `'{"pageWidth":1500}'` or `'[5,0,0,3.5,0,0]'`) is parsed before forwarding, so a client whose harness stringifies nested numbers can send the whole object as a JSON string and recover real numbers. The server also coerces string numerics inside objects/arrays to numbers defensively (harness stringification tolerance) without requiring `_rawJson`.
+Every tool also accepts `_rawJson` (boolean, optional) — the escape hatch for a host harness that stringifies a nested object or array instead of sending it as one. Set it to `true` and every argument that is a string whose trimmed form starts with `{`/`[` and ends with `}`/`]` is JSON-parsed before forwarding, so the whole object can travel as a string and arrive as a real object with real numbers.
+
+It works on **both** tool modes, on the two different surfaces each mode gives you:
+
+- **Full mode** — a top-level param of any generated tool: `figpea_layer_create({ "kind": "page", "props": "{\"pageWidth\":1500}", "_rawJson": true })` parses `props`.
+- **Compact mode (the default)** — any **element** of `figpea_call`'s positional `args` array, including nested payloads like a `layer.batch` ops array: `figpea_call({ "group": "layer", "method": "batch", "args": ["[{\"method\":\"create\",\"args\":[\"rect\",{\"rwidth\":100}]}]"], "_rawJson": true })` delivers `ops` as a real array, so the whole batch arrives in one call.
+
+It is opt-in: without `_rawJson` a stringified object or array is forwarded as the plain string it is, and the editor rejects it. If a value *looks* like JSON but cannot be parsed, and the parameter is declared an `object` or an array, the call is refused up front with `invalid_params` naming `_rawJson` and the parameter, instead of being silently forwarded — so the flag never lies about having been honoured. The server also coerces string numerics inside objects/arrays to numbers defensively (harness stringification tolerance) without requiring `_rawJson`.
 
 ## Security model
 
