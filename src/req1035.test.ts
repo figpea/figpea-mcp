@@ -32,7 +32,8 @@ async function getFreePort(): Promise<number> {
  * strings are accepted byte-for-byte by the editor.
  */
 
-// --- vendored parsePairingFromPaste (verbatim from v3/src/agent/bridge/parsePairing.ts @ b932bad0) ---
+// --- vendored parsePairingFromPaste (verbatim from v3/src/agent/bridge/parsePairing.ts @ b932bad0,
+// widened by REQ-1301 to accept the `localhost` host cli.ts now prints, in lockstep with the v3 change) ---
 function safeDecodeAndTrim(s: string): string {
   let out = s;
   try { out = decodeURIComponent(out); } catch {}
@@ -117,7 +118,7 @@ function parsePairingFromPaste(input: string): { port: number; token: string } |
     if (!jp) return { error: 'missing bridgePort' };
     if (!jt) return { error: 'missing bridgeToken' };
   }
-  const listenPortMatch = trimmed.match(/127\.0\.0\.1[:\s]+(\d{1,5})/);
+  const listenPortMatch = trimmed.match(/(?:localhost|127\.0\.0\.1)[:\s]+(\d{1,5})/);
   let pairingTokenMatch: RegExpMatchArray | null = trimmed.match(/pairing token[:\s]*([^\s"'`]+)/i);
   if (!pairingTokenMatch) pairingTokenMatch = trimmed.match(/token[:\s]*([^\s"'`]+)/i);
   if (listenPortMatch && pairingTokenMatch) {
@@ -307,7 +308,13 @@ describe('REQ-1035 AC-4 — all three paste families round-trip', () => {
     expect(parsed).toEqual({ port: PORT, token: TOKEN });
   });
 
-  it('(c) stderr 127.0.0.1:port + pairing token pair round-trips', async () => {
+  it('(c) stderr localhost:port + pairing token pair round-trips (REQ-1301: the form cli.ts now prints)', async () => {
+    const stderrPair = `[figpea-mcp] bridge listening on localhost:${PORT}\n[figpea-mcp] pairing token: ${TOKEN}`;
+    const parsed = parsePairingFromPaste(stderrPair);
+    expect(parsed).toEqual({ port: PORT, token: TOKEN });
+  });
+
+  it('(c) stderr 127.0.0.1:port + pairing token pair round-trips (REQ-1301: kept — an already-installed older figpea-mcp still prints this)', async () => {
     const stderrPair = `[figpea-mcp] bridge listening on 127.0.0.1:${PORT}\n[figpea-mcp] pairing token: ${TOKEN}`;
     const parsed = parsePairingFromPaste(stderrPair);
     expect(parsed).toEqual({ port: PORT, token: TOKEN });
@@ -315,6 +322,12 @@ describe('REQ-1035 AC-4 — all three paste families round-trip', () => {
 
   it('(c) stderr pair concatenated with whitespace also round-trips', async () => {
     const pair = `127.0.0.1:${PORT} pairing token: ${TOKEN}`;
+    const parsed = parsePairingFromPaste(pair);
+    expect(parsed).toEqual({ port: PORT, token: TOKEN });
+  });
+
+  it('(c) the whitespace-concatenated localhost pair also round-trips (REQ-1301)', async () => {
+    const pair = `localhost:${PORT} pairing token: ${TOKEN}`;
     const parsed = parsePairingFromPaste(pair);
     expect(parsed).toEqual({ port: PORT, token: TOKEN });
   });
@@ -349,7 +362,7 @@ describe('REQ-1035 AC-1 — stderr is paste-ready (dist/cli.js via StdioClientTr
       // Allow small flush for stderr banner (printed before connect)
       await new Promise((r) => setTimeout(r, 200));
       const stderr = Buffer.concat(stderrChunks).toString('utf8');
-      expect(stderr, 'stderr contains bridge listening line').toContain('bridge listening on 127.0.0.1:');
+      expect(stderr, 'stderr contains bridge listening line').toContain('bridge listening on localhost:');
       expect(stderr, 'stderr contains pairing token line').toContain('pairing token:');
       expect(stderr, 'stderr contains open this URL line').toContain('open this URL');
       // Extract the indented pairing URL (the line beginning with two spaces)
@@ -425,7 +438,7 @@ describe('REQ-1035 AC-1 — stderr is paste-ready (dist/cli.js via StdioClientTr
       expect(status.port).toBe(fixedPort);
       await new Promise((r) => setTimeout(r, 200));
       const stderr = Buffer.concat(stderrChunks).toString('utf8');
-      expect(stderr).toContain(`127.0.0.1:${fixedPort}`);
+      expect(stderr).toContain(`localhost:${fixedPort}`);
       const urlMatch = stderr.match(/https?:\/\/[^\s]+bridgePort=\d+[^\s]*/);
       expect(urlMatch).toBeTruthy();
       const url = urlMatch![0];
@@ -470,7 +483,7 @@ describe('REQ-1035 AC-5 — stdout hygiene (StdioClientTransport spawn monitorin
       // If stdout had stray writes, the above calls would have thrown JSON parse errors.
       await new Promise((r) => setTimeout(r, 100));
       const stderr = Buffer.concat(stderrChunks).toString('utf8');
-      expect(stderr).toContain('[figpea-mcp] bridge listening on 127.0.0.1:');
+      expect(stderr).toContain('[figpea-mcp] bridge listening on localhost:');
       expect(stderr).toContain('pairing token:');
       // Assert stdout was not captured as empty due to stray — the client is still alive
       expect(status.toolCount).toBeGreaterThanOrEqual(0);

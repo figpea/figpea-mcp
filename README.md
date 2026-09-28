@@ -34,7 +34,9 @@ Optional: the `FIGPEA_EDITOR_URL` env var and `--port=<n>` flag override the edi
 
 ## How pairing works
 
-The server starts a bridge on `127.0.0.1:<port>` with a per-run pairing token. The editor tab connects back over that localhost WebSocket carrying the token (`?agent=1&bridgePort=…&bridgeToken=…`). One connected tab at a time — the newest connection always wins over a stale one.
+The server binds a bridge on `127.0.0.1:<port>` — loopback only, never a public interface — and the editor tab connects back over that localhost WebSocket carrying the token (`?agent=1&bridgePort=…&bridgeToken=…`). One connected tab at a time: the newest connection always wins over a stale one.
+
+Two different hosts, on purpose. The **bind** is `127.0.0.1` and stays that way: it is a security property, and the listener is IPv4-only. The **host in the URLs the bridge emits** (and in the `bridge listening on …` line it prints) is `localhost`, which is the host your editor tab is itself served from. Matching it puts the tab and the bridge in the same address space, so a `localhost` page talking to a `127.0.0.1` URL — a *cross-hostname* request, and so outside the Local Network Access localhost exemption, preflighted and permission-gated — no longer happens. That matters most for headless and automated browsers, which cannot answer an LNA prompt. The bind is deliberately not widened to `::1` to match: `localhost` resolves to `::1` first, and IPv4 clients still reach it through connection racing.
 
 ## Mid-session pairing — copy the connection string
 
@@ -44,7 +46,7 @@ You started a design without `?agent=1&bridgePort&bridgeToken` (the normal human
   ```text
   [figpea-mcp]   https://editor.figpea.com/?agent=1&bridgePort=54321&bridgeToken=550e8400-e29b-41d4-a716-446655440000
   ```
-  (the indented line after `open this URL in a browser…`). Also the two-line pair `127.0.0.1:<port>` + `pairing token: <uuid>` is accepted when pasted together.
+  (the indented line after `open this URL in a browser…`). Also the two-line pair `localhost:<port>` + `pairing token: <uuid>` is accepted when pasted together — that is the form the server now prints. The older `127.0.0.1:<port>` + `pairing token: <uuid>` pair is still accepted, so a log from an already-installed server still pairs.
 - **From `open_editor`** — call the tool, copy its returned `url` (same pairing URL; with `file` it appends `&loader=http&url=<file>`).
 - **From `status`** — call the tool, copy its `url` or compose `?agent=1&bridgePort=<port>&bridgeToken=<token>` from `port`/`token`.
 
@@ -52,7 +54,7 @@ All three paste families are accepted byte-for-byte by `parsePairingFromPaste`:
 
 1. **Full URL** `…?agent=1&bridgePort=<port>&bridgeToken=<token>` (any origin, extra surrounding text tolerated, also with `&loader=http&url=…`);
 2. **JSON** `{"port":<port>,"token":"<uuid>","url":"https://…?bridgePort=…&bridgeToken=…"}` (as `open_editor` returns);
-3. **stderr pair** `127.0.0.1:<port>` + `pairing token: <uuid>` pasted together with whitespace/newline.
+3. **stderr pair** `localhost:<port>` + `pairing token: <uuid>` pasted together with whitespace/newline (the form the server now prints; the older `127.0.0.1:<port>` + `pairing token: <uuid>` pair is still accepted).
 
 Honors `FIGPEA_EDITOR_URL` (default `https://editor.figpea.com`, override for local dev) and `--port=<n>` — the pairing URL embeds whatever origin/port/token the bridge is actually bound to.
 
@@ -159,7 +161,7 @@ It is opt-in: without `_rawJson` a stringified object or array is forwarded as t
 
 ## Security model
 
-- The bridge binds **localhost only** (`127.0.0.1`) — never a public interface.
+- The bridge binds **localhost only** (`127.0.0.1`) — never a public interface. The listener is IPv4-only and stays that way; the `localhost` host in emitted URLs and in the printed banner line is a separate decision, described under *How pairing works*.
 - A **per-run pairing token** is regenerated on every start; a connection without the correct token is closed without ever being relayed.
 - **Single active session** — the newest valid connection always supersedes the previous one.
 - At startup, the server performs two GET requests to the editor origin — `/agent/contract.json` (tool definitions) and `/agent/skill.md` (the agent skill reference, backing the `figpea_skill` tool) — to prefetch both before any tab pairs. This reveals only your client IP and startup timing to the editor origin; no usage telemetry is shipped. You can disable both fetches by setting `FIGPEA_DISABLE_CONTRACT_FETCH=1`.

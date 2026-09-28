@@ -208,4 +208,41 @@ describe('README.md (AC-5)', () => {
       /never pass a file path as a parameter/i,
     );
   });
+
+  // REQ-1301 AC-5. The README is this package's only public doc surface, and
+  // three of its statements became factually wrong the moment the banner and
+  // the emitted URLs moved to `localhost`. These assertions pin the two hosts
+  // as *distinct facts with different jobs* — the bind stays `127.0.0.1` and is
+  // a security property; the emitted URL is `localhost` and exists so the tab
+  // and the bridge share an address space. A README that collapsed them into
+  // one sentence would pass a looser check and teach the next reader to
+  // "tidy" the host back, which is the recurrence this case exists to prevent.
+  it('distinguishes the loopback bind (127.0.0.1) from the emitted URL host (localhost), with the why (REQ-1301)', () => {
+    expect(readme, 'the bind host is still documented as 127.0.0.1').toMatch(/binds? \*\*localhost only\*\* \(`127\.0\.0\.1`\)/);
+    expect(readme, 'and the security claim that it is never a public interface survives').toMatch(/never a public interface/i);
+
+    expect(readme, 'the stderr pair family is documented with the new localhost host').toMatch(
+      /`localhost:<port>` \+ `pairing token: <uuid>`/,
+    );
+    expect(readme, 'the older 127.0.0.1 pair is still documented, for an already-installed server').toMatch(
+      /`127\.0\.0\.1:<port>` \+ `pairing token: <uuid>`/,
+    );
+    expect(readme, 'the localhost form is described as what the server now prints').toMatch(/now prints/i);
+
+    // The bind/URL distinction itself, and the reason it is deliberate. These
+    // assert the documented *fact* (the two hosts are named separately, one of
+    // them is the emitted one, and the split is called out as intentional),
+    // not one particular sentence's phrasing — pinning the wording would fail
+    // every harmless rewording while still letting a README that quietly
+    // collapsed the two hosts back into one pass a looser reading.
+    expect(readme, 'the bind is documented as 127.0.0.1').toMatch(/bind[^\n]{0,80}127\.0\.0\.1/i);
+    expect(readme, 'the emitted URL host is documented as localhost').toMatch(/(?:emit\w*|URL)[^\n]{0,200}localhost/i);
+    expect(readme, 'the two are explicitly called out as different, on purpose').toMatch(
+      /(?:two|different)[^\n]{0,40}hosts?[^\n]{0,40}on purpose/i,
+    );
+    expect(readme, 'the reason the emitted host is localhost is stated, not just the fact').toMatch(
+      /same address space|localhost exemption/i,
+    );
+    expect(readme, 'the bind staying IPv4-only is called out so it is not widened').toMatch(/IPv4-only|not widened|stays IPv4/i);
+  });
 });

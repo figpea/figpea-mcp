@@ -13,8 +13,13 @@ import { startBridgeServer } from './bridgeServer';
  *
  * RED reason: mcpServer currently has no filePath interception, so tools either
  * reject filePath as unexpected or forward it verbatim and the bridge call
- * never carries a loopback http URL; assertions for http://127.0.0.1 and for
+ * never carries a loopback http URL; assertions for http://localhost and for
  * structured error codes fail.
+ *
+ * REQ-1301: the emitted host is `localhost` (the host the editor tab is served
+ * from), not `127.0.0.1`. The stub's `getFileUrl` used to re-inflate that
+ * literal by hand; it now delegates to the real bridge, so what the assertions
+ * see is the product's own string rather than a copy of it.
  */
 
 function tmpFile(ext: string, content = 'x'): string {
@@ -49,7 +54,7 @@ async function createHarnessedClient(bridgePort: number, bridgeToken: string, fa
     }),
     callTab: fakeCallTab,
     close: () => realBridge.close(),
-    getFileUrl: (fp: string) => `http://127.0.0.1:${realBridge.port}/file?path=${encodeURIComponent(fp)}`,
+    getFileUrl: (fp: string) => realBridge.getFileUrl(fp),
   };
   const server = createMcpServer(stub as any);
   const client = new Client({ name: 'req1017-translation', version: '0.0.0' });
@@ -60,13 +65,13 @@ async function createHarnessedClient(bridgePort: number, bridgeToken: string, fa
 }
 
 describe('REQ-1017 AC-1: session_openFile filePath→bridge URL', () => {
-  it('translates filePath to http://127.0.0.1 bridge URL before relaying', async () => {
+  it('translates filePath to a localhost bridge URL before relaying', async () => {
     const fp = tmpFile('.fp', '{"k":"v"}');
     let relayedArgs: unknown[] = [];
     const { client } = await createHarnessedClient(0, '', async (g, m, a) => { relayedArgs = a; return { ok: true, value: undefined }; });
     await client.callTool({ name: 'session_openFile', arguments: { input: { filePath: fp } } as any });
     const input = (relayedArgs[0] as any);
-    expect(input?.url, 'MCP maps filePath to url').toMatch(/^http:\/\/127\.0\.0\.1:\d+\/file\?path=/);
+    expect(input?.url, 'MCP maps filePath to url').toMatch(/^http:\/\/localhost:\d+\/file\?path=/);
     expect(input?.filePath, 'filePath stripped before relay').toBeUndefined();
   });
 
@@ -89,7 +94,7 @@ describe('REQ-1017 AC-2: layer_setImageFill filePath→bridge URL', () => {
     const { client } = await createHarnessedClient(0, '', async (g, m, a) => { relayed = a; return { ok: true, value: undefined }; });
     await client.callTool({ name: 'layer_setImageFill', arguments: { id: 'layer-1', source: { filePath: fp } } as any });
     const source = (relayed[1] as any);
-    expect(source?.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/file\?path=/);
+    expect(source?.url).toMatch(/^http:\/\/localhost:\d+\/file\?path=/);
     expect(source?.filePath).toBeUndefined();
   });
 });
@@ -101,7 +106,7 @@ describe('REQ-1017 AC-3: layer_create image filePath', () => {
     const { client } = await createHarnessedClient(0, '', async (g, m, a) => { relayed = a; return { ok: true, value: { id: 'new-id' } }; });
     await client.callTool({ name: 'layer_create', arguments: { kind: 'image', props: { filePath: fp } } as any });
     const props = (relayed[1] as any);
-    expect(props?.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/file\?path=/);
+    expect(props?.url).toMatch(/^http:\/\/localhost:\d+\/file\?path=/);
     expect(props?.filePath).toBeUndefined();
   });
 });

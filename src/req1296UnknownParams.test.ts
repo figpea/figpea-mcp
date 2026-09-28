@@ -459,7 +459,7 @@ describe('REQ-1296 preservation: everything that worked before the change must s
     expect(res.isError, 'the compatibility shim is still accepted, not rejected as unknown').toBe(false);
     expect(calls, 'and it still reaches the tab').toHaveLength(1);
     const input = calls[0].args[0] as Record<string, any>;
-    expect(input?.url, 'filePath is still translated to a loopback bridge URL').toMatch(/^http:\/\/127\.0\.0\.1:\d+\/file\?path=/);
+    expect(input?.url, 'filePath is still translated to a loopback bridge URL').toMatch(/^http:\/\/localhost:\d+\/file\?path=/);
     expect(input?.filePath, 'the shim key is still stripped before relay').toBeUndefined();
     expect(input?.fileName).toBe('design.fp');
   });

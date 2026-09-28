@@ -13,6 +13,7 @@
 
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { startBridgeServer } from './bridgeServer';
+import { BRIDGE_URL_HOST } from './bridgeHost';
 import { createMcpServer } from './mcpServer';
 import { fetchContract } from './contractFetch';
 import { fetchSkill } from './skillFetch';
@@ -94,7 +95,13 @@ async function main(): Promise<void> {
   const toolMode = resolveToolMode(argv);
   const bridge = await startBridgeServer(port !== undefined ? { port } : undefined);
 
-  console.error(`[figpea-mcp] bridge listening on 127.0.0.1:${bridge.port}`);
+  // REQ-1301: this line is not decoration — it is the anchor of the documented
+  // two-line paste (README "Mid-session pairing"), which the editor's
+  // `parsePairingFromPaste` parses (v3/src/agent/bridge/parsePairing.ts, step
+  // C). The host is `BRIDGE_URL_HOST`, the same spelling the bridge's emitted
+  // URLs use, so the host a user reads is the host their tab is served from.
+  // The parser accepts both this and the older `127.0.0.1` form.
+  console.error(`[figpea-mcp] bridge listening on ${BRIDGE_URL_HOST}:${bridge.port}`);
   console.error(`[figpea-mcp] pairing token: ${bridge.token}`);
   console.error('[figpea-mcp] open this URL in a browser to connect an editor tab:');
   console.error(`[figpea-mcp]   ${defaultConnectUrl(bridge.port, bridge.token)}`);

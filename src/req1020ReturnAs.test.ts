@@ -233,7 +233,7 @@ describe('REQ-1020 AC-7: the returned url is token-gated (blob alias)', () => {
     const res: any = await client.callTool({ name: 'canvas_screenshot', arguments: { returnAs: 'path' } as any });
     const payload = textPayload(res);
     expect(typeof payload.url).toBe('string');
-    expect(payload.url, 'url is a loopback blob URL').toMatch(/^http:\/\/127\.0\.0\.1:\d+\/blob\//);
+    expect(payload.url, 'url is a loopback blob URL').toMatch(/^http:\/\/localhost:\d+\/blob\//);
     const okRes = await fetch(payload.url);
     expect(okRes.status, 'correct token fetches').toBe(200);
     const badRes = await fetch(`http://127.0.0.1:${realBridge.port}/blob/req1020-not-a-real-token`);

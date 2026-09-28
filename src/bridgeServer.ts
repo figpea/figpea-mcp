@@ -14,6 +14,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import WebSocket, { WebSocketServer } from 'ws';
+import { BRIDGE_BIND_HOST, BRIDGE_URL_HOST } from './bridgeHost';
 import type { CallFrame, DescribeFrame } from './protocol';
 import { drillManifest, type DescribeFn, type DescribeResultPayload } from './describeDrill';
 import { sessionDirFor, removeSessionDir } from './returnPath';
@@ -172,7 +173,10 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
       res.end();
       return;
     }
-    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+    // REQ-1301: the parser *base*, not an emitted URL. Over HTTP/1.1 `Host` is
+    // always present, so the fallback is unreachable in normal traffic; it is
+    // the URL host constant only so this file cannot disagree with itself.
+    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? BRIDGE_URL_HOST}`);
     if (req.method === 'GET' && url.pathname === '/file') {
       const fp = url.searchParams.get('path');
       if (!fp) {
@@ -207,7 +211,10 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
   await new Promise<void>((resolve, reject) => {
     const onErr = (err: Error) => reject(err);
     httpServer.once('error', onErr);
-    httpServer.listen(options?.port ?? 0, '127.0.0.1', () => {
+    // REQ-1301: a rename, not a behaviour change — the bind stays IPv4-only
+    // loopback, which is a security property. See BRIDGE_BIND_HOST for why it
+    // does not follow the emitted URL host to `localhost`.
+    httpServer.listen(options?.port ?? 0, BRIDGE_BIND_HOST, () => {
       httpServer.removeListener('error', onErr);
       resolve();
     });
@@ -446,14 +453,14 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
       });
     },
     getFileUrl(filePath: string): string {
-      return `http://127.0.0.1:${port}/file?path=${encodeURIComponent(filePath)}`;
+      return `http://${BRIDGE_URL_HOST}:${port}/file?path=${encodeURIComponent(filePath)}`;
     },
     registerBlob(filePath: string): string {
       const tok = crypto.randomUUID();
       blobMap.set(tok, filePath);
       // simple expiry after 5 min
       setTimeout(() => blobMap.delete(tok), 5 * 60 * 1000).unref?.();
-      return `http://127.0.0.1:${port}/blob/${tok}`;
+      return `http://${BRIDGE_URL_HOST}:${port}/blob/${tok}`;
     },
     async close(): Promise<void> {
       rejectAllPending(new Error('figpea-mcp bridgeServer: server closed'));

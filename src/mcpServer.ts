@@ -21,6 +21,13 @@ import {
   type McpContentBlockLike,
 } from './tools';
 import { writeImageReturn, sessionDirFor } from './returnPath';
+// REQ-1301 — the one place the loopback host is decided. Imported from a
+// neutral module (not from ./bridgeServer) so this file's structural stub seam
+// stays a stub seam: `cli.ts` always passes the real handle, which defines
+// `getFileUrl`, so the two fallbacks below are a *consistency* backstop for a
+// handle that omits it — not a path production traffic takes. They use the
+// constant so a fallback can never disagree with the canonical host again.
+import { BRIDGE_URL_HOST } from './bridgeHost';
 import { groupNamesFromCompactIndex } from './describeDrill';
 import { findArgShapeMismatch, renderSchemaExample } from './argShape';
 // REQ-1280 — the single `_rawJson` implementation, called by BOTH relay paths
@@ -777,7 +784,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         const toolName = `${group}_${method}`;
         const toBridgeUrl = (filePath: string): string => {
           if (bridge.getFileUrl) return bridge.getFileUrl(filePath);
-          return `http://127.0.0.1:${bridge.port}/file?path=${encodeURIComponent(filePath)}`;
+          return `http://${BRIDGE_URL_HOST}:${bridge.port}/file?path=${encodeURIComponent(filePath)}`;
         };
         const isValidFile = async (fp: string): Promise<boolean> => {
           try {
@@ -1253,7 +1260,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       // Helper to validate a local path and return bridge URL or error payload
       const toBridgeUrl = (filePath: string): string => {
         if (bridge.getFileUrl) return bridge.getFileUrl(filePath);
-        return `http://127.0.0.1:${bridge.port}/file?path=${encodeURIComponent(filePath)}`;
+        return `http://${BRIDGE_URL_HOST}:${bridge.port}/file?path=${encodeURIComponent(filePath)}`;
       };
       const isValidFile = async (fp: string): Promise<boolean> => {
         try {
