@@ -245,4 +245,24 @@ describe('README.md (AC-5)', () => {
     );
     expect(readme, 'the bind staying IPv4-only is called out so it is not widened').toMatch(/IPv4-only|not widened|stays IPv4/i);
   });
+
+  // REQ-1309 T5 — the rot-guard for the third pre-flight, and the one that
+  // costs the most when it rots: a package user hitting `invalid_transform`
+  // has to be able to READ the rule, not merely be told the call failed. The
+  // pinning is deliberately specific — the CODE, the SOURCE of the applicable
+  // set, and the before-the-round-trip claim are the three facts that go stale
+  // first. Pinning only the word "props" would pass against a paragraph that
+  // had quietly gone vague.
+  it('documents that a prop which does not apply to the kind is refused before the tab is reached (REQ-1309)', () => {
+    expect(readme, "the editor's own code is documented").toContain('invalid_transform');
+    expect(readme, 'the method it applies to is named').toContain('layer_create');
+    // The rule is read from the manifest, not from a list baked into this
+    // package — that is the whole reason a future kind needs no edit here.
+    expect(readme, "the applicable set is documented as the manifest's own derivation").toContain('params.props.shape');
+    expect(readme, 'and as merged with the per-kind entry').toContain('byKind[kind]');
+    expect(readme, 'the refusal is documented as happening before the tab is reached').toMatch(
+      /before the (call reaches the )?(editor|tab)/i,
+    );
+    expect(readme, 'and as costing no tab round trip').toMatch(/round trip/i);
+  });
 });

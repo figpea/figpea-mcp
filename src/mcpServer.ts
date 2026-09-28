@@ -29,7 +29,7 @@ import { writeImageReturn, sessionDirFor } from './returnPath';
 // constant so a fallback can never disagree with the canonical host again.
 import { BRIDGE_URL_HOST } from './bridgeHost';
 import { groupNamesFromCompactIndex } from './describeDrill';
-import { findArgShapeMismatch, renderSchemaExample } from './argShape';
+import { findArgShapeMismatch, findKindPropMismatch, renderSchemaExample } from './argShape';
 // REQ-1280 — the single `_rawJson` implementation, called by BOTH relay paths
 // (full mode's contract handler and compact mode's `figpea_call`) so they
 // cannot drift (AC-7).
@@ -961,10 +961,52 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             return toCallToolResult(
               resultToContent({
                 ok: false,
-                code: 'invalid_params',
+                code: mismatch.code ?? 'invalid_params',
                 message:
                   `${toolName}: ${mismatch.path} must be ${mismatch.expected}, but it arrived as ${mismatch.got}. ` +
                   `${mismatch.hint} ` +
+                  `Expected ${toolName} args: [${expectedArgs}]. ` +
+                  `Learn the exact shape first: figpea_describe({group:"${group}", method:"${method}"}).`,
+              }),
+            );
+          }
+          // REQ-1309 T4 — the PER-KIND prop rule, same placement as the wire
+          // shape above (after the filePath translation, after the `_rawJson`
+          // verdict, after coercion, before the round trip) and calling the
+          // SAME message wrapper, so an agent that trips either pre-flight
+          // reads one sentence grammar. It carries its own code — the editor's
+          // `invalid_transform`, relayed rather than invented — which is why
+          // the wrapper reads `mismatch.code ?? 'invalid_params'` instead of
+          // hardcoding one code for two rules.
+          //
+          // `values` is keyed by param name and built from the COERCED array,
+          // which is what makes the verdict the tab's own: `coerceValue` never
+          // rebuilds an object from schema keys, so the post-coercion props
+          // are byte-for-byte the object the tab would have been handed.
+          const kindValues: Record<string, unknown> = {};
+          for (let i = 0; i < contractTool.inputKeys.length; i++) {
+            const key = contractTool.inputKeys[i];
+            if (key !== undefined) kindValues[key] = effectiveArgs[i];
+          }
+          const kindMismatch = findKindPropMismatch(
+            contractTool.paramSchemas,
+            kindValues,
+            (name) => `args[${contractTool.inputKeys.indexOf(name)}]`,
+          );
+          if (kindMismatch) {
+            const expectedArgs = contractTool.inputKeys
+              .map((k, idx) => {
+                const sch = contractTool.paramSchemas?.[k];
+                return sch ? renderSchemaExample(sch) : '…';
+              })
+              .join(', ');
+            return toCallToolResult(
+              resultToContent({
+                ok: false,
+                code: kindMismatch.code ?? 'invalid_params',
+                message:
+                  `${toolName}: ${kindMismatch.path} must be ${kindMismatch.expected}, but it arrived as ${kindMismatch.got}. ` +
+                  `${kindMismatch.hint} ` +
                   `Expected ${toolName} args: [${expectedArgs}]. ` +
                   `Learn the exact shape first: figpea_describe({group:"${group}", method:"${method}"}).`,
               }),
@@ -1422,6 +1464,31 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         const schema = tool?.paramSchemas?.[key];
         return coerceValue(raw, schema);
       });
+      // REQ-1309 T4 — the SAME per-kind prop rule the compact lane runs, at
+      // the SAME point in the pipeline: after the `filePath`→bridge-URL
+      // translation, after the `_rawJson` verdict, after coercion, and before
+      // the round trip. This lane had no shape pre-flight of any kind until
+      // now, and it is the lane real MCP clients actually use — wiring only the
+      // compact one would satisfy the requirement's example in one calling
+      // convention and keep billing the round trip in the other.
+      //
+      // `pathFor` is the bare param name because that is how this lane names
+      // things: the caller wrote `{kind, props}`, not `args[1]`.
+      const kindValues: Record<string, unknown> = {};
+      for (let i = 0; i < inputKeys.length; i++) kindValues[inputKeys[i]] = args[i];
+      const kindMismatch = findKindPropMismatch(tool?.paramSchemas, kindValues, (name) => name);
+      if (kindMismatch) {
+        return toCallToolResult(
+          resultToContent({
+            ok: false,
+            code: kindMismatch.code ?? 'invalid_params',
+            message:
+              `${toolName}: ${kindMismatch.path} must be ${kindMismatch.expected}, but it arrived as ${kindMismatch.got}. ` +
+              `${kindMismatch.hint} ` +
+              `Learn the exact shape first: figpea_describe({group:"${groupName}", method:"${methodName}"}).`,
+          }),
+        );
+      }
       try {
         const result = (await bridge.callTab(groupName, methodName, args, effectiveTimeoutMs)) as FigpeaCallResultLike;
         return toCallToolResult(resultToContent(result, returnAsOpts(bridge, toolName, resolvedReturnAs.mode)));
