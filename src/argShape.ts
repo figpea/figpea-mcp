@@ -115,6 +115,37 @@ function isSingleKeyEnvelope(value: Record<string, unknown>): boolean {
   return keys.length === 1 && keys[0] === 'item';
 }
 
+/** Is this value a string whose trimmed form is `{…}`- or `[…]`-wrapped — the
+ *  single narrow guard REQ-1318's Rule C fires on. Deliberately the same
+ *  predicate `rawJson.ts`'s `parseRawJsonValue` uses, so the pre-flight and the
+ *  parse it precedes can never disagree about what "JSON-looking" means. */
+function looksLikeJsonLiteral(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  return (trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'));
+}
+
+/** The one route that survives a collapsing host, appended to a hint that
+ *  would otherwise be a dead end (REQ-1318, AC-4).
+ *
+ *  The envelope hint names the mistake and the fix for an agent whose host is
+ *  well-behaved — but the whole reason the envelope arrived is that the host is
+ *  NOT well-behaved, and such a host may not survive being told to send a real
+ *  nested array. The one thing it cannot damage is a SCALAR. So the hint now
+ *  ends with the route this server actually implements: a structured parameter
+ *  may travel as a JSON string, and the server parses it.
+ *
+ *  A payload to copy rather than an abstract rule — the REQ-1268 idiom, because
+ *  an agent left to construct the escaping itself will get it wrong. */
+function jsonStringEscapeHatch(): string {
+  const payload = '[{"method":"create","args":["rect",{"rwidth":100}]}]';
+  return (
+    ' Or send it as a JSON string — a string is a scalar, which no host collapses — and this server will parse it, e.g. ' +
+    JSON.stringify(payload) +
+    '. figpea_describe({group, method}) lists this method\'s own string-capable params as stringJsonParams.'
+  );
+}
+
 /**
  * Finds the FIRST shape mismatch between `value` and the declared `schema`,
  * or `undefined` when the value is consistent with it.
@@ -139,6 +170,38 @@ export function findArgShapeMismatch(
   if (budget.nodes++ > MAX_NODES) return undefined;
   if (!schema) return undefined;
 
+  // REQ-1318 Rule C — the STRINGIFIED case, which until now was a dead end: a
+  // string is not a plain object, so Rule A/B never saw it, the value reached
+  // the tab, and the agent got the editor's bare `props must be object (got
+  // string)` — naming neither remedy, one wasted round trip later.
+  //
+  // ⛔ WHY THE GUARD IS THIS NARROW, and why firing on ANY string at a
+  // structured position would be rejected rather than merely narrowed. By the
+  // time this pre-flight runs, the server's schema-scoped parse has ALREADY
+  // parsed every JSON-looking string at a structured position it could rescue.
+  // So the only strings left here are ones the escape hatch could not fix:
+  // malformed (`"{name: 'x'}"`, truncated JSON) or shape-mismatched
+  // (`"[1,2,3]"` at an object position). A value that does not LOOK like JSON
+  // is left to the tab, exactly as today — refusing it would invent a
+  // pre-flight rejection class with a false-rejection risk the editor does not
+  // have, and a false rejection is the expensive direction.
+  //
+  // Both routes are named, because for a malformed payload the real object is
+  // a fix and the JSON string is not, and for a shape-mismatched one the
+  // reverse — the agent needs to know which it has before it retries.
+  if (looksLikeJsonLiteral(value) && (schema.type === 'object' || isArraySchema(schema))) {
+    return {
+      path,
+      expected: describeSchema(schema),
+      got: describeValue(value),
+      hint:
+        `Send a real ${describeSchema(schema)} at this position, or send a JSON string and this server will parse it for you. ` +
+        `The string arrived unparsed, so it is either not valid JSON or it parses to the wrong kind for a parameter declared ${describeSchema(schema)} — ` +
+        jsonStringEscapeHatch() +
+        `Offending value: ${value}.`,
+    };
+  }
+
   if (isArraySchema(schema)) {
     if (isPlainObject(value)) {
       const envelope = isSingleKeyEnvelope(value);
@@ -147,8 +210,8 @@ export function findArgShapeMismatch(
         expected: describeSchema(schema),
         got: describeValue(value),
         hint: envelope
-          ? `Your host collapsed a nested array into a single-key {"item": …} envelope. ${schema.type === 'array' ? 'Pass the array itself — an array of ' + describeSchema(schema.of) + '.' : ''} Never wrap an array in an object.`
-          : `${schema.type === 'array' ? 'This parameter is an array' : 'This parameter is an array of numbers'} and it arrived as an object. Pass the array itself, positionally, with no wrapper key.`,
+          ? `Your host collapsed a nested array into a single-key {"item": …} envelope. ${schema.type === 'array' ? 'Pass the array itself — an array of ' + describeSchema(schema.of) + '.' : ''} Never wrap an array in an object.${jsonStringEscapeHatch()}`
+          : `${schema.type === 'array' ? 'This parameter is an array' : 'This parameter is an array of numbers'} and it arrived as an object. Pass the array itself, positionally, with no wrapper key.${jsonStringEscapeHatch()}`,
       };
     }
     if (Array.isArray(value) && schema.of) {

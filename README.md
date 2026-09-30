@@ -111,6 +111,17 @@ By default `figpea-mcp` runs in **compact mode** — only 5 tools (`open_editor`
 
 **Nesting rule.** `args` is the positional array in the method's own parameter order. When a parameter is itself an array — `layer.batch`'s `ops` is the one that bites — that parameter goes in as **one element of `args`**, and the element is an array of `{method, args}` ops. Each op's `args` is a positional array as well. So `ops` is `[[{…}]]`, never `{ops: […]}` and never `{"item": […]}` (the latter is what some host harnesses produce when they collapse a nested array; `figpea_call` answers that with an `invalid_params` naming the path and the expected shape, without spending a tab round trip). When in doubt, call `figpea_describe({ group: "layer", method: "batch" })` first — it returns the authoritative shape from the manifest.
 
+**If your harness cannot send a nested object or array.** Some host harnesses serialise nested arrays into `{"item": …}` envelopes, and one that does that may not survive being told to send a real nested array. The one thing such a host cannot damage is a **scalar** — so any parameter the method declares as an `object`, `array` or `matrix` may be sent as a **JSON string** instead, and this server parses it before the round trip. **No flag is required**, and a string position is never touched, so `setName(id, "[Hero]")` is still the name `[Hero]`:
+
+```json
+// the batch above, as one string — note the escaped quotes
+{ "group": "layer", "method": "batch", "args": ["[{\"method\":\"create\",\"args\":[\"page\",{\"name\":\"probe\",\"pageWidth\":100,\"pageHeight\":100}]}]"] }
+{ "group": "layer", "method": "setTransform", "args": ["L_rect", "[1,0,0,1,0,0]"] }
+{ "group": "layer", "method": "create", "args": ["line", "{\"x\":0,\"y\":0,\"style\":{\"dashArray\":[4,4]}}"] }
+```
+
+A string that does not parse, or that parses to the wrong kind for its declared type, is **refused before the round trip** with an `invalid_params` naming the position and both ways out — never silently forwarded. `figpea_describe({ group, method })` lists this method's own string-capable params under `stringJsonParams`, derived from the manifest, so you do not have to guess.
+
 - `group` (string, required) — contract group name (`layer`, `canvas`, `session`, `export`, `history`).
 - `method` (string, required) — method within the group (`create`, `screenshot`, `openFile`, …).
 - `args` (array, optional, defaults to `[]`) — positional arguments for that method, in the order `describe()` lists them.
@@ -169,7 +180,12 @@ It works on **both** tool modes, on the two different surfaces each mode gives y
 - **Full mode** — a top-level param of any generated tool: `figpea_layer_create({ "kind": "page", "props": "{\"pageWidth\":1500}", "_rawJson": true })` parses `props`.
 - **Compact mode (the default)** — any **element** of `figpea_call`'s positional `args` array, including nested payloads like a `layer.batch` ops array: `figpea_call({ "group": "layer", "method": "batch", "args": ["[{\"method\":\"create\",\"args\":[\"rect\",{\"rwidth\":100}]}]"], "_rawJson": true })` delivers `ops` as a real array, so the whole batch arrives in one call.
 
-It is opt-in: without `_rawJson` a stringified object or array is forwarded as the plain string it is, and the editor rejects it. If a value *looks* like JSON but cannot be parsed, and the parameter is declared an `object` or an array, the call is refused up front with `invalid_params` naming `_rawJson` and the parameter, instead of being silently forwarded — so the flag never lies about having been honoured. The server also coerces string numerics inside objects/arrays to numbers defensively (harness stringification tolerance) without requiring `_rawJson`.
+It is **opt-in**, and deliberately so. It is the **broader but schema-blind** route: it parses any element that looks like JSON, with no manifest lookup, which is what makes it usable on a first call before anything has been described — and also what makes it unsafe as a default, since a schema-blind parse would rewrite a legitimate string. So there are **two routes**, and the narrower one is the default:
+
+- **No flag (the default)** — a parameter the manifest **declares** as an `object`/`array`/`matrix` may travel as a JSON string, and the server parses it. Schema-scoped, so a `string`-declared value is provably never touched. This is the route to reach for when you know the method.
+- **`_rawJson: true`** (opt-in) — the broader, schema-blind route above, for when you do not: an unknown method, or a parameter this build of the manifest does not declare as structured. With no declaration there is nothing to scope a parse to, so the flag is what makes the value usable.
+
+If a value *looks* like JSON but cannot be parsed, and the parameter is declared an `object` or an array, the call is refused up front with `invalid_params` naming `_rawJson` and the parameter, instead of being silently forwarded — so the flag never lies about having been honoured. The server also coerces string numerics inside objects/arrays to numbers defensively (harness stringification tolerance) without requiring `_rawJson`.
 
 ## Security model
 

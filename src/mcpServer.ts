@@ -32,7 +32,14 @@ import { findArgShapeMismatch, findKindPropMismatch, renderSchemaExample } from 
 // REQ-1280 — the single `_rawJson` implementation, called by BOTH relay paths
 // (full mode's contract handler and compact mode's `figpea_call`) so they
 // cannot drift (AC-7).
-import { isRawJsonFlag, applyRawJson, rawJsonFailureMessage } from './rawJson';
+import {
+  isRawJsonFlag,
+  applyRawJson,
+  applyStructuredStringJson,
+  rawJsonFailureMessage,
+  expectsStructuredValue,
+  type RawJsonSchemaLike,
+} from './rawJson';
 import { resolveTimeoutMs } from './callTimeout';
 // REQ-1283 — the single extension-preserving name resolver, called by BOTH
 // relay paths (compact `figpea_call` and full mode's `session_openFile`) for
@@ -409,6 +416,36 @@ function buildInputShape(tool: GeneratedTool): z.ZodType {
 }
 
 /**
+ * REQ-1318 — the params of one method that may be sent as a JSON STRING,
+ * because the server parses it before the round trip.
+ *
+ * ⛔ DERIVE, NEVER ENUMERATE, for the REQ-1309 reason: a hard-coded method or
+ * param list is a drift generator that the very next contract change has to
+ * come back and edit. So this walks the descriptor's OWN declared params and
+ * asks the same `expectsStructuredValue` predicate the parse itself is gated
+ * on — which is the point. The list `figpea_describe` advertises and the list
+ * the server acts on are the same predicate, so they cannot disagree.
+ *
+ * A legacy free-text manifest's params are hint STRINGS, not schemas, so they
+ * are skipped and the caller omits the key entirely: with nothing structured
+ * declared, there is no string-capable param to advertise, and an empty list
+ * would read as "this method has none" rather than "this server cannot tell".
+ *
+ * Pure and module-level so it is testable in isolation, like `argShape.ts`'s
+ * rules — which is the only honest way to pin "no method and no param is named
+ * in here" without pinning prose.
+ */
+export function structuredParamNames(descriptor: { params?: unknown } | undefined): string[] {
+  const params = descriptor?.params as Record<string, unknown> | undefined;
+  if (!params || typeof params !== 'object') return [];
+  const names: string[] = [];
+  for (const [name, schema] of Object.entries(params)) {
+    if (expectsStructuredValue(schema as RawJsonSchemaLike)) names.push(name);
+  }
+  return names;
+}
+
+/**
  * Builds the `McpServer` for a bridge: `open_editor` + `status` are always
  * registered (OQ-4); contract tools are registered/updated from the bridge's
  * live `describe()` manifest on every connect/reconnect.
@@ -522,7 +559,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       'figpea_describe',
       {
         description:
-          "Returns the agent contract surface for a group or method — the same doc/params/result the editor's own describe() returns, served from the manifest this server already holds in memory (no round trip to the tab). Call it with no arguments for the group index, {group} for one group's methods, or {group, method} for one method's wire shape. In compact mode this is how you learn a method's argument shape instead of probing: e.g. figpea_describe({group:'layer', method:'batch'}) returns the ops shape, whose args is a POSITIONAL array of {method, args} ops.",
+          "Returns the agent contract surface for a group or method — the same doc/params/result the editor's own describe() returns, served from the manifest this server already holds in memory (no round trip to the tab). Call it with no arguments for the group index, {group} for one group's methods, or {group, method} for one method's wire shape. In compact mode this is how you learn a method's argument shape instead of probing: e.g. figpea_describe({group:'layer', method:'batch'}) returns the ops shape, whose args is a POSITIONAL array of {method, args} ops. A per-method response also carries stringJsonParams: the names of THIS method's params you may send as a JSON string instead of a real object/array, because the server parses them before the round trip (e.g. [\"[{\\\"method\\\":\\\"create\\\",\\\"args\\\":[\\\"rect\\\",{\\\"rwidth\\\":100}]}]\"] for ops). The key is absent when the method declares no such param, and it is derived from the manifest, so it is right for any method without this description being updated.",
         inputSchema: {
           group: z.string().optional().describe("Contract group name (e.g. layer, canvas, session, export). Omit for the index of all groups."),
           method: z.string().optional().describe('Method name within the group (e.g. create, batch). Requires group.'),
@@ -564,7 +601,28 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
                 message: `Unknown method "${group}.${method}". Known methods in ${group}: ${Object.keys(methods).join(', ')}`,
               });
             }
-            return jsonTextResult({ ok: true, group, method, ...descriptor });
+            // REQ-1318 (AC-7) — the additive key. An agent deciding HOW to
+            // encode a value needs to know, at the moment it decides, which of
+            // this method's params may travel as a JSON string; today the only
+            // way to learn that is to try it and read an error. Derived from
+            // the descriptor's own declared params by the same predicate the
+            // parse is gated on, so the advertised list and the acted-on list
+            // cannot drift. Absent when empty (a method with nothing
+            // structured, or a legacy free-text manifest with no schemas at
+            // all) rather than sent as `[]`, which would read as "this method
+            // has none" instead of "this server cannot tell".
+            //
+            // Everything the editor documented is spread through untouched
+            // below — this server does not restate the editor's docs, it only
+            // adds the one fact the manifest itself cannot express.
+            const stringJson = structuredParamNames(descriptor);
+            return jsonTextResult({
+              ok: true,
+              group,
+              method,
+              ...(stringJson.length > 0 ? { stringJsonParams: stringJson } : {}),
+              ...descriptor,
+            });
           }
           return jsonTextResult({ ok: true, group, methods });
         }
@@ -638,6 +696,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
   }
 
   // REQ-1018 — figpea_call dispatcher (compact mode only)
+
   if (toolMode === 'compact') {
     server.registerTool(
       'figpea_call',
@@ -674,12 +733,12 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             .array(z.any())
             .optional()
             .describe(
-              'Positional arguments for the method, in that method\'s own parameter order (defaults to []). When a parameter is itself an array (e.g. layer.batch\'s ops), pass it as ONE element of args — that element is an array of {method, args} ops, e.g. [[{method:"create", args:["rect",{rwidth:100}]}]]. Each op\'s args is an array too, never an object.',
+              'Positional arguments for the method, in that method\'s own parameter order (defaults to []). When a parameter is itself an array (e.g. layer.batch\'s ops), pass it as ONE element of args — that element is an array of {method, args} ops, e.g. [[{method:"create", args:["rect",{rwidth:100}]}]]. Each op\'s args is an array too, never an object. If your harness cannot send a nested object or array, any param the method declares as an object/array may instead be sent as a JSON string with no flag, and this server parses it before the round trip — e.g. "args":["[{\"method\":\"create\",\"args\":[\"rect\",{\"rwidth\":100}]}]"]. A string is a scalar, so nothing collapses it; figpea_describe({group, method}) lists which of this method\'s params accept that as stringJsonParams.',
             )
             .meta({
               type: 'array',
               description:
-                'Positional argument array, in the method\'s own parameter order. An array-typed parameter (e.g. layer.batch\'s ops) is passed as ONE element of args, and that element is itself an array of {method, args} ops — e.g. [[{method:"create", args:["rect",{rwidth:100}]}]]. Each op\'s args is an array, never an object.',
+                'Positional argument array, in the method\'s own parameter order. An array-typed parameter (e.g. layer.batch\'s ops) is passed as ONE element of args, and that element is itself an array of {method, args} ops — e.g. [[{method:"create", args:["rect",{rwidth:100}]}]]. Each op\'s args is an array, never an object. If your harness cannot send a nested object or array, any param the method declares as an object/array may instead be sent as a JSON string with no flag, and this server parses it before the round trip — e.g. "args":["[{\"method\":\"create\",\"args\":[\"rect\",{\"rwidth\":100}]}]"]. A string is a scalar, so nothing collapses it; figpea_describe({group, method}) lists which of this method\'s params accept that as stringJsonParams.',
             }),
           // REQ-1282 AC-5 — the advice an agent needs at the moment it decides
           // whether to pass this at all, carried in BOTH halves for the reason
@@ -708,7 +767,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             .any()
             .optional()
             .describe(
-              'Set _rawJson:true on your figpea_call when your harness STRINGIFIED an object or array argument: every element of args that is a string whose trimmed form starts with { or [ and ends with } or ] is JSON-parsed before it reaches the editor, e.g. {"group":"layer","method":"create","args":["page","{\\"name\\":\\"probe\\",\\"pageWidth\\":300,\\"pageHeight\\":200}"],"_rawJson":true}. Omit it and a stringified object/array is forwarded as the string it is and the editor rejects it. If a value looks like JSON but cannot be parsed, and its parameter is declared an object/array, the call is refused by name (invalid_params) instead of being forwarded — nothing is silently ignored.',
+              'Set _rawJson:true on your figpea_call when your harness STRINGIFIED an object or array argument AND the method is unknown or the parameter is not declared as an object/array in the manifest this server holds: every element of args that is a string whose trimmed form starts with { or [ and ends with } or ] is JSON-parsed before it reaches the editor, e.g. {"group":"layer","method":"create","args":["page","{\\"name\\":\\"probe\\",\\"pageWidth\\":300,\\"pageHeight\\":200}"],"_rawJson":true}. NOTE you usually do NOT need this: a param the method DECLARES as an object/array is parsed with no flag at all, which is safer because it only ever touches a value the manifest says was meant to be structured. This flag\'s parse is deliberately schema-blind so it works on a first call with no manifest, which is exactly why it stays opt-in rather than becoming the default. If a value looks like JSON but cannot be parsed, and its parameter is declared an object/array, the call is refused by name (invalid_params) instead of being forwarded — nothing is silently ignored.',
             ),
           returnAs: z.any().optional().describe('Reserved: "inline" (default) or "path" — "path" writes a binary result to a session file and returns {ok, path, mime, width, height, bytes, filename?, url} as text, so a non-image export (e.g. a native .fp project) never crosses the wire as base64'),
         }),
@@ -797,8 +856,36 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         // merged into `args`, so it cannot reach the tab — there is no strip
         // statement to add here, and adding one would be a lie about a leak
         // that cannot happen.
+        //
+        // REQ-1318 — the LOOKUP is hoisted above the translation block because
+        // the flag-LESS branch beside it needs the declared schema, and the
+        // schema is the only thing that can make a parse safe to do by
+        // default. Nothing else moved: `contractToolFor` is a memoised pure
+        // lookup on `activeManifest` (contractIndex is rebuilt only when the
+        // manifest identity changes), and the `if (contractTool)` block below
+        // and every statement in it are exactly where they were.
+        const contractTool = contractToolFor(group, method);
         if (rawJsonRequested) {
           args = applyRawJson(args, { schemaAt: () => undefined, pathAt: (i) => `args[${i}]` }).value;
+        } else if (contractTool) {
+          // REQ-1318 — a structured parameter may travel as a JSON string,
+          // with NO flag. Same placement as the flag's step 1, for the same
+          // reason: before the file-path translation (a stringified
+          // `{"filePath":…}` must be parsed before the blocks below read it
+          // structurally), before `coerceValue` (so string numerics inside the
+          // parsed object still become real numbers), and before the REQ-1296
+          // arity check — provably harmless there, because `schemaAt(i)`
+          // yields `undefined` past the declared arity, so no surplus argument
+          // is ever parsed and the arity error still fires first.
+          //
+          // What it costs when no manifest is in memory: with nothing to say
+          // the value SHOULD have been structured, the route takes no opinion
+          // and the call forwards exactly as today (the published-npm
+          // standalone case — and the flag's remaining reason to exist).
+          args = applyStructuredStringJson(args, {
+            schemaAt: (i) => contractTool.paramSchemas?.[contractTool.inputKeys[i] ?? ''],
+            pathAt: (i) => `args[${i}]${contractTool.inputKeys[i] ? ` (${contractTool.inputKeys[i]})` : ''}`,
+          }).value;
         }
 
         // Remove reserved keys so they never leak
@@ -904,7 +991,6 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         // translation above (so a translated bridge URL is never re-coerced)
         // and BEFORE the round trip (so a coercion problem costs no bridge
         // call). Same `coerceValue`, same positional mapping as full mode.
-        const contractTool = contractToolFor(group, method);
         if (contractTool) {
           // REQ-1296 D4 (AC-3) — the SURPLUS POSITIONAL argument, the second
           // spelling of the very same defect and the one the loop below used
@@ -1460,23 +1546,32 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           );
         }
       } else {
-        // Auto-parse heuristic even without flag: schema expects object/array/matrix but received JSON string
-        for (const key of inputKeys) {
-          const v = (effectiveRawArgs as any)[key];
-          if (typeof v !== 'string') continue;
-          const schema = tool?.paramSchemas?.[key];
-          if (!schema) continue;
-          const expectsStructured = schema.type === 'object' || schema.type === 'array' || schema.type === 'matrix';
-          if (!expectsStructured) continue;
-          const trimmed = v.trim();
-          if (!((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']')))) continue;
-          try {
-            const parsed = JSON.parse(trimmed);
-            if (typeof parsed !== 'object' || parsed === null) continue;
-            if (schema.type === 'matrix' && Array.isArray(parsed)) (effectiveRawArgs as any)[key] = parsed;
-            else if (schema.type === 'array' && Array.isArray(parsed)) (effectiveRawArgs as any)[key] = parsed;
-            else if (schema.type === 'object' && !Array.isArray(parsed)) (effectiveRawArgs as any)[key] = parsed;
-          } catch {}
+        // REQ-1318 T2 — the flag-less parse was an inline re-implementation of
+        // exactly the rule the shared module now owns, so it is REPLACED by a
+        // call to that same function rather than left to drift. This is a
+        // de-duplication, not a behaviour change: the inline loop's five guards
+        // (declared structured, so schema present, so JSON-looking, so it
+        // parses, so the shape matches) are the module's steps 1-3 one for one
+        // in the same order, and its swallowed `catch` is the module's
+        // `if (!parsed.ok) continue` — silent in both, because a failed parse
+        // is left exactly as sent and the editor is what names it.
+        //
+        // `keys: inputKeys` is load-bearing for the same reason it is on the
+        // flag branch above: the loop visits the DECLARED positions in order,
+        // which is what makes `schemaAt`/`pathAt` line up, and it keeps the
+        // reserved keys (`_rawJson`/`_timeoutMs`/`returnAs`) out of the parse.
+        //
+        // Position, scope and semantics are unchanged. In particular this lane's
+        // parse still runs AFTER the filePath translation, so a stringified
+        // `filePath` in full mode is still not translated — a pre-existing gap
+        // that belongs to REQ-1337, deliberately not moved here.
+        const applied = applyStructuredStringJson(effectiveRawArgs, {
+          keys: inputKeys,
+          schemaAt: (i) => tool?.paramSchemas?.[inputKeys[i] ?? ''],
+          pathAt: (i) => inputKeys[i] ?? `arg[${i}]`,
+        });
+        for (const [key, value] of Object.entries(applied.value)) {
+          (effectiveRawArgs as any)[key] = value;
         }
       }
       // Remove reserved keys so they never leak into coercion or logging of effective args

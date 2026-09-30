@@ -161,6 +161,90 @@ export function applyRawJson<T extends Record<string, unknown> | unknown[]>(
 }
 
 /**
+ * REQ-1318 — the ONE flag-less, SCHEMA-SCOPED parse, shared by both relay paths.
+ *
+ * The rule it implements, in one sentence: *a parameter whose declared schema
+ * is `object`, `array` or `matrix` may be sent as a JSON string; the server
+ * parses it before the round trip.* It is an ADDITION — every call that works
+ * today keeps working, because the gate is the declaration, not the value.
+ *
+ * ⛔ WHY THE GATE IS THE SCHEMA, and why that is the whole safety claim. A
+ * host harness that collapses nested arrays into `{"item": …}` envelopes is
+ * outside this repo, so the only route that survives it is a SCALAR — and a
+ * string is a scalar. But a schema-blind default would parse a legitimate
+ * value: `layer.setName(id, '[Hero]')` at a `string`-declared position is a
+ * NAME, and `setName(id, '[1,2,3]')` is a name too. Because step 1 asks the
+ * declaration first, a string at a `string`/`number`/`boolean` position — and
+ * any value at all where no declaration is reachable (a legacy free-text
+ * manifest, or compact mode with no manifest in memory) — is provably never
+ * touched. That is the difference from `_rawJson`, whose parse is deliberately
+ * schema-blind (REQ-1280's documented residual, owned by REQ-1338), and the
+ * reason the flag-less route is safe to make the DEFAULT while the flag stays
+ * opt-in.
+ *
+ * ⛔ PARSE AND USE, NEVER REPORT, NEVER REPAIR, NEVER THROW. A string that
+ * does not parse is left exactly as sent; a string that parses to the WRONG
+ * shape for its declaration is left exactly as sent. In both cases the value
+ * the pre-flight then sees is the one the agent sent, so it can name the
+ * position (`argShape.ts`'s Rule C) instead of this function quietly handing
+ * the tab a value of a DIFFERENT type than the agent believed it sent. The
+ * pre-flight is where a problem is reported; this function only makes a good
+ * value usable.
+ *
+ * Returns the SAME container (by identity) when nothing parsed, so the common
+ * path allocates nothing and no caller has to reason about a fresh copy — the
+ * same guarantee `applyRawJson` makes.
+ *
+ * `pathAt` is accepted for interface parity with `applyRawJson` and the two
+ * call sites' uniformity; this function has no failure to locate, because by
+ * construction it never reports one.
+ */
+export function applyStructuredStringJson<T extends Record<string, unknown> | unknown[]>(
+  container: T,
+  opts: ApplyRawJsonOptions,
+): { value: T } {
+  const isArray = Array.isArray(container);
+  const positions: Array<string | number> = isArray
+    ? (container as unknown[]).map((_, i) => i)
+    : (opts.keys ?? Object.keys(container as Record<string, unknown>)).slice();
+  const source = container as unknown as Record<string | number, unknown>;
+  // Copy-on-write, preserving the container's kind, for the same reason
+  // `applyRawJson` does it: a positional `args` array must stay an array.
+  let next: unknown[] | Record<string, unknown> | undefined;
+
+  for (let i = 0; i < positions.length; i++) {
+    // STEP 1 — the whole safety claim. Asked BEFORE the value is even looked
+    // at, so a legitimate string at a non-structured position is provably
+    // unreachable from here rather than merely unlikely to be affected.
+    const schema = opts.schemaAt(i);
+    if (!expectsStructuredValue(schema)) continue;
+
+    // STEP 2 — the single `JSON.parse` in this module, reused verbatim.
+    const original = source[positions[i]!];
+    const parsed = parseRawJsonValue(original);
+    if (!parsed.ok) continue; // a failed parse: leave the value exactly as sent
+    const value = parsed.value;
+    if (value === original) continue; // not a string, or not JSON-looking
+
+    // STEP 3 — the parsed value must match what was DECLARED, not merely be an
+    // object. `[1,2,3]` at an `object` position is left alone, so the pre-flight
+    // can say "you sent an array where an object was declared" instead of the
+    // tab receiving a value of a type the agent never chose.
+    const shapeMatches = schema!.type === 'object' ? !Array.isArray(value) : Array.isArray(value);
+    if (!shapeMatches) continue;
+
+    // STEP 4 — assign, copy-on-write.
+    if (next === undefined) {
+      next = isArray ? [...(container as unknown[])] : { ...(container as Record<string, unknown>) };
+    }
+    if (Array.isArray(next)) next[i] = value;
+    else next[positions[i] as string] = value;
+  }
+
+  return { value: (next ?? container) as T };
+}
+
+/**
  * The one message both handlers emit, so AC-7's byte-parity between the two
  * paths holds by construction rather than by two writers agreeing. Names the
  * flag, the position, and what to send instead.

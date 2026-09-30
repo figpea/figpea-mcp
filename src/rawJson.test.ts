@@ -243,19 +243,21 @@ describe('REQ-1280 — AC-7 structural guarantee', () => {
     const server = files.find(([f]) => f === 'mcpServer.ts')![1];
     // The handler READS the flag through the shared module…
     expect(count(server, 'isRawJsonFlag(')).toBeGreaterThanOrEqual(1);
-    // …and owns NO parse of its own on the flag's branch. The one
-    // `JSON.parse` still in mcpServer.ts is full mode's pre-existing FLAG-LESS
-    // auto-parse heuristic (the `else` sibling), which the card puts out of
-    // scope ("Full-mode behaviour") and the plan leaves untouched. (Other
-    // modules parse their own protocol payloads — bridge frames, the fetched
-    // contract — which is unrelated to the flag; only the flag's parse is
-    // load-bearing here, and it must not be forked.)
+    // …and owns NO parse of its own, on either branch. REQ-1280 pinned this at
+    // exactly 1 and named the survivor: full mode's pre-existing FLAG-LESS
+    // auto-parse heuristic, an inline loop the card then put out of scope.
+    // REQ-1318 de-duplicated that loop into the same shared module, so the
+    // count goes 1 → 0. STRICTLY STRONGER, not relaxed: after this the server
+    // owns no `JSON.parse` at all, on either lane, for either spelling of the
+    // flag. (Other modules parse their own protocol payloads — bridge frames,
+    // the fetched contract — which is unrelated; what must not be forked is a
+    // parse of a CALL's argument, and there is now none here.)
     const flagAt = server.indexOf('if (rawJsonFlag)');
     const elseAt = server.indexOf('} else {', flagAt);
     expect(flagAt).toBeGreaterThan(-1);
     expect(elseAt).toBeGreaterThan(flagAt);
     expect(count(server.slice(flagAt, elseAt), 'JSON.parse(')).toBe(0);
-    expect(count(server, 'JSON.parse(')).toBe(1);
+    expect(count(server, 'JSON.parse(')).toBe(0);
   });
 
   it('BOTH relay paths call that one implementation — the loop is not forked', async () => {
@@ -270,6 +272,37 @@ describe('REQ-1280 — AC-7 structural guarantee', () => {
     // (the schema is). This is the assertion that fails if either path ever
     // grows its own inline parse — the drift AC-7 exists to prevent.
     expect(count('applyRawJson(')).toBe(3);
+    // REQ-1318: the same anti-drift pin for the FLAG-LESS parse, at exactly TWO
+    // call sites — one per lane. Before this, full mode carried an inline
+    // re-implementation of the rule and compact mode carried none, which is
+    // precisely the drift. Two sites means both lanes adopted the shared
+    // function; three would mean one lane grew its own copy, and one would
+    // mean a lane silently stopped using it.
+    expect(count('applyStructuredStringJson(')).toBe(2);
+    // …and one per lane, provably: the compact one is inside `figpea_call`'s
+    // handler (beside the hoisted `contractToolFor`), the full-mode one in the
+    // `else` sibling of `if (rawJsonFlag)`.
+    const fullModeFlagBranch = server.indexOf('if (rawJsonFlag)');
+    const fullModeFlagless = server.indexOf('} else {', fullModeFlagBranch);
+    expect(fullModeFlagBranch).toBeGreaterThan(-1);
+    expect(fullModeFlagless).toBeGreaterThan(fullModeFlagBranch);
+    // Inside the flag branch: no, that is `applyRawJson`'s job.
+    expect(server.slice(fullModeFlagBranch, fullModeFlagless).includes('applyStructuredStringJson(')).toBe(false);
+    // In its `else` sibling: yes — the de-duplicated call.
+    expect(server.slice(fullModeFlagless, fullModeFlagless + 2000).includes('applyStructuredStringJson(')).toBe(true);
+    // And the compact lane adopted it beside the flag branch, before the
+    // file-path translation — the only place a parsed-then-translated payload
+    // is still correct. The ORDERING is the property worth pinning, not a
+    // character window: `session_openFile`/`layer_setImageFill`/`layer_create`
+    // read `args[0]`/`args[1]` as `{filePath}`, so a parse placed after them
+    // would leave a stringified `{"filePath":…}` untranslated.
+    const compactFlagless = server.indexOf('} else if (contractTool) {');
+    expect(compactFlagless).toBeGreaterThan(-1);
+    const compactCall = server.indexOf('applyStructuredStringJson(args, {');
+    expect(compactCall).toBeGreaterThan(compactFlagless);
+    const filePathTranslation = server.indexOf("toolName === 'session_openFile'");
+    expect(filePathTranslation).toBeGreaterThan(-1);
+    expect(compactCall, 'the compact flag-less parse runs BEFORE the file-path translation').toBeLessThan(filePathTranslation);
     // The flag test and the message builder are one per PATH, never per call.
     expect(count('isRawJsonFlag(')).toBe(2);
     expect(count('rawJsonFailureMessage(')).toBe(2);

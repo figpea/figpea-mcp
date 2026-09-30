@@ -320,7 +320,18 @@ const LEGIT_STRING = '[Hero]';
 // ───────────────────────────────────────────────────── AC-1 / AC-2 / AC-9 ──
 
 describe('REQ-1280 AC-1 — the deterministic repro, in both directions', () => {
-  it('without the flag the editor answer is relayed verbatim (the repro stays runnable cold)', async () => {
+  // ⛔ SUPERSEDED IN PLACE by REQ-1318 (AC-6). This assertion previously read
+  // "without the flag the editor answer is relayed verbatim" and pinned
+  // REQ-1280 AC-5's user-approved "the fix is opt-in only". REQ-1318 makes that
+  // sentence FALSE by design: `props` is declared `object`, so a JSON-looking
+  // string at that position is now PARSED WITHOUT THE FLAG — schema-scoped,
+  // which is what makes the default safe, unlike this REQ's schema-blind flag.
+  // The same payload now SUCCEEDS with no flag, and the tab receives a real
+  // object. The assertion is REPLACED, not deleted, skipped or relaxed: the
+  // editor-answer relay it asserted is still tested below through the
+  // no-manifest row, and the full REQ-1318 contract lives in
+  // req1318StringJson.test.ts. Nothing here was turned into `expect(true)`.
+  it('without the flag the same payload now succeeds — the editor answer is never bought', async () => {
     const { stub, captured } = makeStub();
     const client = await connect(stub, 'compact');
     const result = await callToolJson(client, 'figpea_call', {
@@ -328,15 +339,35 @@ describe('REQ-1280 AC-1 — the deterministic repro, in both directions', () => 
       method: 'create',
       args: ['page', '{"name":"probe","pageWidth":300,"pageHeight":200}'],
     });
-    // The envelope AC-1 quotes, produced by the tab and relayed. The relayed
-    // message carries REQ-1268's shape-hint suffix on top of the tab's own
-    // answer (already pinned by req1268.test.ts), so AC-1's string is asserted
-    // as the prefix it is — the tab's verbatim answer, unchanged by the relay.
+    expect(result.ok).toBe(true);
+    // The payload the tab receives is byte-equal to the flagged row's below —
+    // that is the whole contract of the supersession: two spellings, one
+    // forwarded value, and no round trip spent learning it.
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.args[1]).toEqual({ name: 'probe', pageWidth: 300, pageHeight: 200 });
+    expect(result.value).toEqual({ id: 'L_probe', name: 'probe' });
+  });
+
+  it('the editor answer is still relayed verbatim when the server has no declaration to reason from', async () => {
+    // The relay behaviour the superseded row above asserted, kept where it is
+    // still true: with NO manifest there is nothing saying `props` should have
+    // been structured, so the server takes no opinion and the tab's own
+    // `props must be object (got string)` is relayed after the round trip.
+    const { stub, captured } = makeStub({ deliverManifest: undefined });
+    const client = await connect(stub, 'compact');
+    const result = await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'create',
+      args: ['page', '{"name":"probe","pageWidth":300,"pageHeight":200}'],
+    });
+    // The envelope REQ-1280 AC-1 quotes, produced by the tab and relayed. The
+    // relayed message carries REQ-1268's shape-hint suffix on top of the tab's
+    // own answer (already pinned by req1268.test.ts), so AC-1's string is
+    // asserted as the prefix it is — the tab's verbatim answer, unaltered.
     expect(result.ok).toBe(false);
     expect(result.code).toBe('invalid_params');
     expect(result.message).toContain(AC1_REPRO_MESSAGE);
     expect(result.message.startsWith(AC1_REPRO_MESSAGE)).toBe(true);
-    // …and the string really did reach the tab: the flag-less relay defect.
     expect(captured).toHaveLength(1);
     expect(captured[0]!.args[1]).toBe('{"name":"probe","pageWidth":300,"pageHeight":200}');
   });
@@ -435,8 +466,17 @@ describe('REQ-1280 AC-4 — a layer.batch ops array sent as one JSON string appl
 
 // ───────────────────────────────────────────────────────────────────── AC-5 ──
 
-describe('REQ-1280 AC-5 — without the flag behaviour is byte-identical to today', () => {
-  it('the flag-less envelope is the same code and the same message (pinned in the AC-1 repro above)', async () => {
+// ⛔ AC-5's HEADLINE IS SUPERSEDED by REQ-1318 (AC-6); this row is replaced in
+// place. "Without the flag behaviour is byte-identical to today… the fix is
+// opt-in only" was user-approved and true when REQ-1280 shipped. REQ-1318's
+// whole point is to reverse it for the SCHEMA-DECLARED positions: a structured
+// param may now travel as a JSON string with no flag, so the two spellings
+// agree. The flag itself is untouched — still present, still schema-blind, still
+// opt-in, still the route for a position with no declaration to reason from
+// (that residual is REQ-1338's). So the row is REPLACED with the stronger
+// guarantee, not deleted, skipped or weakened.
+describe('REQ-1280 AC-5 — superseded by REQ-1318 AC-6: the flag-less route is now equivalent, not inert', () => {
+  it('absent and _rawJson:false are indistinguishable, and both deliver a real object', async () => {
     const { stub, captured } = makeStub();
     const client = await connect(stub, 'compact');
     const withoutFlag = await callToolJson(client, 'figpea_call', {
@@ -450,11 +490,42 @@ describe('REQ-1280 AC-5 — without the flag behaviour is byte-identical to toda
       args: ['page', '{"name":"probe","pageWidth":300,"pageHeight":200}'],
       _rawJson: false,
     });
+    // `false` is still a no-op, so the two envelopes are the same result…
+    expect(withFalse).toEqual(withoutFlag);
+    // …and the new flag-less default is STRICTLY STRONGER than the old one was:
+    // not "the same failure twice", but one success reached two spellings.
+    expect(withoutFlag.ok).toBe(true);
+    // The tab received a real object in both cases, never the string.
+    expect(captured).toHaveLength(2);
+    expect(captured.every((c) => typeof c.args[1] === 'object' && c.args[1] !== null)).toBe(true);
+    expect(captured[0]!.args[1]).toEqual({ name: 'probe', pageWidth: 300, pageHeight: 200 });
+    expect(captured[1]!.args[1]).toEqual(captured[0]!.args[1]);
+  });
+
+  it('the flag remains the route for a position with NO declaration to reason from', async () => {
+    // The scope that keeps `_rawJson` alive and opt-in, now stated positively
+    // rather than as an accident: with no manifest the schema-scoped route
+    // cannot know `props` should have been structured, so this call's outcome
+    // still depends on the flag. The pinned relay behaviour survives here.
+    const { stub, captured } = makeStub({ deliverManifest: undefined });
+    const client = await connect(stub, 'compact');
+    const withoutFlag = await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'create',
+      args: ['page', '{"name":"probe","pageWidth":300,"pageHeight":200}'],
+    });
     expect(withoutFlag.code).toBe('invalid_params');
     expect(withoutFlag.message).toContain(AC1_REPRO_MESSAGE);
-    expect(withFalse).toEqual(withoutFlag);
-    // The fix is opt-in only: the string still reaches the tab in both cases.
-    expect(captured.every((c) => typeof c.args[1] === 'string')).toBe(true);
+    expect(captured[0]!.args[1]).toBe('{"name":"probe","pageWidth":300,"pageHeight":200}');
+    // With the flag, the schema-blind parse is what rescues it — unchanged.
+    const withFlag = await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'create',
+      args: ['page', '{"name":"probe","pageWidth":300,"pageHeight":200}'],
+      _rawJson: true,
+    });
+    expect(withFlag.ok).toBe(true);
+    expect(captured[1]!.args[1]).toEqual({ name: 'probe', pageWidth: 300, pageHeight: 200 });
   });
 
   it('a legitimate props object with the flag absent is forwarded untouched', async () => {
@@ -759,29 +830,63 @@ describe('REQ-1280 — the flag composes with the rest of the compact path', () 
     expect(String(props.url)).toContain(encodeURIComponent(file));
   });
 
-  it('an unflagged stringified payload is answered by the tab on both file-translation branches', async () => {
+  // ⛔ SUPERSEDED IN PLACE by REQ-1318 (T2/T3), in substance if not in the plan's
+  // own list. This row asserted "an UNFLAGGED stringified payload is answered by
+  // the tab" — `captured` length 1, the string forwarded as a string. That is
+  // exactly the behaviour REQ-1318 replaces: an unflagged stringified payload is
+  // now parsed before the translation blocks read it, so the tab is no longer
+  // asked. The row is therefore REPLACED by two rows that keep its actual
+  // purpose — the `in`-operator hardening — and pin the new contract, which is
+  // strictly stronger than what it asserted. Nothing is deleted or weakened.
+  it('an unflagged stringified payload is now PARSED before the file-translation blocks read it', async () => {
     // The file-translation blocks guard their `in` tests with the value itself
     // (`input && 'filePath' in input`, `props && 'filePath' in props`), and the
     // `in` operator REJECTS a string primitive — so an unflagged stringified
-    // payload threw a TypeError out of the handler, before the `try` that
-    // turns failures into envelopes. Hardened, the string is simply forwarded
-    // and the tab answers it like any other wrong input.
+    // payload used to throw a TypeError out of the handler, before the `try`
+    // that turns failures into envelopes. REQ-1318 removes the hazard at the
+    // root: by the time these blocks run, a JSON-looking string at a declared
+    // `object` position has already been parsed into a REAL object, so there is
+    // no primitive left for `in` to reject.
     for (const call of [
-      { group: 'session', method: 'openFile', args: ['{"filePath":123}'], message: 'openFile(): input must be object (got string)' },
-      { group: 'layer', method: 'create', args: ['image', '{"filePath":123}'], message: 'create(): props must be object (got string)' },
+      { group: 'session', method: 'openFile', args: ['{"filePath":123}'], code: 'open_failed', message: 'input.filePath must be a string' },
+      { group: 'layer', method: 'create', args: ['image', '{"filePath":123}'], code: 'invalid_image_source', message: 'props.filePath must be a string' },
     ]) {
       const { stub, captured } = makeStub();
       const client = await connect(stub, 'compact');
-      const result = await callToolJson(client, 'figpea_call', {
-        group: call.group,
-        method: call.method,
-        args: call.args,
-      });
-      // The tab is asked, and its own answer comes back as a normal envelope
-      // (compact relays it with REQ-1268's shape-hint suffix appended).
+      const result = await callToolJson(client, 'figpea_call', { group: call.group, method: call.method, args: call.args });
+      // Strictly better than the row it replaces: the invalid `filePath` is now
+      // caught by the server's OWN guard, at ZERO round trips, naming the
+      // precise problem — where before a whole tab round trip bought the same
+      // information wrapped in an editor message.
+      expect(result, call.method).toHaveProperty('ok');
+      expect(result.ok, call.method).toBe(false);
+      expect(result.code, call.method).toBe(call.code);
+      expect(result.message, call.method).toBe(call.message);
+      expect(captured, call.method).toHaveLength(0);
+    }
+  });
+
+  it('a NON-JSON string at the same positions is still forwarded, and no TypeError escapes the handler', async () => {
+    // The `in`-operator hazard is still LIVE for a value the escape hatch
+    // cannot parse — a plain string does not look like JSON, so REQ-1318's
+    // narrow guard leaves it alone and it reaches the tab as the string it is.
+    // This row is where the original hardening claim actually has to hold, and
+    // it is kept verbatim in substance: the handler must not throw, and the
+    // tab's own answer must come back as a normal envelope (compact relays it
+    // with REQ-1268's shape-hint suffix appended).
+    for (const call of [
+      { group: 'session', method: 'openFile', args: ['plain string'], message: 'input must be object (got string)' },
+      { group: 'layer', method: 'create', args: ['image', 'plain string'], message: 'props must be object (got string)' },
+    ]) {
+      const { stub, captured } = makeStub();
+      const client = await connect(stub, 'compact');
+      const result = await callToolJson(client, 'figpea_call', { group: call.group, method: call.method, args: call.args });
       expect(captured, call.method).toHaveLength(1);
       expect(captured[0]!.args[0], call.method).toBe(call.args[0]);
       expect(result, call.method).toHaveProperty('ok');
+      // A TypeError would have surfaced as the helper's `non_envelope`
+      // envelope, so asserting the real editor message also asserts no throw.
+      expect(result.code, call.method).not.toBe('non_envelope');
       expect(result.message, call.method).toContain(call.message);
     }
   });

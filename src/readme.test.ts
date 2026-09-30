@@ -203,8 +203,46 @@ describe('README.md (AC-5)', () => {
     // The loud-failure behaviour is stated, not implied.
     expect(readme).toMatch(/invalid_params/);
     expect(readme, 'the refusal is documented as naming the flag').toMatch(/naming `_rawJson`|names `_rawJson`/);
-    // Opt-in-ness is stated, so the fix is not read as changing the default.
-    expect(readme).toMatch(/opt-in/i);
+    // ⛔ RE-POINTED by REQ-1318, and STRONGER than what it replaced. The
+    // original line pinned one word, `opt-in`, guarding "the fix is opt-in
+    // only" — a sentence REQ-1318 makes FALSE, because a structured
+    // parameter may now travel as a JSON string with no flag at all. The word
+    // is kept (the flag IS still opt-in, and still schema-blind, and still
+    // the route for a position with no declaration to reason from) and a
+    // companion is added, because REQ-1318 splits what one word used to
+    // conflate into two claims that can now drift apart independently: a
+    // structured param needs NO FLAG, while `_rawJson` remains the opt-in,
+    // schema-blind route. Deleting the pin would have been the finding; two
+    // statements are asserted where one was.
+    expect(readme, 'a structured parameter needs no flag at all').toMatch(/no flag/i);
+    expect(readme, 'the flag remains opt-in').toMatch(/opt-in/i);
+    expect(readme, "the flag's true scope is stated: broader, and schema-blind").toMatch(/schema-blind/i);
+  });
+
+  // REQ-1318 T4 — the rot-guards for the discoverability this requirement
+  // owes. The escape hatch is worthless as a capability if an agent cannot
+  // find it, and the README is where a human or an agent reading the package
+  // looks before the first call.
+  it('documents the JSON-string escape hatch with a copyable payload (REQ-1318)', () => {
+    // The route is named where the nesting rule lives — that is the paragraph
+    // an agent reads when a nested array is the thing that bit them.
+    expect(readme, 'the nesting rule names the JSON-string route').toMatch(/JSON string/i);
+    // A payload to copy, not an abstract rule (the REQ-1268 idiom).
+    expect(readme, 'a copyable stringified batch payload is shown').toMatch(/"group":\s*"layer",\s*"method":\s*"batch"/);
+    // The reason a string is the right carrier, so the rule is not read as an
+    // arbitrary encoding preference.
+    expect(readme, 'the hint says why a string is the safe carrier').toMatch(/scalar/i);
+    // The call that teaches the shape, so the paragraph is not a dead end.
+    expect(readme).toContain('figpea_describe');
+  });
+
+  it('the superseded "forwarded as the plain string" claim is GONE from the _rawJson paragraph (REQ-1318)', () => {
+    // This sentence was true when REQ-1280 shipped and is false now. Left in
+    // place it would contradict the new rule two paragraphs earlier, so it is
+    // pinned as absent rather than left to rot.
+    expect(readme).not.toMatch(/without `_rawJson` a stringified object or array is forwarded as the plain string it is/);
+    // …and the correction actually replaced it with the true statement.
+    expect(readme, 'the flag is documented as the broader route, not the only one').toMatch(/broader|either route|both routes/i);
   });
 
   it('documents returnAs path mode as reaching every binary export, not only image tools (REQ-1279)', () => {
