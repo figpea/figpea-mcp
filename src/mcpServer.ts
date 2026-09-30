@@ -7,7 +7,6 @@
  */
 
 import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { McpServer, type RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
@@ -35,6 +34,10 @@ import { findArgShapeMismatch, findKindPropMismatch, renderSchemaExample } from 
 // cannot drift (AC-7).
 import { isRawJsonFlag, applyRawJson, rawJsonFailureMessage } from './rawJson';
 import { resolveTimeoutMs } from './callTimeout';
+// REQ-1283 — the single extension-preserving name resolver, called by BOTH
+// relay paths (compact `figpea_call` and full mode's `session_openFile`) for
+// the same reason as `_rawJson` above: one rule, two call sites, no drift.
+import { resolveOpenFileName } from './openFileName';
 // REQ-1296 — the pure "did I understand every key I was given?" predicate and
 // the two reserved-key sets. Ordered below REQ-1280's import because this
 // branch is rebased on top of it; the two are independent helpers and neither
@@ -832,7 +835,13 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             const bridgeUrl = toBridgeUrl(filePathVal);
             const newInput: Record<string, unknown> = { ...(input ?? {}) };
             newInput.url = bridgeUrl;
-            if (!newInput.fileName && !(newInput as any).name) newInput.fileName = path.basename(filePathVal);
+            // REQ-1283: the basename default alone dropped the extension whenever
+            // the caller supplied `name` — the documented alias for `fileName` —
+            // and the editor, which selects a decoder from the name it is given,
+            // reported a valid `.fp` as corrupt. `fileName` is set (not `name`)
+            // because v3 reads `fileName ?? name`.
+            const resolvedName = resolveOpenFileName({ filePath: filePathVal, fileName: newInput.fileName, name: (newInput as any).name });
+            if (resolvedName !== undefined) newInput.fileName = resolvedName;
             delete (newInput as any).filePath;
             effectiveArgs[0] = newInput;
           } else if (typeof filePathVal === 'string' && filePathVal.trim() === '') {
@@ -1353,7 +1362,13 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           // Build new input with url, preserve fileName/type/name if caller gave them
           const newInput: Record<string, unknown> = { ...(inputAny ?? {}) };
           newInput.url = bridgeUrl;
-          if (!newInput.fileName && !newInput.name) newInput.fileName = path.basename(filePathVal);
+          // REQ-1283 — the same rule as the compact dispatcher above, and
+          // deliberately a second call site rather than a shared branch: this
+          // is full mode's generated `session_openFile` tool, a different
+          // handler, and a one-site fix would leave the default (compact) path
+          // broken or the non-default one broken, depending which was chosen.
+          const resolvedName = resolveOpenFileName({ filePath: filePathVal, fileName: newInput.fileName, name: newInput.name });
+          if (resolvedName !== undefined) newInput.fileName = resolvedName;
           delete (newInput as any).filePath;
           delete (effectiveRawArgs as any).filePath;
           effectiveRawArgs.input = newInput;
