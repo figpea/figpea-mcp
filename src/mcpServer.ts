@@ -1417,102 +1417,31 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       // remains intact for logging, but inputKeys.map below sees the URLified value.
       const effectiveRawArgs: Record<string, unknown> = { ...rawArgs };
 
-      // Helper to validate a local path and return bridge URL or error payload
-      const toBridgeUrl = (filePath: string): string => {
-        if (bridge.getFileUrl) return bridge.getFileUrl(filePath);
-        return `http://${BRIDGE_URL_HOST}:${bridge.port}/file?path=${encodeURIComponent(filePath)}`;
-      };
-      const isValidFile = async (fp: string): Promise<boolean> => {
-        try {
-          const st = await fs.promises.stat(fp);
-          return st.isFile();
-        } catch {
-          return false;
-        }
-      };
-
+      // REQ-1337 T3 — the REQ-1037 `_rawJson` bypass + auto JSON-parse for
+      // stringified objects/arrays (both branches, flag set and flag-less)
+      // now runs HERE, ABOVE the `filePath`→bridge-URL translation below,
+      // mirroring the compact lane's REQ-1280 D3 step 1 (:833-846) and for
+      // exactly the reason recorded there: the `session_openFile` /
+      // `layer_setImageFill` / `layer_create` blocks read `.input` /
+      // `.source` / `.props` as `{filePath}`, so parsing after them meant a
+      // stringified `{"filePath":"/tmp/x.png"}` was never translated and the
+      // editor was handed a local path it cannot fetch — the same payload
+      // with the opposite outcome per lane, which is the drift REQ-1280's
+      // AC-7 exists to prevent. BOTH branches move, not just the flagged one:
+      // the flag-less schema-scoped parse is what rescues an unflagged
+      // stringified `filePath`, and moving only the flag branch would have
+      // traded that divergence for its mirror image.
+      //
+      // It still runs BEFORE `coerceValue`, so a string numeric inside a
+      // parsed object still becomes a real number, and before the REQ-1309
+      // kind-prop check and the round trip.
+      //
+      // What still runs above it, and must: the unknown-top-level-key
+      // rejection and the `no_tab` refusal are about the CALL rather than
+      // about how its arguments are encoded. `toolName` is hoisted to here
+      // because the refusal message below reads it, and it reads nothing else
+      // between its old position and this one.
       const toolName = `${groupName}_${methodName}`;
-      if (toolName === 'session_openFile') {
-        // input may be at rawArgs.input or rawArgs itself (some callers pass filePath top-level)
-        const inputAny = (effectiveRawArgs as any).input as Record<string, unknown> | undefined;
-        const filePathVal = (inputAny?.filePath as string | undefined) ?? (effectiveRawArgs as any).filePath as string | undefined;
-        if (typeof filePathVal === 'string' && filePathVal) {
-          if (typeof filePathVal !== 'string') {
-            return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: `filePath must be a string: ${String(filePathVal)}` }));
-          }
-          const okFile = await isValidFile(filePathVal);
-          if (!okFile) {
-            return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: `file not found or not readable: ${filePathVal}` }));
-          }
-          const bridgeUrl = toBridgeUrl(filePathVal);
-          // Build new input with url, preserve fileName/type/name if caller gave them
-          const newInput: Record<string, unknown> = { ...(inputAny ?? {}) };
-          newInput.url = bridgeUrl;
-          // REQ-1283 — the same rule as the compact dispatcher above, and
-          // deliberately a second call site rather than a shared branch: this
-          // is full mode's generated `session_openFile` tool, a different
-          // handler, and a one-site fix would leave the default (compact) path
-          // broken or the non-default one broken, depending which was chosen.
-          const resolvedName = resolveOpenFileName({ filePath: filePathVal, fileName: newInput.fileName, name: newInput.name });
-          if (resolvedName !== undefined) newInput.fileName = resolvedName;
-          delete (newInput as any).filePath;
-          delete (effectiveRawArgs as any).filePath;
-          effectiveRawArgs.input = newInput;
-          // Ensure inputKeys includes 'input' mapping — already does, but if rawArgs had top-level filePath we cleared it
-        } else if (typeof filePathVal === 'string' && filePathVal.trim() === '') {
-          return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: 'filePath cannot be empty' }));
-        } else if ((effectiveRawArgs as any).filePath !== undefined && typeof (effectiveRawArgs as any).filePath !== 'string') {
-          return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: 'filePath must be a string' }));
-        }
-        // Also handle filePath inside input that is non-string
-        if (inputAny && 'filePath' in inputAny && inputAny.filePath !== undefined && typeof inputAny.filePath !== 'string') {
-          return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: 'input.filePath must be a string' }));
-        }
-      } else if (toolName === 'layer_setImageFill') {
-        const source = (effectiveRawArgs as any).source as Record<string, unknown> | undefined;
-        const fp = source?.filePath as string | undefined;
-        if (typeof fp === 'string' && fp) {
-          const okFile = await isValidFile(fp);
-          if (!okFile) {
-            return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: `file not found or not readable: ${fp}` }));
-          }
-          const bridgeUrl = toBridgeUrl(fp);
-          const newSource: Record<string, unknown> = { ...source };
-          newSource.url = bridgeUrl;
-          delete (newSource as any).filePath;
-          effectiveRawArgs.source = newSource;
-        } else if (fp !== undefined && fp !== null && (typeof fp !== 'string' || (fp as string).trim() === '')) {
-          // fp is present but invalid type/empty
-          if (typeof fp !== 'string') {
-            return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'source.filePath must be a string' }));
-          }
-        } else if (source && 'filePath' in source && source.filePath !== undefined && typeof source.filePath !== 'string') {
-          return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'source.filePath must be a string' }));
-        }
-      } else if (toolName === 'layer_create') {
-        // rawArgs.kind is the kind string, rawArgs.props contains image props
-        const kindVal = (effectiveRawArgs as any).kind;
-        const props = (effectiveRawArgs as any).props as Record<string, unknown> | undefined;
-        const fp = props?.filePath as string | undefined;
-        if (kindVal === 'image' && typeof fp === 'string' && fp) {
-          const okFile = await isValidFile(fp);
-          if (!okFile) {
-            return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: `file not found or not readable: ${fp}` }));
-          }
-          const bridgeUrl = toBridgeUrl(fp);
-          const newProps: Record<string, unknown> = { ...props };
-          newProps.url = bridgeUrl;
-          delete (newProps as any).filePath;
-          effectiveRawArgs.props = newProps;
-        } else if (kindVal === 'image' && props && 'filePath' in props && props.filePath !== undefined && typeof props.filePath !== 'string') {
-          return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'props.filePath must be a string' }));
-        } else if (kindVal === 'image' && typeof fp === 'string' && fp.trim() === '') {
-          return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'filePath cannot be empty' }));
-        }
-      }
-
-      // REQ-1037 T3 — `_rawJson` bypass + auto JSON-parse for stringified objects/arrays.
-      // Must run after filePath translation (which may have mutated effectiveRawArgs) but before coercion.
       const rawJsonFlag = isRawJsonFlag((effectiveRawArgs as any)['_rawJson']);
       if (rawJsonFlag) {
         // REQ-1280 T2 — the flag's parse now lives in the ONE shared
@@ -1561,10 +1490,13 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         // which is what makes `schemaAt`/`pathAt` line up, and it keeps the
         // reserved keys (`_rawJson`/`_timeoutMs`/`returnAs`) out of the parse.
         //
-        // Position, scope and semantics are unchanged. In particular this lane's
-        // parse still runs AFTER the filePath translation, so a stringified
-        // `filePath` in full mode is still not translated — a pre-existing gap
-        // that belongs to REQ-1337, deliberately not moved here.
+        // Position, scope and semantics are unchanged — but not the position's
+        // ORDER: REQ-1337 moved this branch above the `filePath` translation
+        // (see the note at the top of it), which closes the gap this comment
+        // used to reserve by name. A stringified `filePath` in full mode is now
+        // translated like it is on the compact lane, and the behaviour it
+        // changes is only ever a value the editor would otherwise have
+        // rejected with a local path it cannot fetch.
         const applied = applyStructuredStringJson(effectiveRawArgs, {
           keys: inputKeys,
           schemaAt: (i) => tool?.paramSchemas?.[inputKeys[i] ?? ''],
@@ -1576,6 +1508,129 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       }
       // Remove reserved keys so they never leak into coercion or logging of effective args
       delete (effectiveRawArgs as any)['_rawJson'];
+
+      // REQ-1017 helper to validate a local path and return bridge URL or error payload
+      const toBridgeUrl = (filePath: string): string => {
+        if (bridge.getFileUrl) return bridge.getFileUrl(filePath);
+        return `http://${BRIDGE_URL_HOST}:${bridge.port}/file?path=${encodeURIComponent(filePath)}`;
+      };
+      const isValidFile = async (fp: string): Promise<boolean> => {
+        try {
+          const st = await fs.promises.stat(fp);
+          return st.isFile();
+        } catch {
+          return false;
+        }
+      };
+
+      if (toolName === 'session_openFile') {
+        // input may be at rawArgs.input or rawArgs itself (some callers pass filePath top-level)
+        const inputAny = (effectiveRawArgs as any).input as Record<string, unknown> | undefined;
+        const filePathVal = (inputAny?.filePath as string | undefined) ?? (effectiveRawArgs as any).filePath as string | undefined;
+        if (typeof filePathVal === 'string' && filePathVal) {
+          if (typeof filePathVal !== 'string') {
+            return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: `filePath must be a string: ${String(filePathVal)}` }));
+          }
+          const okFile = await isValidFile(filePathVal);
+          if (!okFile) {
+            return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: `file not found or not readable: ${filePathVal}` }));
+          }
+          const bridgeUrl = toBridgeUrl(filePathVal);
+          // Build new input with url, preserve fileName/type/name if caller gave them
+          const newInput: Record<string, unknown> = { ...(inputAny ?? {}) };
+          newInput.url = bridgeUrl;
+          // REQ-1283 — the same rule as the compact dispatcher above, and
+          // deliberately a second call site rather than a shared branch: this
+          // is full mode's generated `session_openFile` tool, a different
+          // handler, and a one-site fix would leave the default (compact) path
+          // broken or the non-default one broken, depending which was chosen.
+          const resolvedName = resolveOpenFileName({ filePath: filePathVal, fileName: newInput.fileName, name: newInput.name });
+          if (resolvedName !== undefined) newInput.fileName = resolvedName;
+          delete (newInput as any).filePath;
+          delete (effectiveRawArgs as any).filePath;
+          effectiveRawArgs.input = newInput;
+          // Ensure inputKeys includes 'input' mapping — already does, but if rawArgs had top-level filePath we cleared it
+        } else if (typeof filePathVal === 'string' && filePathVal.trim() === '') {
+          return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: 'filePath cannot be empty' }));
+        } else if ((effectiveRawArgs as any).filePath !== undefined && typeof (effectiveRawArgs as any).filePath !== 'string') {
+          return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: 'filePath must be a string' }));
+        }
+        // Also handle filePath inside input that is non-string
+        //
+        // REQ-1337 T2 — the `!== null && typeof … === 'object'` guard is the
+        // compact twin's, verbatim and in the same textual order (`:936`).
+        // `in` REJECTS a primitive, so the un-guarded `inputAny &&` threw
+        // `TypeError: Cannot use 'in' operator …` straight out of this handler
+        // — the only `try` on this lane wraps `callTab` — and reached the agent
+        // as plain text with no `code` to branch on.
+        //
+        // ⛔ The guard is NOT dead code, and the parse now running above does
+        // not make it so: a value that does not look like JSON, one that does
+        // not parse, one whose parsed shape contradicts its declaration, and
+        // every position on a manifest with no structured schema (a legacy
+        // free-text `params` block, the published-npm "no describe() yet"
+        // case) all reach this line as the string the caller sent. The
+        // `src/req1337RawJsonFilePath.test.ts` rows for exactly those cases
+        // fail if this guard is deleted.
+        if (inputAny !== null && typeof inputAny === 'object' && 'filePath' in inputAny && inputAny.filePath !== undefined && typeof inputAny.filePath !== 'string') {
+          return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: 'input.filePath must be a string' }));
+        }
+      } else if (toolName === 'layer_setImageFill') {
+        const source = (effectiveRawArgs as any).source as Record<string, unknown> | undefined;
+        const fp = source?.filePath as string | undefined;
+        if (typeof fp === 'string' && fp) {
+          const okFile = await isValidFile(fp);
+          if (!okFile) {
+            return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: `file not found or not readable: ${fp}` }));
+          }
+          const bridgeUrl = toBridgeUrl(fp);
+          const newSource: Record<string, unknown> = { ...source };
+          newSource.url = bridgeUrl;
+          delete (newSource as any).filePath;
+          effectiveRawArgs.source = newSource;
+        } else if (fp !== undefined && fp !== null && (typeof fp !== 'string' || (fp as string).trim() === '')) {
+          // fp is present but invalid type/empty
+          if (typeof fp !== 'string') {
+            return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'source.filePath must be a string' }));
+          }
+        } else if (source !== null && typeof source === 'object' && 'filePath' in source && source.filePath !== undefined && typeof source.filePath !== 'string') {
+          // REQ-1337 T2 — the `typeof … === 'object'` test is the compact
+          // lane's, verbatim (`:947`, where the same lookup runs over the
+          // positional args). ⛔ Load-bearing, not dead: a non-JSON-looking
+          // string, an unparseable one, one whose parsed shape contradicts its
+          // declaration, and any position on a schema-less legacy manifest all
+          // reach this line as the string the caller sent — see the REQ-1337
+          // rows in src/req1337RawJsonFilePath.test.ts, which fail without it.
+          return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'source.filePath must be a string' }));
+        }
+      } else if (toolName === 'layer_create') {
+        // rawArgs.kind is the kind string, rawArgs.props contains image props
+        const kindVal = (effectiveRawArgs as any).kind;
+        const props = (effectiveRawArgs as any).props as Record<string, unknown> | undefined;
+        const fp = props?.filePath as string | undefined;
+        if (kindVal === 'image' && typeof fp === 'string' && fp) {
+          const okFile = await isValidFile(fp);
+          if (!okFile) {
+            return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: `file not found or not readable: ${fp}` }));
+          }
+          const bridgeUrl = toBridgeUrl(fp);
+          const newProps: Record<string, unknown> = { ...props };
+          newProps.url = bridgeUrl;
+          delete (newProps as any).filePath;
+          effectiveRawArgs.props = newProps;
+        } else if (kindVal === 'image' && props !== null && typeof props === 'object' && 'filePath' in props && props.filePath !== undefined && typeof props.filePath !== 'string') {
+          // REQ-1337 T2 — the compact lane's guard for this exact condition,
+          // verbatim and in the same textual order (`:984`). ⛔ Load-bearing,
+          // not dead: see the note at the `session_openFile` guard above — the
+          // values that reach this line as a non-object are the ones the parse
+          // deliberately leaves alone, and the REQ-1337 rows in
+          // src/req1337RawJsonFilePath.test.ts fail without this.
+          return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'props.filePath must be a string' }));
+        } else if (kindVal === 'image' && typeof fp === 'string' && fp.trim() === '') {
+          return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'filePath cannot be empty' }));
+        }
+      }
+
 
       // REQ-1020 — reserved `returnAs` (plan D1/D2): validated here (fail
       // loud on typos, before spending a bridge round trip), stripped like
@@ -1598,9 +1653,15 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         return coerceValue(raw, schema);
       });
       // REQ-1309 T4 — the SAME per-kind prop rule the compact lane runs, at
-      // the SAME point in the pipeline: after the `filePath`→bridge-URL
-      // translation, after the `_rawJson` verdict, after coercion, and before
-      // the round trip. This lane had no shape pre-flight of any kind until
+      // the SAME point in the pipeline: after the `_rawJson` verdict and after
+      // coercion — and, since REQ-1337 moved that parse, BEFORE the
+      // `filePath`→bridge-URL translation, where this lane used to run it.
+      // The relative order of those first two is deliberately reversed (the
+      // translation has to see a PARSED payload to find a `filePath` in it);
+      // what this check needs from them is unchanged, since a `props` that
+      // failed to parse is refused above and a `props` that parsed is still
+      // forwarded, translated, as the same value. It still runs before the
+      // round trip. This lane had no shape pre-flight of any kind until
       // now, and it is the lane real MCP clients actually use — wiring only the
       // compact one would satisfy the requirement's example in one calling
       // convention and keep billing the round trip in the other.
