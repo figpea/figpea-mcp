@@ -136,8 +136,8 @@ Use **full mode** when your agent harness hardcodes individual tool names (e.g. 
 
 Every relayed call has a bridge timeout. Two knobs control it:
 
-- **Per-call override** — every generated contract tool accepts an optional top-level `_timeoutMs` input key that raises that single call's timeout, e.g. `{ "url": "…", "_timeoutMs": 120000 }`. It is a reserved key: it is never forwarded to the editor-side method (it is not part of any method's arguments) and only affects the relay's own deadline. The documented maximum is **120000 ms (120 seconds)**; values above it are clamped to the cap rather than rejected.
-- **Raised defaults for known-slow methods** — methods that legitimately run long get longer default ceilings automatically:
+- **Per-call override** — every generated contract tool accepts an optional top-level `_timeoutMs` input key that sets that single call's timeout, e.g. `{ "url": "…", "_timeoutMs": 120000 }`. It is a reserved key: it is never forwarded to the editor-side method (it is not part of any method's arguments) and only affects the relay's own deadline. The documented maximum is **120000 ms (120 seconds)**; values above it are clamped to the cap rather than rejected. Smaller values are honoured too, so a caller that wants a fast failure can still ask for one.
+- **Per-method defaults for known-slow methods** — a method that legitimately runs long gets its own default, and a method that must not hold a call open gets a shorter one:
 
   | Tool | Default timeout |
   |------|-----------------|
@@ -148,9 +148,19 @@ Every relayed call has a bridge timeout. Two knobs control it:
   | `export_assetHarvest` | 120000 ms |
   | `export_figmaKit` | 60000 ms |
 
-  Everything else keeps the flat 10-second default.
+  That table is authoritative per method **in both directions**: `session_waitForIdle` deliberately stays at 30000 ms, *below* the flat default, so waiting on the editor can never hold a call open for a minute.
 
-When a call does time out, the error says so honestly — `timed out after Nms; the editor may still be executing this call — check state before retrying`. **Do not blindly retry a failed mutation**: the tab keeps working after the relay gives up, so the effect may have landed anyway (retrying a non-idempotent call like `layer_create` duplicates the layer). Check state first (`status`, `session_layerTree`) and re-issue reads and idempotent setters freely.
+  Everything else gets a flat 60-second default.
+
+The flat default is 60 s rather than 10 s because the editor's render-settle window after a burst of mutations on a large project is longer than 10 s. A 10 s deadline reported `layer_create` calls that had already been applied as failures, and the obvious retry silently duplicated the layer. It is deliberately *below* the 120000 ms cap: your MCP host has its own request timeout that `_timeoutMs` cannot raise, so a floor at the cap would let the host's ceiling fire first and hand you a transport error with no envelope at all.
+
+**During a burst of mutations, pass `_timeoutMs` deliberately** — 90000 is a legal value — rather than rediscovering the limit by timing out. The same advice is in the tools' own descriptions, so an agent that only ever reads `tools/list` sees it too.
+
+When a call does time out, the error says so honestly — `timed out after Nms; the editor may still be executing this call — check state before retrying` — and then **names the call to run**: `session.find({name})` for a create (the check that stops a retry from duplicating the layer), `session.layerById(<id>)` for a patch whose id you already have, `session.layerTree()` when there is no name or id to check by, and a plain "re-issue is safe" for a read. **Do not blindly retry a failed mutation**: the tab keeps working after the relay gives up, so the effect may have landed anyway.
+
+### Host request timeout
+
+`_timeoutMs` raises *this package's* deadline only. Your MCP host has its own request timeout on top of it, which `_timeoutMs` cannot raise. When the host's ceiling fires first you get a transport-level error (e.g. `MCP error -32001: Request timed out`) and **no envelope at all** — no message, no named state check, nothing telling you whether the mutation applied. That is the one case where the advice above is not delivered for you: run the state check yourself, and prefer passing `_timeoutMs` up front to waiting under the host's ceiling.
 
 Every tool also accepts `_rawJson` (boolean, optional) — the escape hatch for a host harness that stringifies a nested object or array instead of sending it as one. Set it to `true` and every argument that is a string whose trimmed form starts with `{`/`[` and ends with `}`/`]` is JSON-parsed before forwarding, so the whole object can travel as a string and arrive as a real object with real numbers.
 

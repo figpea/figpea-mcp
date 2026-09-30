@@ -34,6 +34,7 @@ import { findArgShapeMismatch, findKindPropMismatch, renderSchemaExample } from 
 // (full mode's contract handler and compact mode's `figpea_call`) so they
 // cannot drift (AC-7).
 import { isRawJsonFlag, applyRawJson, rawJsonFailureMessage } from './rawJson';
+import { resolveTimeoutMs } from './callTimeout';
 // REQ-1296 — the pure "did I understand every key I was given?" predicate and
 // the two reserved-key sets. Ordered below REQ-1280's import because this
 // branch is rebased on top of it; the two are independent helpers and neither
@@ -82,36 +83,36 @@ const SERVER_VERSION = '2.5.0';
 
 /** REQ-772 AC-1 — the documented maximum a per-call `_timeoutMs` override may
  * raise a single bridge call's timeout to. Values above it are clamped (not
- * rejected), per the README's stated semantics. */
-export const MAX_CALL_TIMEOUT_MS = 120_000;
+ * rejected), per the README's stated semantics.
+ *
+ * REQ-1282 D1 — the cap, the known-slow table and the resolver now live in
+ * `callTimeout.ts`, a zero-import leaf that also owns the flat floor
+ * `bridgeServer.ts` uses as its own default, so the relay's deadline and this
+ * layer's resolved deadline are the same number by construction. Re-exported
+ * here so anything that imported them from this module keeps working. */
+export { MAX_CALL_TIMEOUT_MS, DEFAULT_TIMEOUT_TABLE_MS } from './callTimeout';
 
-/** REQ-772 AC-2 — raised default timeouts for known-slow contract methods,
- * keyed by tool name (`${group}_${method}`). Lives next to the tool
- * registration so docs and code stay in one place; every method NOT listed
- * here keeps `callTab`'s own flat 10s default (AC-4 — the fast path is
- * byte-for-byte unchanged: an `undefined` 4th arg hits callTab's default
- * parameter exactly as before). Mirrored verbatim in README.md ("Call
- * timeouts") and the shipped skill markdown — keep them in sync. */
-export const DEFAULT_TIMEOUT_TABLE_MS: Record<string, number> = {
-  session_openFile: 120_000,
-  session_waitForIdle: 30_000,
-  export_project: 120_000,
-  export_specBundle: 60_000,
-  export_assetHarvest: 120_000,
-  export_figmaKit: 60_000,
-};
-
-/** REQ-772 — resolves the timeout for one contract-tool call:
- * a usable `_timeoutMs` override (finite, > 0) wins, clamped to the cap;
- * anything else falls through to the method-aware table, then to `undefined`
- * (= `callTab`'s built-in 10s default). Non-number/NaN/≤0 values are ignored
- * rather than rejected — a broken knob must not fail an otherwise-valid call. */
-function resolveTimeoutMs(toolName: string, rawOverride: unknown): number | undefined {
-  if (typeof rawOverride === 'number' && Number.isFinite(rawOverride) && rawOverride > 0) {
-    return Math.min(rawOverride, MAX_CALL_TIMEOUT_MS);
-  }
-  return DEFAULT_TIMEOUT_TABLE_MS[toolName];
-}
+/** REQ-1282 AC-5 — the one sentence that makes the timeout knob discoverable,
+ * carried at EVERY site that advertises `_timeoutMs` (this dispatcher, and
+ * `buildInputShape`'s shared key for every generated contract tool) so the
+ * three can never disagree.
+ *
+ * The knob has worked since REQ-772; what was missing is that nobody could
+ * learn it existed, let alone that the default is *sometimes* too low. An
+ * agent that cannot see the problem cannot pass the fix for it, so the wall
+ * gets rediscovered by timing out — which is what the card's incident was.
+ * Stated as a fact about a situation the agent can recognise (a burst of
+ * mutations on a large project), not as a warning to be careful.
+ *
+ * `120000` is spelled with digits on purpose: the README, `readme.test.ts` and
+ * the other `_timeoutMs` descriptions all use the digits, and a copyable
+ * number beats a formatted one for an agent computing a legal value. It names
+ * the key by name, which reads slightly self-referentially inside the key's own
+ * property description — the price of ONE string at all three sites, which is
+ * the whole point of extracting it.
+ */
+const TIMEOUT_KNOB_ADVICE =
+  'The default can be too low during a burst of mutations, where the editor is still settling after the relay has already given up — pass _timeoutMs deliberately (90000 is a legal value) rather than discovering the limit by timing out. Clamped to 120000, not rejected.';
 
 /** REQ-1020 — the three tools whose off-band return is *documented* as an image
  * return, and the worked example set the README uses. This used to gate the
@@ -244,7 +245,18 @@ function buildInputShape(tool: GeneratedTool): z.ZodType {
   // manifest-args mapping by construction (`makeContractHandler` maps only
   // `inputKeys`, which never contains `_timeoutMs`), so it is never
   // forwarded to the tab-side method.
-  shape['_timeoutMs'] = z.number().optional();
+  //
+  // REQ-1282 AC-5 — it used to carry NO description at all, so in full mode
+  // every generated contract tool advertised the knob blind: an agent could
+  // not learn from `tools/list` that the key exists, let alone that the
+  // default is sometimes too low. Carried in `.describe()` AND `.meta()` for
+  // the reason recorded at TIMEOUT_KNOB_ADVICE above: the SDK's zod→JSON Schema conversion takes the meta description in PREFERENCE to
+  // `.describe()`, so `.describe()` alone is the half that does not ship.
+  shape['_timeoutMs'] = z
+    .number()
+    .optional()
+    .describe(`Optional per-call timeout override in ms. ${TIMEOUT_KNOB_ADVICE}`)
+    .meta({ description: `Optional per-call timeout override in ms. ${TIMEOUT_KNOB_ADVICE}` });
   // REQ-1037 — reserved `_rawJson` bypass for harness that stringifies nested numbers.
   // Declared so it survives safeParseAsync, never forwarded (not in inputKeys).
   shape['_rawJson'] = z.any().optional();
@@ -628,7 +640,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       'figpea_call',
       {
         description:
-          'Universal dispatcher — calls any group.method on the paired editor tab via bridge.callTab(group, method, args, _timeoutMs?). In compact mode this is the only way to reach contract methods; in full mode the individual tools are also available. group/method are the describe() surface names, and args is the POSITIONAL argument array for that method, in that method\'s own parameter order. FLAT example: ["rect", {rwidth:100}] for layer.create. NESTED example — when a parameter is itself an array (e.g. layer.batch\'s ops), that parameter is passed as ONE element of args, so the element is an array of {method, args} ops: {"group":"layer","method":"batch","args":[[{"method":"create","args":["page",{"name":"probe","pageWidth":100,"pageHeight":100}]}]]}. Each op\'s own args is likewise a positional ARRAY, never an object. Unsure of a method\'s shape? Call figpea_describe({group, method}) first — it returns that method\'s doc and params from the manifest with no round trip to the tab. Image results return MCP image content + a text summary. Pass returnAs:"path" to receive a binary result off-band as a session file path instead of inline base64 — it reaches every binary export, e.g. canvas_screenshot / export_layer / export_artboard for images and export_project for a native .fp.',
+          'Universal dispatcher — calls any group.method on the paired editor tab via bridge.callTab(group, method, args, _timeoutMs?). In compact mode this is the only way to reach contract methods; in full mode the individual tools are also available. group/method are the describe() surface names, and args is the POSITIONAL argument array for that method, in that method\'s own parameter order. FLAT example: ["rect", {rwidth:100}] for layer.create. NESTED example — when a parameter is itself an array (e.g. layer.batch\'s ops), that parameter is passed as ONE element of args, so the element is an array of {method, args} ops: {"group":"layer","method":"batch","args":[[{"method":"create","args":["page",{"name":"probe","pageWidth":100,"pageHeight":100}]}]]}. Each op\'s own args is likewise a positional ARRAY, never an object. Unsure of a method\'s shape? Call figpea_describe({group, method}) first — it returns that method\'s doc and params from the manifest with no round trip to the tab. Image results return MCP image content + a text summary. Pass returnAs:"path" to receive a binary result off-band as a session file path instead of inline base64 — it reaches every binary export, e.g. canvas_screenshot / export_layer / export_artboard for images and export_project for a native .fp. ' + TIMEOUT_KNOB_ADVICE,
         // REQ-1296 D1 — loose for the SAME reason as buildInputShape, and it is
         // load-bearing rather than cosmetic here: `figpea_call` is the ONLY way
         // to reach a contract method in compact mode, so if its schema keeps
@@ -666,7 +678,18 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
               description:
                 'Positional argument array, in the method\'s own parameter order. An array-typed parameter (e.g. layer.batch\'s ops) is passed as ONE element of args, and that element is itself an array of {method, args} ops — e.g. [[{method:"create", args:["rect",{rwidth:100}]}]]. Each op\'s args is an array, never an object.',
             }),
-          _timeoutMs: z.number().optional().describe('Optional per-call timeout override in ms (clamped to 120000)'),
+          // REQ-1282 AC-5 — the advice an agent needs at the moment it decides
+          // whether to pass this at all, carried in BOTH halves for the reason
+          // recorded at TIMEOUT_KNOB_ADVICE: the SDK advertises the `meta`
+          // description in preference to `.describe()`, so `.describe()` alone
+          // would leave the shipped schema silent. The PARSE behaviour is
+          // unchanged (`z.number().optional()`), so this adds guidance and
+          // zero new rejections.
+          _timeoutMs: z
+            .number()
+            .optional()
+            .describe(`Optional per-call timeout override in ms. ${TIMEOUT_KNOB_ADVICE}`)
+            .meta({ description: `Optional per-call timeout override in ms. ${TIMEOUT_KNOB_ADVICE}` }),
           // REQ-1280 T3 — this flag was advertised as a "reserved passthrough"
           // on the ONE tool compact mode registers, and was inert here: an
           // agent that set it got the editor's own rejection back with nothing

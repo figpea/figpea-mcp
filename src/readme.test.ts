@@ -123,6 +123,38 @@ describe('README.md (AC-5)', () => {
     expect(readme, 'never forwarded to the tab-side method is stated').toMatch(/never forwarded|not forwarded/i);
   });
 
+  // REQ-1282 T7 — the README is the published mirror of the timeout ladder, so
+  // every number T2 changed has to be pinned here. Without these, the section
+  // is documentation nobody maintains: it kept promising a flat 10-second
+  // default for a package whose floor became 60 s, and the plan's own
+  // complaint is that a shipped doc which is merely incomplete is still wrong.
+  it('documents the raised flat default, not the 10-second one it replaced (REQ-1282)', () => {
+    expect(readme, 'the flat default is documented with its real value').toMatch(/flat 60-second default/i);
+    expect(
+      readme,
+      'the old flat 10-second default is GONE - a doc that still promises it is worse than one that says nothing',
+    ).not.toMatch(/flat 10-second default/i);
+    expect(readme, 'and the reason it is not 10 s is stated, so the number is not arbitrary').toMatch(
+      /render-settle|settle window/i,
+    );
+  });
+
+  it('documents the burst advice and the host request timeout the cap cannot raise (REQ-1282)', () => {
+    expect(readme, 'the burst case is named').toMatch(/burst of mutations/i);
+    expect(readme, 'passing _timeoutMs deliberately is the documented response').toMatch(
+      /_timeoutMs`? deliberately|deliberately.*_timeoutMs/i,
+    );
+    expect(readme, 'the host side has its own request timeout, named as such').toMatch(/host.{0,60}request timeout/i);
+    expect(readme, 'and the host ceiling is explicitly not raisable from here').toMatch(
+      /host.{0,80}(cannot|can't|no parameter|not raisable)/i,
+    );
+  });
+
+  it('documents the concrete state-check routes the timeout envelope now names (REQ-1282)', () => {
+    expect(readme, 'a create is checked by name').toContain('session.find({name');
+    expect(readme, 'a patch is checked by id').toContain('session.layerById(');
+  });
+
   // REQ-1018 AC-5 — compact mode default, figpea_call, configuration
   it('documents compact mode default, figpea_call, and --mode/FIGPEA_TOOL_MODE (REQ-1018 AC-5)', () => {
     expect(readme).toMatch(/Tool modes.*figpea_call|figpea_call.*Tool modes/i);

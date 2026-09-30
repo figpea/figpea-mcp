@@ -15,6 +15,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import WebSocket, { WebSocketServer } from 'ws';
 import { BRIDGE_BIND_HOST, BRIDGE_URL_HOST } from './bridgeHost';
+import { DEFAULT_CALL_TIMEOUT_MS, stateCheckHint } from './callTimeout';
 import type { CallFrame, DescribeFrame } from './protocol';
 import { drillManifest, type DescribeFn, type DescribeResultPayload } from './describeDrill';
 import { sessionDirFor, removeSessionDir } from './returnPath';
@@ -30,8 +31,11 @@ export const CLOSE_CODE_SUPERSEDED = 4002;
  * `hello` as its very first frame with no round trip in between. */
 const HELLO_TIMEOUT_MS = 5000;
 
-/** Default per-call timeout when the caller doesn't specify one. */
-const DEFAULT_CALL_TIMEOUT_MS = 10_000;
+/** REQ-1282 D1 — the relay's per-call deadline is no longer a local
+ * constant: it is the same flat floor the MCP layer resolves to, so the two
+ * cannot drift (they were 10 s here and "undefined, i.e. whatever this file
+ * says" in `mcpServer.ts`, which is how a 12 s create was reported as a
+ * failure while the tab applied it). */
 
 /** How long one `describe` frame may go unanswered before the drill gives up
  * on it (REQ-188). A stalled tab must degrade to a skipped group — or, for
@@ -442,9 +446,17 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
           // tab keeps executing and the effect (e.g. layer.create) may land
           // anyway. The rejection must say so, so callers check state before
           // blindly retrying non-idempotent mutations.
+          //
+          // REQ-1282 AC-3: "check state before retrying" is advice with no
+          // route attached, and both reactions to it are expensive — trust it
+          // and abandon a layer that was created, or retry a `create` and
+          // silently duplicate it. So the clause now NAMES the call to run.
+          // Everything above the `;` is the REQ-772 wording, kept byte-for-
+          // byte because tests pin those three substrings literally; the
+          // state check is appended, never substituted for them.
           reject(
             new Error(
-              `figpea-mcp bridgeServer: call ${group}.${method} timed out after ${timeoutMs}ms; the editor may still be executing this call — check state before retrying`,
+              `figpea-mcp bridgeServer: call ${group}.${method} timed out after ${timeoutMs}ms; the editor may still be executing this call — check state before retrying; ${stateCheckHint(group, method, args)}`,
             ),
           );
         }, timeoutMs);

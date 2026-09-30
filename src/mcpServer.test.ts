@@ -931,7 +931,13 @@ describe('REQ-772 AC-1/AC-2/AC-4 — per-call _timeoutMs override + method-aware
     await callToolJson(client, 'session_waitForIdle', { timeout: 1000, _timeoutMs: 0 });
     await callToolJson(client, 'layer_setPosition', { id: 'x', pos: { x: 0, y: 0 }, _timeoutMs: -5 });
     expect(captured[0].timeoutMs, 'a table-method with a useless override keeps its table value').toBe(30_000);
-    expect(captured[1].timeoutMs, 'non-table method + useless override = no explicit timeout (default path)').toBeUndefined();
+    // REQ-1282 AC-2 — SUPERSEDED, and deliberately STRONGER than what it
+    // replaces. This used to assert `toBeUndefined()` ("no explicit timeout,
+    // whatever callTab's default happens to be"), which is the 10 s defect
+    // this REQ fixes: an 80-layer project's create was reported as a failure
+    // while the tab applied it. It now pins the actual floor, so a silent
+    // re-lowering of the default fails here rather than in a user's session.
+    expect(captured[1].timeoutMs, 'non-table method + useless override = the flat floor, pinned to a value').toBe(60_000);
   });
 
   it('(AC-2) known-slow methods get their raised defaults whenever no override is given', async () => {
@@ -953,11 +959,17 @@ describe('REQ-772 AC-1/AC-2/AC-4 — per-call _timeoutMs override + method-aware
     ]);
   });
 
-  it('(AC-4) a non-table method without an override keeps the unchanged default path (no explicit timeout)', async () => {
+  it('(AC-4) a non-table method without an override gets the flat floor, not an undefined deadline', async () => {
     const { bridge, captured } = knobBridge();
     const client = await connectedClient(bridge);
     await callToolJson(client, 'layer_setPosition', { id: 'x', pos: { x: 1, y: 1 } });
-    expect(captured[0].timeoutMs, 'callTab receives no explicit override — its own 10s default applies').toBeUndefined();
+    // REQ-1282 — SUPERSEDED, and STRONGER than the `toBeUndefined()` it
+    // replaces. "No explicit override, so callTab's own default applies" is
+    // not a property worth pinning: it is precisely how a call could be given
+    // a deadline shorter than the work it was doing. The floor is now an
+    // explicit, asserted number, and the same one `bridgeServer.ts` uses as
+    // its own default parameter — one number, two call sites.
+    expect(captured[0].timeoutMs, 'callTab receives the flat floor explicitly — it never has to fall back on a default').toBe(60_000);
   });
 
   it('(AC-1) a zero-param contract tool honors _timeoutMs too (its registered shape carries the reserved key)', async () => {
