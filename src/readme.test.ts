@@ -245,6 +245,117 @@ describe('README.md (AC-5)', () => {
     expect(readme, 'the flag is documented as the broader route, not the only one').toMatch(/broader|either route|both routes/i);
   });
 
+  // The rot-guard for the failure class this package's own docs kept walking
+  // into: a method whose parameter is a plain OBJECT. The section documented
+  // array-nesting and the JSON-string escape hatch, and said nothing about the
+  // shape that actually cost a /design run three round trips — including one
+  // that answered `open_fetch_failed: HTTP 404` for a file that exists, sending
+  // the reader to the filesystem instead of to their own argument shape. The
+  // transport is right and the calls were wrong, so the only thing that can keep
+  // teaching the right shape is the document — which is exactly the kind of doc
+  // that goes stale quietly, hence these pins. They assert the three correct
+  // call shapes, the three error strings that make each trap recognisable, the
+  // positional-slot-only limit on the JSON-string route, and that every
+  // counter-example is labelled, so a wrong call can never be copied out of
+  // here as if it were a right one.
+  it('documents the object-valued-parameter rule with openFile/stylePatch/setPageFill (designfix 2026-10-01)', () => {
+    // The rule itself, and that it is stated as the object being the slot.
+    expect(readme, 'the object-is-the-positional-slot rule is stated').toMatch(/object IS the positional slot/i);
+
+    // The three correct shapes, copyable and unambiguous.
+    expect(readme, 'openFile passes the input object as args[0]').toMatch(
+      /"method":\s*"openFile",\s*"args":\s*\[\{\s*"filePath"/,
+    );
+    expect(readme, 'stylePatch passes flat style keys at args[1]').toMatch(
+      /"method":\s*"stylePatch",\s*"args":\s*\[\s*"L_\w+",\s*\{\s*"font[^"]*"/,
+    );
+    expect(readme, 'setPageFill is a scalar then an object').toMatch(
+      /"method":\s*"setPageFill",\s*"args":\s*\[\s*"P_\d+",\s*\{\s*"fill"/,
+    );
+
+    // The trap each correct shape exists to defuse, named by its own message —
+    // so a reader who has ALREADY hit the failure recognises it here.
+    expect(readme, 'the misleading 404 on an existing file is called out').toContain('open_fetch_failed');
+    expect(readme, 'the flat-vs-nested style asymmetry is named').toContain('unsupported_style_key');
+    expect(readme, 'a stringified patch is refused as a string').toMatch(/patch must be object \(got string\)/);
+
+    // The create/stylePatch contrast, which is a real asymmetry and the thing
+    // most likely to be "tidied" back into a single spelling.
+    expect(readme, 'create nests style and stylePatch does not').toMatch(/create\(\) nests them and stylePatch does NOT/i);
+
+    // The JSON-string route's limit: whole positional slot only, never nested
+    // inside a real object. Pinned because the route reads as universally
+    // applicable, and the nesting trap is precisely its blind spot.
+    expect(readme, 'the string route is scoped to a whole positional slot').toMatch(
+      /string must be the whole positional slot/i,
+    );
+    expect(readme, 'and the reason is stated, not just the rule').toMatch(/never descends into an object/i);
+
+    // The escape hatch that makes the rule checkable rather than memorised.
+    expect(readme, 'figpea_describe is named as the authoritative shape').toContain('figpea_describe');
+
+    // Every counter-example is labelled, so a wrong call cannot be mistaken for
+    // a right one by a reader skimming the JSON block.
+    expect(readme, 'counter-examples are marked WRONG').toMatch(/^\/\/ WRONG —/m);
+  });
+
+  // The COHERENCE pin — the one the presence-only pins above structurally
+  // cannot do: an example must be paired with the error it actually produces.
+  //
+  // How this shipped a wrong pair. The section showed the setPageFill
+  // counter-example as two positional args and quoted `patch must be object
+  // (got string)`. That message comes from the editor's entry-time validator,
+  // which can only see a string in `patch` AFTER the single-object wrapper has
+  // been expanded to positional order — and expansion runs only for a call of
+  // exactly one argument (v3 registry.ts:130, `raw.length !== 1`). Two
+  // positional args therefore never expand, `patch` stays an object, entry
+  // validation passes, and the page-fill validator rejects the unknown key with
+  // a DIFFERENT message: `unsupported page fill key "patch"`. Every pin above
+  // was still green, because each of them only asked whether a string was
+  // PRESENT.
+  //
+  // So this one asserts the example's SHAPE — parsed as JSON, one argument, an
+  // object, keyed by the method's own parameter names, `patch` a string — which
+  // is the only shape for which the quoted message is reachable. It is
+  // deliberately structural rather than textual: the comment may be reworded,
+  // rewrapped, recoloured, or have its id names changed without breaking it.
+  //
+  // IF THIS FAILS: the example and the message have drifted apart again, and
+  // they must be re-derived together against the live editor — do not relax the
+  // assertion to make it green. Relaxing it is what let the misquote through.
+  it('pairs each counter-example with the error that call actually produces, not merely with an error string', () => {
+    const lines = readme.split('\n');
+    // The setPageFill counter-example: the one call in the section that carries a
+    // stringified `patch`. (The correct example beside it is a real object, so
+    // `"patch":` + a quote only matches the failing one.)
+    const idx = lines.findIndex((l) => l.includes('"method": "setPageFill"') && /"patch":\s*"/.test(l));
+    expect(idx, 'the setPageFill counter-example line was found').toBeGreaterThan(-1);
+
+    // Shape: the SINGLE-OBJECT WRAPPER, which is both the observed /design
+    // failure and the only shape whose quoted message is reachable.
+    const call = JSON.parse(lines[idx]!.trim());
+    expect(call.group, 'the example is a layer call').toBe('layer');
+    expect(call.method).toBe('setPageFill');
+    expect(
+      Array.isArray(call.args) ? call.args.length : -1,
+      'the counter-example is the single-object wrapper form — the 2-positional-arg form does NOT expand, so it yields a different error',
+    ).toBe(1);
+    expect(typeof call.args[0], 'args[0] is the wrapper object, not a pageId string').toBe('object');
+    expect(Object.keys(call.args[0]).sort()).toEqual(['pageId', 'patch']);
+    expect(typeof call.args[0].patch, 'the mistake is that patch is a STRING where an object was required').toBe('string');
+
+    // Pairing: the message the comment quotes is the one attached to THIS
+    // example, read from the comment block immediately above it. Walks back over
+    // contiguous `//` lines, so rewrapping the comment is fine but moving the
+    // message onto a different example is not.
+    const comment: string[] = [];
+    for (let i = idx - 1; i >= 0 && /^\s*\/\//.test(lines[i]!); i--) comment.unshift(lines[i]!);
+    expect(comment.join('\n'), 'the message is quoted on the example it belongs to').toMatch(
+      /patch must be object \(got string\)/,
+    );
+    expect(comment.join('\n'), 'the example is still labelled a counter-example').toMatch(/WRONG/);
+  });
+
   it('documents returnAs path mode as reaching every binary export, not only image tools (REQ-1279)', () => {
     expect(readme, 'the section is no longer image-scoped').toContain('Off-band binary returns');
     expect(readme, 'the old image-only section title is gone').not.toContain('Off-band image returns');

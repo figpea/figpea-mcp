@@ -111,13 +111,48 @@ By default `figpea-mcp` runs in **compact mode** — only 5 tools (`open_editor`
 
 **Nesting rule.** `args` is the positional array in the method's own parameter order. When a parameter is itself an array — `layer.batch`'s `ops` is the one that bites — that parameter goes in as **one element of `args`**, and the element is an array of `{method, args}` ops. Each op's `args` is a positional array as well. So `ops` is `[[{…}]]`, never `{ops: […]}` and never `{"item": […]}` (the latter is what some host harnesses produce when they collapse a nested array; `figpea_call` answers that with an `invalid_params` naming the path and the expected shape, without spending a tab round trip). When in doubt, call `figpea_describe({ group: "layer", method: "batch" })` first — it returns the authoritative shape from the manifest.
 
-**If your harness cannot send a nested object or array.** Some host harnesses serialise nested arrays into `{"item": …}` envelopes, and one that does that may not survive being told to send a real nested array. The one thing such a host cannot damage is a **scalar** — so any parameter the method declares as an `object`, `array` or `matrix` may be sent as a **JSON string** instead, and this server parses it before the round trip. **No flag is required**, and a string position is never touched, so `setName(id, "[Hero]")` is still the name `[Hero]`:
+**Object-valued parameters — the object IS the positional slot.** When a parameter is a plain object, that object occupies `args[n]` *on its own*; you never wrap it in a second envelope keyed by the parameter's own name. This is the shape that bites hardest, precisely because several parameters are **named** `input` or `patch` — so writing that name into your payload is the mistake, not the fix:
+
+```json
+// session.openFile(input) — `input` IS args[0]. figpea-mcp maps a `filePath`
+// here to http://localhost:<port>/file?path=… so the editor can fetch it.
+{ "group": "session", "method": "openFile", "args": [{ "filePath": "/abs/path/design.fp" }] }
+// WRONG — the file-path translation reads args[0].filePath, finds nothing, and the
+// bare path reaches the editor as a URL: open_fetch_failed: HTTP 404 Not Found for
+// "/abs/path/design.fp". The file EXISTS; the 404 is your argument shape, not the
+// filesystem and not the bridge. Check this shape before you go looking for the file.
+// Nothing server-side looks inside that envelope, so retrying this shape fails
+// identically — the cure is the shape above, not a clearer error on the next try.
+{ "group": "session", "method": "openFile", "args": [{ "input": { "filePath": "/abs/path/design.fp" } }] }
+
+// layer.stylePatch(id, patch) — the style keys go in FLAT, with no `style` wrapper
+{ "group": "layer", "method": "stylePatch", "args": ["L_kicker", { "fontFamily": "Inter", "fontSize": 26, "fill": "#1A1A1A" }] }
+// create() nests them and stylePatch does NOT — that asymmetry is real:
+// { "style": { … } } is answered unsupported_style_key: "style" — "style" is a
+// create() top-level prop, not a style key.
+{ "group": "layer", "method": "create", "args": ["text", { "text": "Counterform", "style": { "fontSize": 26 } }] }
+
+// layer.setPageFill(pageId, patch) — a scalar, then an object, positionally
+{ "group": "layer", "method": "setPageFill", "args": ["P_1", { "fill": "#EFEBE3", "fillType": "solid" }] }
+// WRONG — the wrapper below is NOT the mistake: a single object keyed by a method's own
+// parameter names is a legal `args`, and it expands to positional order. The mistake is
+// `patch` itself — a stringified object NESTED INSIDE a real object is never parsed, so it
+// stays a string: invalid_params: setPageFill(): patch must be object (got string)
+{ "group": "layer", "method": "setPageFill", "args": [{ "pageId": "P_1", "patch": "{\"fill\":\"#EFEBE3\"}" }] }
+```
+
+Two conventions meet here, and mixing them is the trap. In **full mode** a generated tool takes its parameters **by name**, so the same `input` object really is `session_openFile({ "input": { … } })` and `export_project({ "input": { "format": "figpea" } })`. **`figpea_call` positions them**, so the very same object is `{ … }` and not `{ "input": { … } }`. Both spellings are correct; each mode's spelling, used in the other, is the bug. `figpea_describe({ group, method })` settles it without a round trip: it returns each parameter's name, type and shape **in the method's own positional order**, so the first entry is `args[0]`, the second is `args[1]`, and the name a parameter happens to have tells you nothing about how to nest it.
+
+**If your harness cannot send a nested object or array.** Some host harnesses serialise nested arrays into `{"item": …}` envelopes, and one that does that may not survive being told to send a real nested array. The one thing such a host cannot damage is a **scalar** — so any parameter the method declares as an `object`, `array` or `matrix` may be sent as a **JSON string** instead, and this server parses it before the round trip. **No flag is required**, and a string position is never touched, so `setName(id, "[Hero]")` is still the name `[Hero]`. **The string must be the whole positional slot**: the parse visits `args[0]`, `args[1]`, … as complete positions and never descends into an object you also sent, so the `setPageFill` call above is *not* rescued by stringifying its `patch`. No flag, key or spelling makes a nested string parse:
 
 ```json
 // the batch above, as one string — note the escaped quotes
 { "group": "layer", "method": "batch", "args": ["[{\"method\":\"create\",\"args\":[\"page\",{\"name\":\"probe\",\"pageWidth\":100,\"pageHeight\":100}]}]"] }
 { "group": "layer", "method": "setTransform", "args": ["L_rect", "[1,0,0,1,0,0]"] }
 { "group": "layer", "method": "create", "args": ["line", "{\"x\":0,\"y\":0,\"style\":{\"dashArray\":[4,4]}}"] }
+// an object-valued parameter stringified into its OWN slot — the only place the route applies.
+// `input` is still args[0] here; the string is the object, not an envelope around it.
+{ "group": "session", "method": "openFile", "args": ["{\"filePath\":\"/abs/path/design.fp\"}"] }
 ```
 
 A string that does not parse, or that parses to the wrong kind for its declared type, is **refused before the round trip** with an `invalid_params` naming the position and both ways out — never silently forwarded. `figpea_describe({ group, method })` lists this method's own string-capable params under `stringJsonParams`, derived from the manifest, so you do not have to guess.
