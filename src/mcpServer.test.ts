@@ -140,7 +140,14 @@ describe('REQ-705 — figpea_skill MCP tool (prefetchedSkillBody)', () => {
     const content = (result as any).content as Array<{ type: string; text?: string }>;
     const textBlock = content.find((c) => c.type === 'text');
     expect(textBlock, 'figpea_skill returns a text content block').toBeDefined();
-    expect(textBlock!.text).toBe('# Some skill markdown\n\nBody text.');
+    // CHANGED from `toBe(body)`: the answer now PREPENDS a provenance line
+    // (which origin the body was fetched from), so byte-equality with the
+    // body is no longer the contract — "returns exactly the body with nothing
+    // added" is precisely the behaviour that let a body from the wrong editor
+    // read as authoritative for whatever tab was paired. What still matters is
+    // that the body is delivered whole; see skillProvenance.test.ts for the
+    // provenance itself.
+    expect(textBlock!.text).toContain('# Some skill markdown\n\nBody text.');
     expect(result.isError, 'a successful skill fetch is not an error result').not.toBe(true);
   });
 

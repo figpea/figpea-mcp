@@ -80,6 +80,12 @@ export interface CreateMcpServerOptions {
    * or was disabled -- the `figpea_skill` tool degrades gracefully rather
    * than being omitted from `tools/list`. */
   prefetchedSkillBody?: string;
+  /** The exact URL `fetchSkill` read `prefetchedSkillBody` from (cli.ts
+   * forwards `FetchSkillResult.url`). Carried so the `figpea_skill` answer can
+   * name its own provenance: the tab a run pairs is frequently a DIFFERENT
+   * origin/build than the one fetched here, and an unattributed body reads as
+   * authoritative for whatever tab happens to be connected. */
+  prefetchedSkillUrl?: string;
   /** REQ-1018: tool surface mode — compact (default) exposes only 5 tools:
    * `open_editor`, `status`, `figpea_skill`, the `figpea_call` dispatcher, and
    * (REQ-1268) `figpea_describe`; full restores all contract tools instead of
@@ -209,6 +215,45 @@ function jsonTextResult(payload: unknown): CallToolResult {
  * markdown reference body, not a JSON-wrapped string. */
 function textResult(text: string): CallToolResult {
   return toCallToolResult({ content: [{ type: 'text', text }], isError: false });
+}
+
+/** Prepended to `figpea_skill`'s answer so the body is never returned
+ * unattributed.
+ *
+ * The body is fetched ONCE at startup from the process's startup origin
+ * (`FIGPEA_EDITOR_URL`, else `https://editor.figpea.com`) and is never
+ * re-derived from the tab a run later pairs. Those are routinely two different
+ * editors -- a local `v3/static` build paired against a process started on the
+ * production origin, as in the 2026-10-01 design run. There the answer was
+ * production guidance (a `setPosition` call after every `layer.create`, and no
+ * `icon`/`arc` in the kind list) presented as if it described the local tab the
+ * agent was actually driving, which doubled the round trips on a ~200-element
+ * build. The bodies even carry the same `figpea-skill-identity
+ * contract=2.54.0` stamp, so that stamp does not tell a reader which editor it
+ * is holding -- which is why the URL, not the contract, is what gets named.
+ *
+ * This server cannot detect or fix the mismatch (the bridge does not learn the
+ * tab's origin, and `SKILL()` is not one of the eight contract groups), so the
+ * honest move is to say where the body came from and point at the two
+ * authoritative per-tab routes. `tabConnected` is read at call time, not
+ * construction time: a tab pairs long after startup, so the warning has to
+ * reflect the moment the answer is produced.
+ *
+ * A blockquote, because the body is markdown and an agent reads the top of it
+ * first -- the one sentence that could change how it builds has to be above the
+ * 500 lines it might otherwise follow.
+ */
+export function skillWithProvenance(body: string, sourceUrl: string | undefined, tabConnected: boolean): string {
+  const provenance =
+    sourceUrl
+      ? `**Provenance.** The body below was fetched once at server startup from \`${sourceUrl}\`. It is that editor build's own skill — not a query of any paired tab, and two builds can carry the same \`contract=\` stamp, so that stamp does not tell them apart.`
+      : `**Provenance.** The body below was fetched once at server startup, and this server did not record which origin it came from, so treat it as unattributed: it is some editor build's own skill, not a query of any paired tab, and two builds can carry the same \`contract=\` stamp, so that stamp does not tell them apart.`;
+
+  const tabWarning = tabConnected
+    ? `\n>\n> **A tab is connected, and it may be a different origin or a different build than the one above** — this server cannot see the tab's origin, so it cannot tell you which. For the connected tab's own skill — the one that matches the contract its methods actually accept — either evaluate \`figpea.SKILL()\` in that tab, or \`GET\` \`<the tab's origin>/agent/skill.md\`. Prefer those over the body below whenever they disagree.`
+    : '';
+
+  return `> ${provenance}${tabWarning}\n\n${body}`;
 }
 
 /** REQ-1296 D1 — the argument shape every contract tool registers.
@@ -521,11 +566,13 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     'figpea_skill',
     {
       description:
-        "Returns Figpea's agent skill reference -- the craft guidance for using window.figpea well (the authoring loop, recreating a reference faithfully, wiring interactions, the screenshot feedback loop, undo etiquette, entitlement boundaries, and the canonical Tier-1 recipe). Sourced from the editor origin's /agent/skill.md at startup.",
+        "Returns Figpea's agent skill reference -- the craft guidance for using window.figpea well (the authoring loop, recreating a reference faithfully, wiring interactions, the screenshot feedback loop, undo etiquette, entitlement boundaries, and the canonical Tier-1 recipe). Sourced from the editor origin's /agent/skill.md at startup, and the answer NAMES that origin: the body is that origin's own build, so if a tab is paired from a different origin or build, get the tab's skill with figpea.SKILL() in the tab or GET <the tab's origin>/agent/skill.md.",
     },
     async () => {
       if (options?.prefetchedSkillBody) {
-        return textResult(options.prefetchedSkillBody);
+        return textResult(
+          skillWithProvenance(options.prefetchedSkillBody, options.prefetchedSkillUrl, bridge.isTabConnected()),
+        );
       }
       return jsonTextResult({
         ok: false,

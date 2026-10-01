@@ -109,6 +109,7 @@ async function main(): Promise<void> {
 
   let prefetchedManifest: any | undefined;
   let prefetchedSkillBody: string | undefined;
+  let prefetchedSkillUrl: string | undefined;
   const disableFetch = process.env.FIGPEA_DISABLE_CONTRACT_FETCH === '1' || process.env.FIGPEA_DISABLE_CONTRACT_FETCH === 'true';
   if (!disableFetch) {
     const editorBase = process.env.FIGPEA_EDITOR_URL ?? 'https://editor.figpea.com';
@@ -121,12 +122,22 @@ async function main(): Promise<void> {
     }
     if (skillRes.status === 'ok') {
       prefetchedSkillBody = skillRes.body;
+      // This origin is a FACT about the body, not a derived convenience: a run
+      // may pair a tab from a different origin/build than the one fetched
+      // here, and `figpea_skill` says so rather than answering unattributed
+      // (the 2026-10-01 design run read the production skill while every
+      // contract call went to a local tab). Reported by `fetchSkill` itself so
+      // it cannot drift from where the request actually went.
+      prefetchedSkillUrl = skillRes.url;
     }
   }
 
   const serverOptions: Record<string, unknown> = {};
   if (prefetchedManifest) (serverOptions as any).prefetchedManifest = prefetchedManifest;
-  if (prefetchedSkillBody) (serverOptions as any).prefetchedSkillBody = prefetchedSkillBody;
+  if (prefetchedSkillBody) {
+    (serverOptions as any).prefetchedSkillBody = prefetchedSkillBody;
+    (serverOptions as any).prefetchedSkillUrl = prefetchedSkillUrl;
+  }
   (serverOptions as any).toolMode = toolMode;
   const server = createMcpServer(bridge, Object.keys(serverOptions).length > 0 ? (serverOptions as any) : { toolMode } as any);
   const transport = new StdioServerTransport();

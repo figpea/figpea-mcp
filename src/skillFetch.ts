@@ -9,7 +9,12 @@ import * as http from 'node:http';
 import * as https from 'node:https';
 import { URL } from 'node:url';
 
-export type FetchSkillResult = { status: 'ok'; body: string } | { status: 'fetch_failed' };
+/** `url` is the URL the body was actually read from -- the resolved
+ * `/agent/skill.md` URL, reported rather than re-derived by the caller so the
+ * provenance the figpea_skill answer prints can never disagree with where the fetch
+ * really went (the 2026-10-01 design run paired a local tab against a process
+ * started on the production origin, and the answer named neither). */
+export type FetchSkillResult = { status: 'ok'; body: string; url: string } | { status: 'fetch_failed' };
 
 export async function fetchSkill(editorBaseUrl: string, timeoutMs = 5000): Promise<FetchSkillResult> {
   const url = new URL('/agent/skill.md', editorBaseUrl).toString();
@@ -34,7 +39,7 @@ export async function fetchSkill(editorBaseUrl: string, timeoutMs = 5000): Promi
       });
     });
 
-    return { status: 'ok', body };
+    return { status: 'ok', body, url };
   } catch (err) {
     console.error(`[figpea-mcp] skill fetch failed from ${url}:`, err instanceof Error ? err.message : String(err));
     return { status: 'fetch_failed' };

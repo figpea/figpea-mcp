@@ -134,11 +134,18 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
       );
       expect(names).toContain('custom_group_custom_tool');
 
-      // REQ-705: figpea_skill returns the fetched fixture body verbatim.
+      // REQ-705: figpea_skill returns the fetched fixture body. CHANGED from
+      // `toBe(skillBody)`: the answer now prepends a provenance line naming
+      // the URL the body was fetched from, so it is the body PLUS that line,
+      // not the body alone — returning it unattributed is what let a body
+      // from one origin read as authoritative for a tab from another.
       const skillResult = await client.callTool({ name: 'figpea_skill', arguments: {} });
       const content = (skillResult as any).content as Array<{ type: string; text?: string }>;
       const textBlock = content.find((c) => c.type === 'text');
-      expect(textBlock?.text).toBe(skillBody);
+      expect(textBlock?.text).toContain(skillBody);
+      expect(textBlock?.text, 'the answer names the origin it fetched from').toContain(
+        `${origin}/agent/skill.md`,
+      );
     } finally {
       await client.close().catch(() => {});
       await transport.close().catch(() => {});
