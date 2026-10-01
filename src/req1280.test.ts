@@ -137,6 +137,39 @@ const MANIFEST = {
   },
 } as unknown as ManifestLike;
 
+/**
+ * REQ-1338 AC-4(b) — a LEGACY free-text manifest, the one "no schema is
+ * available" state that is NOT the same code path as "no manifest at all".
+ *
+ * Here every `params` value is a hint STRING, so `buildParamSchemas`
+ * (`tools.ts`) carries nothing structured through and returns `undefined`:
+ * a lane that *has* a tool, whose every position nonetheless has no declared
+ * type. This is the state a pre-REQ-093 manifest leaves behind, and it is the
+ * row a schema-guarded parse would silently break into a manifest-dependent
+ * flag — the flag has to keep parsing here, because there is nothing to scope
+ * a parse to.
+ */
+const LEGACY_MANIFEST = {
+  layer: {
+    create: {
+      doc: 'Creates a layer of the given kind.',
+      params: {
+        kind: 'the kind of layer to create, e.g. "page", "rect", "text" or "image"',
+        props: 'an object of properties for the new layer',
+      },
+      result: 'the new layer id',
+    },
+    setName: {
+      doc: 'Renames a layer or page by id.',
+      params: {
+        id: 'the id of the layer or page to rename',
+        name: 'the new name',
+      },
+      result: 'nothing',
+    },
+  },
+} as unknown as ManifestLike;
+
 // ── the stub tab: v3's real answer, not a plausible one ────────────────────
 
 /** v3's `receivedTypeName` (validateArgs.ts:35-45), verbatim in behaviour. */
@@ -325,7 +358,8 @@ describe('REQ-1280 AC-1 — the deterministic repro, in both directions', () => 
   // REQ-1280 AC-5's user-approved "the fix is opt-in only". REQ-1318 makes that
   // sentence FALSE by design: `props` is declared `object`, so a JSON-looking
   // string at that position is now PARSED WITHOUT THE FLAG — schema-scoped,
-  // which is what makes the default safe, unlike this REQ's schema-blind flag.
+  // which is what makes the default safe, and unlike this REQ's flag it also
+  // refuses to touch a position no declaration reaches (REQ-1338).
   // The same payload now SUCCEEDS with no flag, and the tab receives a real
   // object. The assertion is REPLACED, not deleted, skipped or relaxed: the
   // editor-answer relay it asserted is still tested below through the
@@ -471,10 +505,13 @@ describe('REQ-1280 AC-4 — a layer.batch ops array sent as one JSON string appl
 // opt-in only" was user-approved and true when REQ-1280 shipped. REQ-1318's
 // whole point is to reverse it for the SCHEMA-DECLARED positions: a structured
 // param may now travel as a JSON string with no flag, so the two spellings
-// agree. The flag itself is untouched — still present, still schema-blind, still
-// opt-in, still the route for a position with no declaration to reason from
-// (that residual is REQ-1338's). So the row is REPLACED with the stronger
-// guarantee, not deleted, skipped or weakened.
+// agree. The flag itself is untouched — still present, still opt-in, still the
+// route for a position with no declaration to reason from. (REQ-1338 closed the
+// flag's parse-scoping residual: it now asks the declaration where one is
+// reachable, which is why at a declared scalar it does nothing the default
+// does not already do. What is left that is unique to the flag is the position
+// nothing declares.) So the row is REPLACED with the stronger guarantee, not
+// deleted, skipped or weakened.
 describe('REQ-1280 AC-5 — superseded by REQ-1318 AC-6: the flag-less route is now equivalent, not inert', () => {
   it('absent and _rawJson:false are indistinguishable, and both deliver a real object', async () => {
     const { stub, captured } = makeStub();
@@ -517,7 +554,10 @@ describe('REQ-1280 AC-5 — superseded by REQ-1318 AC-6: the flag-less route is 
     expect(withoutFlag.code).toBe('invalid_params');
     expect(withoutFlag.message).toContain(AC1_REPRO_MESSAGE);
     expect(captured[0]!.args[1]).toBe('{"name":"probe","pageWidth":300,"pageHeight":200}');
-    // With the flag, the schema-blind parse is what rescues it — unchanged.
+    // With the flag, the parse is what rescues it — unchanged: with no manifest
+    // in memory there is no declaration to scope to, so the flag parses
+    // (REQ-1338's predicate returns true for an absent schema, which is exactly
+    // what keeps the flag off the manifest's neck).
     const withFlag = await callToolJson(client, 'figpea_call', {
       group: 'layer',
       method: 'create',
@@ -688,8 +728,9 @@ describe('REQ-1280 AC-7 — compact and full cannot drift', () => {
     });
     expect(legit.ok).toBe(true);
     expect(captured[0]!.args[1]).toBe(LEGIT_STRING);
-    // …and a stringified object is still parsed, because the parse itself is
-    // schema-blind (that is what makes the flag usable on a first call).
+    // …and a stringified object is still parsed, because with no declaration
+    // reachable there is nothing to scope a parse to and the flag parses on its
+    // own (that is what makes the flag usable on a first call).
     const parsed = await callToolJson(client, 'figpea_call', {
       group: 'layer',
       method: 'create',
@@ -756,12 +797,20 @@ describe('REQ-1280 AC-8 — a flag that cannot apply fails loudly', () => {
     expect(captured[0]!.args[1]).toBe(LEGIT_STRING);
   });
 
-  it('a residual, deliberately not fixed: a string position holding VALID json is still parsed (documenting test)', async () => {
-    // `setName(id, '[1,2,3]')` with the flag on parses to an array and the tab
-    // rejects it. That is the price of an opt-in, schema-blind parse and it
-    // matches full mode since REQ-1037, so it is parity, not drift. This test
-    // documents the behaviour instead of hiding it: if the parse is ever
-    // schema-guarded, this fails and the change is a deliberate one.
+  it('a declared string position holding VALID json is NOT parsed (REQ-1338 — polarity inverted)', async () => {
+    // ⛔ POLARITY INVERTED BY REQ-1338, IN PLACE. This row used to read "a
+    // residual, deliberately not fixed: a string position holding VALID json is
+    // still parsed (documenting test)" — it existed precisely so that a
+    // schema-guarded parse would FAIL it, and REQ-1338 is that guard. The
+    // tripwire is kept and its polarity flipped rather than deleted or skipped:
+    // the same file, the same position, the same role, now failing if the parse
+    // ever stops being declaration-scoped. A delete would be indistinguishable
+    // from a weakened assertion to the next reader (AC-6).
+    //
+    // PRE-FIX, kept here so the repro stays runnable cold: both paths returned
+    // `{ok:false, code:'invalid_params', message:'setName(): name must be
+    // string (got array)'}` and the tab had been sent ["L1",[1,2,3]] — the
+    // parsed value, of a type the caller never chose.
     const compactRun = makeStub();
     const compactClient = await connect(compactRun.stub, 'compact');
     const compactResult = await callToolJson(compactClient, 'figpea_call', {
@@ -774,14 +823,18 @@ describe('REQ-1280 AC-8 — a flag that cannot apply fails loudly', () => {
     const fullClient = await connect(fullRun.stub, 'full');
     const fullResult = await callToolJson(fullClient, 'layer_setName', { id: 'L1', name: '[1,2,3]', _rawJson: true });
 
-    expect(compactResult.ok).toBe(false);
-    expect(compactResult.message).toContain('setName(): name must be string (got array)');
-    // The tab's answer is identical on both paths (compact relays it with
-    // REQ-1268's shape-hint suffix appended, which is pre-existing behaviour
-    // of the compact path and not this REQ's business).
-    expect(compactResult.message.startsWith(fullResult.message)).toBe(true);
-    expect(fullResult.message).toBe('setName(): name must be string (got array)');
-    expect(compactRun.captured[0]!.args[1]).toEqual([1, 2, 3]);
+    // Neither path refuses, and neither path converts the text: the layer is
+    // named `[1,2,3]`, which is what the caller meant.
+    expect(compactResult.ok).toBe(true);
+    expect(fullResult.ok).toBe(true);
+    expect(compactResult.message).toBeUndefined();
+    expect(fullResult.message).toBeUndefined();
+    expect(compactRun.captured[0]!.args[1]).toBe('[1,2,3]');
+    expect(typeof compactRun.captured[0]!.args[1]).toBe('string');
+    expect(fullRun.captured[0]!.args[1]).toBe('[1,2,3]');
+    expect(typeof fullRun.captured[0]!.args[1]).toBe('string');
+    // Byte-equal on the wire, so the two paths cannot drift on the fix either.
+    expect(compactRun.captured[0]!.args).toEqual(fullRun.captured[0]!.args);
   });
 
   it('flag truthy with args present but not an array: a loud failure that names args', async () => {
@@ -803,6 +856,301 @@ describe('REQ-1280 AC-8 — a flag that cannot apply fails loudly', () => {
     expect(text).toMatch(/expected array|args must be an array/);
     if (result.isError !== true) expect(text).toContain('_rawJson');
     expect(captured).toHaveLength(0);
+  });
+});
+
+// ───────────────────────────────── REQ-1338 — a declared scalar is never parsed ──
+
+/**
+ * REQ-1338 — `_rawJson` must not rewrite a value a `string`-declared position
+ * was given as text.
+ *
+ * REQ-1280 shipped the parse deliberately schema-blind and recorded the residue
+ * as this follow-up by name (`rawJson.ts`'s own module header, boundary 2, said
+ * so too). The defect: a position the manifest declares `string`/`number`/
+ * `boolean`, holding text that happens to be VALID JSON, was converted into
+ * real data and the editor then rejected it for being the wrong type — after
+ * a round trip, with an error naming a type and nothing naming the flag the
+ * caller had set.
+ *
+ * AC map (see `docs/plans/REQ-1338-6ab963e9.md` §Use cases → task → test):
+ *  - AC-1  the repro, closed, on BOTH paths: `{ok:true}` and the literal
+ *          `'[1,2,3]'` on the wire, asserted on the CAPTURED positional arg
+ *          (so a stub that ignored its input could not satisfy it). The
+ *          pre-fix envelope is quoted verbatim in the comment below so the
+ *          repro stays runnable cold, in both directions.
+ *  - AC-2  the same two calls with the flag ABSENT are unchanged — the fix is
+ *          opt-in and cannot move unflagged behaviour on either path.
+ *  - AC-3  every structured declared type still parses, on both paths.
+ *  - AC-4  no schema available — compact before any `describe()`, a legacy
+ *          free-text manifest, and (the same code path as the first) a disabled
+ *          startup contract fetch — the flag still parses and still never
+ *          refuses. A schema-guarded parse must NOT become a manifest-dependent
+ *          flag.
+ *  - AC-5  the loud-failure contract REQ-1280 shipped is untouched: a
+ *          JSON-looking string that cannot be parsed at a STRUCTURED position
+ *          is still refused by name at 0 round trips, byte-equal across both
+ *          paths; the same value at a SCALAR position is still forwarded
+ *          verbatim and is not an error.
+ *  - AC-6  the test that used to DOCUMENT the schema-blind behaviour is
+ *          inverted in place below, keeping its tripwire role.
+ *
+ * RED on the unfixed worktree: `applyRawJson` consults the declared schema
+ * only to decide whether a FAILED parse is worth reporting, so every AC-1/AC-2
+ * flagged row below fails with `setName(): name must be string (got array)`
+ * and a captured `args[1]` that is `[1,2,3]` rather than the string.
+ */
+const JSON_LITERAL_NAME = '[1,2,3]';
+/** The exact pre-fix envelope AC-1 records. Before the fix BOTH paths returned
+ *  `{ok:false, code:'invalid_params', message:'setName(): name must be string
+ *  (got array)'}` and the tab had been sent `["L1",[1,2,3]]` — a round trip
+ *  spent on a value the caller never sent in that shape. */
+const PRE_FIX_ENVELOPE_MESSAGE = 'setName(): name must be string (got array)';
+
+describe('REQ-1338 AC-1/AC-2 — a declared string position is forwarded as the literal text', () => {
+  it('compact, flag on: figpea_call({setName, ["L1","[1,2,3]"]}) returns ok:true and the tab receives the STRING', async () => {
+    const { stub, captured } = makeStub();
+    const client = await connect(stub, 'compact');
+    const result = await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'setName',
+      args: ['L1', JSON_LITERAL_NAME],
+      _rawJson: true,
+    });
+    // PRE-FIX, for the record and to keep the repro runnable cold: this call
+    // returned `{ok:false, code:'invalid_params', message:
+    // 'setName(): name must be string (got array)'}` after the tab had been
+    // sent ["L1",[1,2,3]] — a type error that never mentioned the flag.
+    expect(result.message).not.toBe(PRE_FIX_ENVELOPE_MESSAGE);
+    expect(result.ok).toBe(true);
+    // Asserted on the CAPTURED positional arg, not merely on the envelope: a
+    // stub that ignored its input could not satisfy this, and neither could a
+    // server that parsed the value and then happened to report success.
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.args[1]).toBe(JSON_LITERAL_NAME);
+    expect(typeof captured[0]!.args[1]).toBe('string');
+    expect(Array.isArray(captured[0]!.args[1])).toBe(false);
+    expect(captured[0]!.args).toEqual(['L1', JSON_LITERAL_NAME]);
+  });
+
+  it('full, flag on: layer_setName({name:"[1,2,3]", _rawJson:true}) returns ok:true and the tab receives the STRING', async () => {
+    const { stub, captured } = makeStub();
+    const client = await connect(stub, 'full');
+    const result = await callToolJson(client, 'layer_setName', { id: 'L1', name: JSON_LITERAL_NAME, _rawJson: true });
+    expect(result.message).not.toBe(PRE_FIX_ENVELOPE_MESSAGE);
+    expect(result.ok).toBe(true);
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.args[1]).toBe(JSON_LITERAL_NAME);
+    expect(typeof captured[0]!.args[1]).toBe('string');
+    expect(captured[0]!.args).toEqual(['L1', JSON_LITERAL_NAME]);
+  });
+
+  it('AC-2 — the same two calls with the flag ABSENT are unchanged: literal string, ok:true, both paths', async () => {
+    // The fix is opt-in, so it must be invisible here. REQ-1318 owns the
+    // flag-LESS route proper (and pins it in req1318StringJson.test.ts); this
+    // row is specifically the UNFLAGGED call at a `string` position, which is
+    // the cell the new guard could most easily have disturbed.
+    const compactRun = makeStub();
+    const compactClient = await connect(compactRun.stub, 'compact');
+    const compactResult = await callToolJson(compactClient, 'figpea_call', {
+      group: 'layer',
+      method: 'setName',
+      args: ['L1', JSON_LITERAL_NAME],
+    });
+
+    const fullRun = makeStub();
+    const fullClient = await connect(fullRun.stub, 'full');
+    const fullResult = await callToolJson(fullClient, 'layer_setName', { id: 'L1', name: JSON_LITERAL_NAME });
+
+    expect(compactResult.ok).toBe(true);
+    expect(fullResult.ok).toBe(true);
+    expect(compactResult.message).not.toBe(PRE_FIX_ENVELOPE_MESSAGE);
+    expect(fullResult.message).not.toBe(PRE_FIX_ENVELOPE_MESSAGE);
+    expect(compactRun.captured).toHaveLength(1);
+    expect(fullRun.captured).toHaveLength(1);
+    expect(compactRun.captured[0]!.args[1]).toBe(JSON_LITERAL_NAME);
+    expect(fullRun.captured[0]!.args[1]).toBe(JSON_LITERAL_NAME);
+    // The two paths are one value, which is what makes "the fix cannot change
+    // unflagged behaviour" a fact about the wire rather than about a message.
+    expect(compactRun.captured[0]!.args).toEqual(fullRun.captured[0]!.args);
+  });
+});
+
+describe('REQ-1338 AC-3 — every structured declared type still parses, on both paths', () => {
+  it('object, array and matrix positions are unaffected: the flag still converts them', async () => {
+    // The structured half of the new predicate, stated directly rather than
+    // inferred from the guard rows: narrowing the flag's reach must cost the
+    // three declared types nothing. REQ-1280's own AC-2/3/4 rows (the
+    // `create(props + transform)` and `layer.batch(ops)` cases) stay in place
+    // and green above — this row adds the declared-type enumeration.
+    const structured: Array<{
+      tool: string;
+      compact: Record<string, unknown>;
+      full: Record<string, unknown>;
+      declared: string;
+      index: number;
+      expected: unknown;
+    }> = [
+      {
+        tool: 'layer_create',
+        compact: { group: 'layer', method: 'create', args: ['page', '{"pageWidth":1500}'], _rawJson: true },
+        full: { kind: 'page', props: '{"pageWidth":1500}', _rawJson: true },
+        declared: 'object',
+        index: 1,
+        expected: { pageWidth: 1500 },
+      },
+      {
+        tool: 'layer_batch',
+        compact: { group: 'layer', method: 'batch', args: ['[{"method":"setName","args":["L1","hero"]}]'], _rawJson: true },
+        full: { ops: '[{"method":"setName","args":["L1","hero"]}]', _rawJson: true },
+        declared: 'array',
+        index: 0,
+        expected: [{ method: 'setName', args: ['L1', 'hero'] }],
+      },
+      {
+        tool: 'layer_setTransform',
+        compact: { group: 'layer', method: 'setTransform', args: ['L1', '[5,0,0,3.5,0,0]'], _rawJson: true },
+        full: { id: 'L1', matrix: '[5,0,0,3.5,0,0]', _rawJson: true },
+        declared: 'matrix',
+        index: 1,
+        expected: [5, 0, 0, 3.5, 0, 0],
+      },
+    ];
+
+    for (const row of structured) {
+      const compactRun = makeStub();
+      const compactClient = await connect(compactRun.stub, 'compact');
+      const compactResult = await callToolJson(compactClient, 'figpea_call', row.compact);
+      const fullRun = makeStub();
+      const fullClient = await connect(fullRun.stub, 'full');
+      const fullResult = await callToolJson(fullClient, row.tool, row.full);
+
+      expect(compactResult.ok, `${row.declared} (compact)`).toBe(true);
+      expect(fullResult.ok, `${row.declared} (full)`).toBe(true);
+      expect(compactRun.captured[0]!.args[row.index], `${row.declared} (compact) is parsed`).toEqual(row.expected);
+      expect(fullRun.captured[0]!.args[row.index], `${row.declared} (full) is parsed`).toEqual(row.expected);
+      expect(compactRun.captured[0]!.args, `${row.declared}: the two paths agree`).toEqual(fullRun.captured[0]!.args);
+    }
+  });
+});
+
+describe('REQ-1338 AC-4 — with NO schema available the flag still parses, and still never refuses', () => {
+  it('compact before any describe(): a value that would be a declared string is STILL parsed, and the flag is not the thing that refuses', async () => {
+    // Sits beside the row above it at the same place in the file: "with NO
+    // manifest the flag still parses and never refuses" stays GREEN and
+    // UNEDITED, and this is the row beside it that a naive schema guard would
+    // have broken. With no manifest, `contractToolFor` yields `undefined` at
+    // every position, so there is no declaration to scope a parse to and the
+    // flag must parse — that is the whole reason it cannot be
+    // manifest-dependent, and the whole reason it stays opt-in.
+    const { stub, captured } = makeStub({ deliverManifest: undefined });
+    const client = await connect(stub, 'compact');
+    const result = await callToolJson(client, 'figpea_call', {
+      group: 'layer',
+      method: 'setName',
+      args: ['L1', JSON_LITERAL_NAME],
+      _rawJson: true,
+    });
+    // The server took no opinion: the value WAS parsed, and the tab's own
+    // `validateArgs` rule is what refuses it, after the round trip. Naming the
+    // tab's message is the honest way to pin "the flag parsed" — a silent
+    // no-op here would forward the string and return ok:true instead.
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.args[1]).toEqual([1, 2, 3]);
+    expect(Array.isArray(captured[0]!.args[1])).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain(PRE_FIX_ENVELOPE_MESSAGE);
+  });
+
+  it('a LEGACY free-text manifest: full mode still parses, because that state has a tool but no declared types', async () => {
+    // AC-4's second named state, and the only one that is a genuinely different
+    // code path from "no manifest at all": the lane HAS a tool, so the handler
+    // runs, but every `params` value is a hint string, so `buildParamSchemas`
+    // returns `undefined` and `schemaAt(i)` yields no schema at any position.
+    // A parse guarded on "the schema says structured" would silently stop
+    // working here and the flag would become manifest-dependent.
+    const { stub, captured } = makeStub({ deliverManifest: LEGACY_MANIFEST });
+    const client = await connect(stub, 'full');
+    const result = await callToolJson(client, 'layer_create', { kind: 'page', props: '{"pageWidth":1500}', _rawJson: true });
+    expect(result.ok).toBe(true);
+    expect(captured).toHaveLength(1);
+    // A real object with a real number, not the string — the parse happened.
+    expect(captured[0]!.args[1]).toEqual({ pageWidth: 1500 });
+    expect(typeof (captured[0]!.args[1] as any).pageWidth).toBe('number');
+  });
+
+  it('and a FAILED parse in that same state is still neither recorded nor reported', async () => {
+    // The other half of the no-declaration contract, in the state that HAS a
+    // tool: the flag parses (row above), the value cannot be parsed, and
+    // because nothing is provably structured here the failure is neither
+    // recorded nor reported — the call succeeds with the text as sent. Loudness
+    // in this state would break a call that works today, which is why the
+    // failure-recording guard stays a SEPARATE question from the parse guard.
+    const { stub, captured } = makeStub({ deliverManifest: LEGACY_MANIFEST });
+    const client = await connect(stub, 'full');
+    const result = await callToolJson(client, 'layer_setName', { id: 'L1', name: BROKEN_OBJECT, _rawJson: true });
+    expect(result.ok).toBe(true);
+    expect(result.message).toBeUndefined();
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.args[1]).toBe(BROKEN_OBJECT);
+  });
+});
+
+describe('REQ-1338 AC-5 — the loud-failure contract REQ-1280 shipped is unchanged', () => {
+  it('a JSON-looking string that FAILS to parse at a structured position: invalid_params naming _rawJson, byte-equal, 0 round trips', async () => {
+    const compactRun = makeStub();
+    const compactClient = await connect(compactRun.stub, 'compact');
+    const compactResult = await callToolJson(compactClient, 'figpea_call', {
+      group: 'layer',
+      method: 'create',
+      args: ['page', BROKEN_OBJECT],
+      _rawJson: true,
+    });
+
+    const fullRun = makeStub();
+    const fullClient = await connect(fullRun.stub, 'full');
+    const fullResult = await callToolJson(fullClient, 'layer_create', { kind: 'page', props: BROKEN_OBJECT, _rawJson: true });
+
+    expect(compactResult.code).toBe('invalid_params');
+    expect(fullResult.code).toBe(compactResult.code);
+    // One message builder, so the guidance after the position is byte-equal and
+    // two writers cannot drift (AC-7 of REQ-1280, still owed after this change).
+    const tail = (m: string) => m.slice(m.indexOf('could not be parsed as JSON'));
+    expect(tail(compactResult.message)).toBe(tail(fullResult.message));
+    expect(compactResult.message).toContain('_rawJson');
+    expect(fullResult.message).toContain('_rawJson');
+    // Zero round trips on BOTH paths: the tab is never asked.
+    expect(compactRun.captured).toHaveLength(0);
+    expect(fullRun.captured).toHaveLength(0);
+  });
+
+  it('the SAME value at a scalar position is still forwarded verbatim, and is NOT an error', async () => {
+    // The complementary half, pinned in the same place because the fix must not
+    // buy the row above by costing this one: a declared `string` position is
+    // now skipped by the parse, so nothing can be recorded there either — the
+    // value travels as the text the caller sent and the call succeeds.
+    const compactRun = makeStub();
+    const compactClient = await connect(compactRun.stub, 'compact');
+    const compactResult = await callToolJson(compactClient, 'figpea_call', {
+      group: 'layer',
+      method: 'setName',
+      args: ['L1', BROKEN_OBJECT],
+      _rawJson: true,
+    });
+
+    const fullRun = makeStub();
+    const fullClient = await connect(fullRun.stub, 'full');
+    const fullResult = await callToolJson(fullClient, 'layer_setName', { id: 'L1', name: BROKEN_OBJECT, _rawJson: true });
+
+    expect(compactResult.ok).toBe(true);
+    expect(fullResult.ok).toBe(true);
+    expect(compactResult.code).not.toBe('invalid_params');
+    expect(fullResult.code).not.toBe('invalid_params');
+    expect(compactRun.captured).toHaveLength(1);
+    expect(fullRun.captured).toHaveLength(1);
+    expect(compactRun.captured[0]!.args[1]).toBe(BROKEN_OBJECT);
+    expect(fullRun.captured[0]!.args[1]).toBe(BROKEN_OBJECT);
+    expect(compactRun.captured[0]!.args).toEqual(fullRun.captured[0]!.args);
   });
 });
 

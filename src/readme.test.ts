@@ -203,20 +203,30 @@ describe('README.md (AC-5)', () => {
     // The loud-failure behaviour is stated, not implied.
     expect(readme).toMatch(/invalid_params/);
     expect(readme, 'the refusal is documented as naming the flag').toMatch(/naming `_rawJson`|names `_rawJson`/);
-    // ⛔ RE-POINTED by REQ-1318, and STRONGER than what it replaced. The
-    // original line pinned one word, `opt-in`, guarding "the fix is opt-in
-    // only" — a sentence REQ-1318 makes FALSE, because a structured
-    // parameter may now travel as a JSON string with no flag at all. The word
-    // is kept (the flag IS still opt-in, and still schema-blind, and still
-    // the route for a position with no declaration to reason from) and a
-    // companion is added, because REQ-1318 splits what one word used to
+    // ⛔ RE-POINTED TWICE, and stronger each time. The original line pinned one
+    // word, `opt-in`, guarding "the fix is opt-in only" — a sentence REQ-1318
+    // made FALSE, because a structured parameter may now travel as a JSON
+    // string with no flag at all. REQ-1318 kept the word (the flag IS still
+    // opt-in) and added a companion, because it split what one word used to
     // conflate into two claims that can now drift apart independently: a
-    // structured param needs NO FLAG, while `_rawJson` remains the opt-in,
-    // schema-blind route. Deleting the pin would have been the finding; two
-    // statements are asserted where one was.
+    // structured param needs NO FLAG, while `_rawJson` remains the opt-in
+    // route.
+    //
+    // REQ-1338 then re-pointed THAT companion. It read
+    // /schema-blind/i — one word, asserting a property the flag no longer has:
+    // since this REQ the flag's parse is declaration-scoped too, so at a
+    // declared `string`/`number`/`boolean` it does nothing the default does
+    // not already do. Three statements are asserted where one was, each saying
+    // what the reader now needs to be able to rely on — the position nothing
+    // declares, the declared scalar left alone, and the falsified framing
+    // pinned as ABSENT so a future REQ cannot quietly restore the "broader"
+    // pitch. Deleting the pin would have been the finding; the absence guard is
+    // REQ-1318's own technique, applied to the word that replaced it.
     expect(readme, 'a structured parameter needs no flag at all').toMatch(/no flag/i);
     expect(readme, 'the flag remains opt-in').toMatch(/opt-in/i);
-    expect(readme, "the flag's true scope is stated: broader, and schema-blind").toMatch(/schema-blind/i);
+    expect(readme, 'the flag parses where nothing declares the position').toMatch(/declares nothing|nothing about|manifest fetched/i);
+    expect(readme, 'a declared string is left exactly as sent').toMatch(/left exactly as you sent it|never parsed|provably never touched/i);
+    expect(readme, 'the falsified "schema-blind" framing is GONE').not.toMatch(/schema-blind/);
   });
 
   // REQ-1318 T4 — the rot-guards for the discoverability this requirement
@@ -241,8 +251,14 @@ describe('README.md (AC-5)', () => {
     // place it would contradict the new rule two paragraphs earlier, so it is
     // pinned as absent rather than left to rot.
     expect(readme).not.toMatch(/without `_rawJson` a stringified object or array is forwarded as the plain string it is/);
-    // …and the correction actually replaced it with the true statement.
-    expect(readme, 'the flag is documented as the broader route, not the only one').toMatch(/broader|either route|both routes/i);
+    // …and the correction actually replaced it with the true statement. The
+    // label below was re-pointed by REQ-1338 because it named the framing the
+    // README no longer uses ("the broader route"): the flag is now the route
+    // for a position nothing declares, which is why A2 keeps the literal
+    // "both routes" and the assertion still passes on that. The ASSERTION is
+    // untouched — it is the pin REQ-1318 put there, and the copy it was
+    // written for still contains one of its three words.
+    expect(readme, 'the flag is documented as one of the two routes, not the only one').toMatch(/broader|either route|both routes/i);
   });
 
   // The rot-guard for the failure class this package's own docs kept walking

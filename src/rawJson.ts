@@ -30,11 +30,14 @@ import type { ParamSchemaLike } from './tools';
  *     AC-8; loudness everywhere would break a call that works today
  *     (`setName(id, '[Hero]')` with `name` declared `string`).
  *
- *  2. The PARSE itself stays schema-blind on both paths. A *valid* JSON
- *     literal sitting at a `string` position is therefore parsed and rejected
- *     downstream — the documented residual class, identical to full mode's
- *     behaviour since REQ-1037, so the two paths cannot diverge. Guarding the
- *     parse would change full mode, which the card puts out of scope.
+ *  2. The PARSE itself is DECLARATION-SCOPED on both paths (REQ-1338). A
+ *     *valid* JSON literal sitting at a `string`/`number`/`boolean` position
+ *     is therefore NOT parsed: `setName(id, '[1,2,3]')` names a layer called
+ *     `[1,2,3]`, because that is text the caller chose, and rewriting it into
+ *     an array made the tab reject the call for being the wrong type — a type
+ *     error that never mentioned the flag that caused it. Where NO declaration
+ *     is reachable the flag still parses; see `rawJsonParseApplies` below for
+ *     why that asymmetry is the feature and not an oversight.
  */
 
 /** A failed parse, located precisely enough to fix blind. */
@@ -114,8 +117,45 @@ export function expectsStructuredValue(schema: RawJsonSchemaLike): boolean {
 }
 
 /**
+ * REQ-1338 — MAY the flag parse this position's value at all?
+ *
+ * The flag's own guard, and the one cell in which it must differ from
+ * `expectsStructuredValue`.
+ *
+ * ⛔ THE ASYMMETRY IS THE WHOLE POINT and must never be "DRY'd" away, because a
+ * future reader who collapses the two functions re-breaks the flag on exactly
+ * the first call an agent is most likely to make. The flag-LESS route asks
+ * `expectsStructuredValue` and therefore SKIPS a position with no declaration:
+ * there, an undeclared value is a DEFAULT, and a default must be provably
+ * untouched. The flag is OPT-IN, and the position no declaration reaches is the
+ * entire reason it exists — a compact-mode first call before any `describe()`, a
+ * legacy free-text manifest, `FIGPEA_DISABLE_CONTRACT_FETCH=1`, a surplus
+ * positional argument past the declared arity. So here, no declaration ⇒ PARSE:
+ * with nothing to scope a parse to, refusing to parse would make the flag
+ * manifest-dependent, i.e. dead on a cold start (REQ-1280 D3, step 1).
+ */
+export function rawJsonParseApplies(schema: RawJsonSchemaLike): boolean {
+  // No declaration reachable — or a declaration this module cannot read, which
+  // is the same state — so the flag's own reason for existing applies.
+  if (schema?.type === undefined) return true;
+  // A declared scalar is provably unreachable from the parse; a declared
+  // structured position is exactly what the flag was asked to convert.
+  return expectsStructuredValue(schema);
+}
+
+/**
  * The one loop both relay paths call. `container` is either a record keyed by
  * parameter name (full mode) or the positional `args` array (compact mode).
+ *
+ * REQ-1338 — the parse is DECLARATION-SCOPED, not element-wise-and-blind: a
+ * position whose declared type is `string`/`number`/`boolean` is skipped before
+ * the value is even read, and a position no declaration reaches is parsed. The
+ * rules that decide HOW a value is parsed are otherwise unchanged, character for
+ * character: the truthy flag set (`isRawJsonFlag`), the `trim()`, the
+ * `{…}`/`[…]` shape test, the single `JSON.parse` call site, the
+ * "parsed to a non-null object or leave it alone" guard (so `'"42"'` stays a
+ * string), copy-on-write that preserves the container's kind, and the
+ * same-container-identity return when nothing parsed.
  *
  * Returns the same container (by identity) when nothing parsed, so the common
  * case allocates nothing and no caller has to reason about a fresh copy.
@@ -137,6 +177,14 @@ export function applyRawJson<T extends Record<string, unknown> | unknown[]>(
 
   for (let i = 0; i < positions.length; i++) {
     const key = positions[i]!;
+    // STEP 1 — REQ-1338. The whole safety claim, asked BEFORE the value is even
+    // looked at, in the same position and the same idiom
+    // `applyStructuredStringJson` uses below: a declared scalar is provably
+    // unreachable from here, not merely unlikely to be affected. The predicate
+    // is `rawJsonParseApplies` and NOT `expectsStructuredValue` — with no
+    // declaration reachable the flag still parses, which is what keeps it alive
+    // on a cold start.
+    if (!rawJsonParseApplies(opts.schemaAt(i))) continue;
     const original = source[key];
     const parsed = parseRawJsonValue(original);
     if (parsed.ok) {
@@ -152,6 +200,14 @@ export function applyRawJson<T extends Record<string, unknown> | unknown[]>(
     // A failed parse at a position the schema proves was meant to be
     // structured is the case where the caller's belief that the flag was
     // honoured is provably false — report it, leave the value alone.
+    //
+    // ⛔ NOT REDUNDANT with STEP 1 above, and the obvious wrong cleanup is to
+    // delete it as dead code. The two guards answer different questions. After
+    // STEP 1 this loop still reaches `parseRawJsonValue` at two kinds of
+    // position: one declared `object`/`array`/`matrix` (record the failure —
+    // that is what makes the refusal loud and free) and one with NO declaration
+    // at all (never record — loudness there would break a first call). This is
+    // the test that keeps those two apart.
     if (expectsStructuredValue(opts.schemaAt(i))) {
       structuredFailures.push({ path: opts.pathAt(i), raw: parsed.raw });
     }
@@ -171,16 +227,21 @@ export function applyRawJson<T extends Record<string, unknown> | unknown[]>(
  * ⛔ WHY THE GATE IS THE SCHEMA, and why that is the whole safety claim. A
  * host harness that collapses nested arrays into `{"item": …}` envelopes is
  * outside this repo, so the only route that survives it is a SCALAR — and a
- * string is a scalar. But a schema-blind default would parse a legitimate
- * value: `layer.setName(id, '[Hero]')` at a `string`-declared position is a
- * NAME, and `setName(id, '[1,2,3]')` is a name too. Because step 1 asks the
- * declaration first, a string at a `string`/`number`/`boolean` position — and
- * any value at all where no declaration is reachable (a legacy free-text
- * manifest, or compact mode with no manifest in memory) — is provably never
- * touched. That is the difference from `_rawJson`, whose parse is deliberately
- * schema-blind (REQ-1280's documented residual, owned by REQ-1338), and the
- * reason the flag-less route is safe to make the DEFAULT while the flag stays
- * opt-in.
+ * string is a scalar. But an ungated default would parse a legitimate value:
+ * `layer.setName(id, '[Hero]')` at a `string`-declared position is a NAME, and
+ * `setName(id, '[1,2,3]')` is a name too. Because step 1 asks the declaration
+ * first, a string at a `string`/`number`/`boolean` position — and any value at
+ * all where no declaration is reachable (a legacy free-text manifest, or
+ * compact mode with no manifest in memory) — is provably never touched.
+ *
+ * ⛔ THIS IS WHERE THE TWO ROUTES DIFFER, and the difference is one predicate.
+ * `_rawJson` asks `rawJsonParseApplies`, which is this function's
+ * `expectsStructuredValue` PLUS one case: where no declaration is reachable,
+ * the flag parses, because the flag exists for that position. Everywhere else
+ * the two loops make the same decision at the same position, which is why at a
+ * declared scalar setting the flag is now identical to not setting it, and why
+ * a future reader must not merge the two functions (that would make the flag
+ * manifest-dependent and dead on a cold start).
  *
  * ⛔ PARSE AND USE, NEVER REPORT, NEVER REPAIR, NEVER THROW. A string that
  * does not parse is left exactly as sent; a string that parses to the WRONG

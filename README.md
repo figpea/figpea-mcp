@@ -208,19 +208,23 @@ When a call does time out, the error says so honestly — `timed out after Nms; 
 
 `_timeoutMs` raises *this package's* deadline only. Your MCP host has its own request timeout on top of it, which `_timeoutMs` cannot raise. When the host's ceiling fires first you get a transport-level error (e.g. `MCP error -32001: Request timed out`) and **no envelope at all** — no message, no named state check, nothing telling you whether the mutation applied. That is the one case where the advice above is not delivered for you: run the state check yourself, and prefer passing `_timeoutMs` up front to waiting under the host's ceiling.
 
-Every tool also accepts `_rawJson` (boolean, optional) — the escape hatch for a host harness that stringifies a nested object or array instead of sending it as one. Set it to `true` and every argument that is a string whose trimmed form starts with `{`/`[` and ends with `}`/`]` is JSON-parsed before forwarding, so the whole object can travel as a string and arrive as a real object with real numbers.
+Every tool also accepts `_rawJson` (boolean, optional) — the escape hatch for a host harness that stringifies a nested object or array instead of sending it as one. Set it to `true` and a JSON-looking string is JSON-parsed before forwarding at any position this build's manifest **declares** `object`/`array`/`matrix`, or at any position it declares nothing about at all — so the whole object can travel as a string and arrive as a real object with real numbers.
+
+A parameter the manifest **declares** a `string`, `number` or `boolean` is left exactly as you sent it, even when its text happens to be valid JSON: `setName(id, '[1,2,3]')` still names the layer `[1,2,3]`, and a code sample or a fake API response travels as the text it is.
+
+The positions the manifest says nothing about are where the flag earns its keep — an unknown method, a legacy free-text manifest, or a call made before the contract has been fetched. There is nothing there to scope a parse to, which is what the flag is for.
 
 It works on **both** tool modes, on the two different surfaces each mode gives you:
 
 - **Full mode** — a top-level param of any generated tool: `figpea_layer_create({ "kind": "page", "props": "{\"pageWidth\":1500}", "_rawJson": true })` parses `props`.
 - **Compact mode (the default)** — any **element** of `figpea_call`'s positional `args` array, including nested payloads like a `layer.batch` ops array: `figpea_call({ "group": "layer", "method": "batch", "args": ["[{\"method\":\"create\",\"args\":[\"rect\",{\"rwidth\":100}]}]"], "_rawJson": true })` delivers `ops` as a real array, so the whole batch arrives in one call.
 
-It is **opt-in**, and deliberately so. It is the **broader but schema-blind** route: it parses any element that looks like JSON, with no manifest lookup, which is what makes it usable on a first call before anything has been described — and also what makes it unsafe as a default, since a schema-blind parse would rewrite a legitimate string. So there are **two routes**, and the narrower one is the default:
+It is **opt-in**, and deliberately so. Where this build's manifest does declare a position, the flag is scoped the same way the default is: both routes are declaration-scoped, so **both routes** leave a `string`/`number`/`boolean` position exactly as you sent it. What the flag adds is the positions nothing declares. So there are **two routes**, and the narrower one is the default:
 
 - **No flag (the default)** — a parameter the manifest **declares** as an `object`/`array`/`matrix` may travel as a JSON string, and the server parses it. Schema-scoped, so a `string`-declared value is provably never touched. This is the route to reach for when you know the method.
-- **`_rawJson: true`** (opt-in) — the broader, schema-blind route above, for when you do not: an unknown method, or a parameter this build of the manifest does not declare as structured. With no declaration there is nothing to scope a parse to, so the flag is what makes the value usable.
+- **`_rawJson: true`** (opt-in) — the route for a position you cannot scope: an unknown method, a parameter this build's manifest does not declare as structured, or no manifest fetched at all, where there is nothing to scope a parse to and the flag is the only thing that makes the value usable. At a position the manifest *does* declare as structured you need neither it nor anything else — the default parses a JSON string there and checks the parsed shape against the declaration too — and all the flag adds there is a refusal that names `_rawJson` instead of the position.
 
-If a value *looks* like JSON but cannot be parsed, and the parameter is declared an `object` or an array, the call is refused up front with `invalid_params` naming `_rawJson` and the parameter, instead of being silently forwarded — so the flag never lies about having been honoured. The server also coerces string numerics inside objects/arrays to numbers defensively (harness stringification tolerance) without requiring `_rawJson`.
+If a value *looks* like JSON but cannot be parsed, and the parameter is declared an `object`, `array` or `matrix`, the call is refused up front with `invalid_params` naming `_rawJson` and the parameter, instead of being silently forwarded — so the flag never lies about having been honoured. The server also coerces string numerics inside objects/arrays to numbers defensively (harness stringification tolerance) without requiring `_rawJson`.
 
 ## Security model
 

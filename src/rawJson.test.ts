@@ -3,6 +3,7 @@ import {
   isRawJsonFlag,
   parseRawJsonValue,
   expectsStructuredValue,
+  rawJsonParseApplies,
   applyRawJson,
   rawJsonFailureMessage,
 } from './rawJson';
@@ -102,6 +103,119 @@ describe('REQ-1280 — expectsStructuredValue: the guard, lifted not invented', 
       expect(expectsStructuredValue(schema(t)), t).toBe(false);
     }
     expect(expectsStructuredValue(undefined)).toBe(false);
+  });
+});
+
+describe('REQ-1338 — rawJsonParseApplies: the FLAG\'s guard, over the whole declared-type space', () => {
+  // REQ-1338 AC-6 — the guard matrix for the new predicate. `expectsStructuredValue`
+  // answers "is a structured value PROVABLY intended here?", which is the
+  // flag-LESS route's question: skip unless the declaration says structured.
+  // `rawJsonParseApplies` answers "MAY the flag parse this position?", and the
+  // two differ in exactly one cell — the one that decides whether `_rawJson`
+  // survives a cold start.
+  it('is true for the structured declared types: the flag still converts what was meant to be converted', () => {
+    for (const t of ['object', 'array', 'matrix']) {
+      expect(rawJsonParseApplies(schema(t)), t).toBe(true);
+    }
+  });
+
+  it('is false for a scalar declared position — a JSON literal there is TEXT the caller chose', () => {
+    // The defect REQ-1338 exists to close. `setName(id, '[1,2,3]')` is a NAME;
+    // parsing it produced an array, and the editor rejected the call for being
+    // the wrong type — naming a type, and never the flag that caused it.
+    for (const t of ['string', 'number', 'boolean', 'color', 'anything']) {
+      expect(rawJsonParseApplies(schema(t)), t).toBe(false);
+    }
+  });
+
+  it('is true where NO declaration is reachable — the flag\'s whole reason to exist', () => {
+    // A compact-mode first call before any `describe()`, a legacy free-text
+    // manifest, `FIGPEA_DISABLE_CONTRACT_FETCH=1`, a surplus positional
+    // argument past the declared arity. With nothing declared there is nothing
+    // to scope a parse to, so the flag parses. A predicate that skipped here
+    // would make the flag manifest-dependent — dead on exactly the first call
+    // an agent is most likely to make.
+    expect(rawJsonParseApplies(undefined)).toBe(true);
+    // A schema object that carries no `type` is the same state, not a third
+    // answer: a hint the module cannot read must not be read as "scalar".
+    expect(rawJsonParseApplies({} as ParamSchemaLike)).toBe(true);
+  });
+
+  it('DIFFERS from expectsStructuredValue in exactly the no-declaration cell — and the reason is the flag\'s design', () => {
+    // The two predicates are one line apart and must NOT be collapsed into one
+    // function. They agree on every NAMED declared type, and they disagree on
+    // the one state that is not a declared type at all:
+    //   - `expectsStructuredValue(undefined) === false` is what lets the
+    //     flag-LESS default leave an undeclared value provably untouched;
+    //   - `rawJsonParseApplies(undefined) === true` is what keeps the flag
+    //     usable where there is no manifest.
+    for (const s of [undefined, {} as ParamSchemaLike]) {
+      expect(rawJsonParseApplies(s), 'the flag parses where nothing declares').toBe(true);
+      expect(expectsStructuredValue(s), 'the default touches nothing there').toBe(false);
+    }
+    for (const t of ['object', 'array', 'matrix', 'string', 'number', 'boolean']) {
+      expect(rawJsonParseApplies(schema(t)), t).toBe(expectsStructuredValue(schema(t)));
+    }
+    // Read together those two statements are the whole design: the flag's guard
+    // is the flag-LESS route's guard everywhere except where a declaration is
+    // missing, which is precisely the position the flag exists to reach.
+  });
+
+  it('applyRawJson leaves a declared-scalar value BYTE-IDENTICAL, and keeps the same container identity', () => {
+    // The record form (full mode's named params): the flag is set, the value is
+    // valid JSON, and the declaration says `string` — so nothing happens, and
+    // the caller gets back the very container it sent.
+    const args = { id: 'L1', name: '[1,2,3]' } as Record<string, unknown>;
+    const applied = applyRawJson(args, {
+      keys: ['id', 'name'],
+      schemaAt: () => schema('string'),
+      pathAt: (i) => (i === 0 ? 'id' : 'name'),
+    });
+    expect(applied.value).toBe(args);
+    expect(applied.value.name).toBe('[1,2,3]');
+    expect(applied.structuredFailures).toEqual([]);
+  });
+
+  it('applyRawJson over the ARRAY form: a declared scalar is skipped while a declared object still parses', () => {
+    // Both halves in one call, which is the claim a reviewer should not have to
+    // take on trust: the guard is per-POSITION, so narrowing one position never
+    // narrows its neighbour.
+    const schemas = [schema('string'), schema('object'), schema('string'), schema('array')];
+    const applied = applyRawJson(['L1', '{"pageWidth":1500}', '[1,2,3]', '[{"method":"setName"}]'], {
+      schemaAt: (i) => schemas[i],
+      pathAt: (i) => `args[${i}]`,
+    });
+    expect(applied.value).toEqual(['L1', { pageWidth: 1500 }, '[1,2,3]', [{ method: 'setName' }]]);
+    expect(applied.structuredFailures).toEqual([]);
+  });
+
+  it('a NO-DECLARATION position still parses — the rows above it in this file are unchanged and this is why', () => {
+    // The existing no-manifest rows use `schemaAt: () => undefined` and are
+    // left unedited; this is the same contract stated against the new predicate
+    // directly, so the reason they still pass is visible rather than inferred.
+    const applied = applyRawJson(['L1', '[1,2,3]'], { schemaAt: () => undefined, pathAt: (i) => `args[${i}]` });
+    expect(applied.value).toEqual(['L1', [1, 2, 3]]);
+  });
+
+  it('a declared-scalar position is skipped BEFORE the parse, so a value that does not parse there is neither recorded nor reported', () => {
+    // The failure-recording guard and the parse guard answer two different
+    // questions and both stay: at a structured position a failure is loud, at a
+    // declared scalar the position is never reached, and with no declaration the
+    // parse happens and its failure is still silent. Collapsing any two of
+    // those is the regression this row exists to catch.
+    const scalar = applyRawJson(['L1', '{name: "probe"}'], {
+      schemaAt: (i) => schema('string'),
+      pathAt: (i) => `args[${i}]`,
+    });
+    expect(scalar.structuredFailures).toEqual([]);
+    expect(scalar.value).toEqual(['L1', '{name: "probe"}']);
+
+    const structured = applyRawJson(['L1', '{name: "probe"}'], {
+      schemaAt: (i) => schema('object'),
+      pathAt: (i) => `args[${i}]`,
+    });
+    expect(structured.structuredFailures).toEqual([{ path: 'args[1]', raw: '{name: "probe"}' }]);
+    expect(structured.value).toEqual(['L1', '{name: "probe"}']);
   });
 });
 
@@ -267,10 +381,15 @@ describe('REQ-1280 — AC-7 structural guarantee', () => {
     const count = (needle: string) => (server.match(new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) ?? []).length;
     // THREE `applyRawJson` call sites, and all three are the shared loop:
     // full mode's contract handler (once), and compact mode's `figpea_call`
-    // TWICE — step 1 parses before the file-path translation (the schema is
-    // not reachable yet), step 2 renders the verdict after `contractToolFor`
-    // (the schema is). This is the assertion that fails if either path ever
-    // grows its own inline parse — the drift AC-7 exists to prevent.
+    // TWICE — step 1 parses before the file-path translation, step 2 renders
+    // the verdict after `contractToolFor`. (REQ-1338: both compact steps now
+    // pass the SAME declared schema, so they make identical parse decisions at
+    // every position and step 2 remains a cheap no-op on values that are
+    // already parsed. Before this, step 1 was schema-blind and the two could
+    // disagree — which is why the schema the flag used to be blind to is now
+    // reachable above it, where REQ-1318's hoist already put the lookup.) This
+    // is the assertion that fails if either path ever grows its own inline
+    // parse — the drift AC-7 exists to prevent.
     expect(count('applyRawJson(')).toBe(3);
     // REQ-1318: the same anti-drift pin for the FLAG-LESS parse, at exactly TWO
     // call sites — one per lane. Before this, full mode carried an inline

@@ -760,8 +760,21 @@ describe('REQ-1337 AC-7 — every claim the README and the .describe() make is t
     expect(tool, 'compact mode advertises figpea_call').toBeDefined();
     const description = tool!.inputSchema?.properties?.['_rawJson']?.description ?? '';
     expect(description, 'the flag is advertised at all').toContain('_rawJson');
-    expect(description, 'claim 1: a declared object/array param needs no flag').toMatch(/declares as an object\/array is parsed with no flag/i);
-    expect(description, 'claim 2: the flag is the schema-blind route, usable with no manifest').toMatch(/schema-blind/);
+    // ⛔ RE-POINTED by REQ-1338, and NOT weakened — the same claim in a wider
+    // form. This read `/declares as an object\/array is parsed with no flag/`,
+    // and the new description widens the enumeration to `object/array/matrix`
+    // (the guard has always fired on `matrix`; REQ-1280's reviewer called the
+    // old wording an under-promise). The literal substring is gone, the CLAIM
+    // is not, so the pin follows the claim rather than the letter.
+    expect(description, 'claim 1: a declared object/array/matrix param needs no flag').toMatch(/object\/array\/matrix is parsed with no flag/i);
+    // This read `/schema-blind/` — a property the flag no longer has, since
+    // REQ-1338 made its parse declaration-scoped too. Re-pointed POSITIVELY,
+    // to the rule that replaced it (a declared scalar is NEVER parsed, even
+    // when its text is valid JSON), plus an absence guard mirroring the
+    // README's, so the falsified framing cannot be restored in one place and
+    // removed from the other.
+    expect(description, 'claim 2: a declared scalar is NEVER parsed, whatever its text').toMatch(/declares a string\/number\/boolean is NEVER parsed/i);
+    expect(description, 'claim 2: the falsified "schema-blind" framing is GONE').not.toMatch(/schema-blind/);
     expect(description, 'claim 3: a value that looks like JSON but cannot be parsed is refused, not forwarded').toMatch(/cannot be parsed/);
   });
 
@@ -804,9 +817,10 @@ describe('REQ-1337 AC-7 — every claim the README and the .describe() make is t
   });
 
   it('claim 2 — the same payloads need NO flag on either lane', async () => {
-    // README.md: "a parameter the manifest declares as an object/array may
-    // travel as a JSON string, and the server parses it". This is the row that
-    // fails if only the FLAG branch is moved above the translation.
+    // README.md: "a parameter the manifest **declares** as an
+    // `object`/`array`/`matrix` may travel as a JSON string, and the server
+    // parses it". This is the row that fails if only the FLAG branch is moved
+    // above the translation.
     for (const mode of ['full', 'compact'] as Mode[]) {
       const { client, captured } = await connect(undefined, mode);
       const noFlag = mode === 'compact'
@@ -826,10 +840,10 @@ describe('REQ-1337 AC-7 — every claim the README and the .describe() make is t
   });
 
   it('claim 3 — the documented loud failure fires up front on BOTH lanes', async () => {
-    // README.md: "If a value looks like JSON but cannot be parsed, and the
-    // parameter is declared as an object or an array, the call is refused up
-    // front with invalid_params naming `_rawJson` and the parameter, instead of
-    // being silently forwarded."
+    // README.md: "If a value *looks* like JSON but cannot be parsed, and the
+    // parameter is declared an `object`, `array` or `matrix`, the call is
+    // refused up front with invalid_params naming `_rawJson` and the parameter,
+    // instead of being silently forwarded."
     const broken = '{name: "x"}';
     for (const mode of ['full', 'compact'] as Mode[]) {
       for (const m of FILE_METHODS) {

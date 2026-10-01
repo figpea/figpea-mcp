@@ -814,7 +814,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             .any()
             .optional()
             .describe(
-              'Set _rawJson:true on your figpea_call when your harness STRINGIFIED an object or array argument AND the method is unknown or the parameter is not declared as an object/array in the manifest this server holds: every element of args that is a string whose trimmed form starts with { or [ and ends with } or ] is JSON-parsed before it reaches the editor, e.g. {"group":"layer","method":"create","args":["page","{\\"name\\":\\"probe\\",\\"pageWidth\\":300,\\"pageHeight\\":200}"],"_rawJson":true}. NOTE you usually do NOT need this: a param the method DECLARES as an object/array is parsed with no flag at all, which is safer because it only ever touches a value the manifest says was meant to be structured. This flag\'s parse is deliberately schema-blind so it works on a first call with no manifest, which is exactly why it stays opt-in rather than becoming the default. If a value looks like JSON but cannot be parsed, and its parameter is declared an object/array, the call is refused by name (invalid_params) instead of being forwarded — nothing is silently ignored.',
+              'Set _rawJson:true on your figpea_call when your harness STRINGIFIED an object or array argument AND this server cannot tell what that position expects — the method is unknown, the parameter is not declared as an object/array/matrix in the manifest this server holds, or no manifest has been fetched yet. At such a position, and at any position the manifest DOES declare as an object/array/matrix, every element of args that is a string whose trimmed form starts with { or [ and ends with } or ] is JSON-parsed before it reaches the editor, e.g. {"group":"layer","method":"create","args":["page","{\\"name\\":\\"probe\\",\\"pageWidth\\":300,\\"pageHeight\\":200}"],"_rawJson":true}. A position the manifest declares a string/number/boolean is NEVER parsed, even when its text is valid JSON: setName(id, \'[1,2,3]\') still names the layer [1,2,3], and a code sample or a fake API response stays the text you sent. NOTE you usually do NOT need this: a param the method DECLARES as an object/array/matrix is parsed with no flag at all, and the parsed shape is checked against the declaration too, so reach for _rawJson when you cannot scope the position, not as a general-purpose parse. If a value looks like JSON but cannot be parsed, and its position is declared an object/array/matrix, the call is refused by name (invalid_params) instead of being forwarded — nothing is silently ignored.',
             ),
           returnAs: z.any().optional().describe('Reserved: "inline" (default) or "path" — "path" writes a binary result to a session file and returns {ok, path, mime, width, height, bytes, filename?, url} as text, so a non-image export (e.g. a native .fp project) never crosses the wire as base64'),
         }),
@@ -892,12 +892,25 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         //    can arrive, so it has to compose with the translation rather
         //    than shadow it.
         //
-        // `schemaAt: () => undefined` is deliberate: the declared schema is
-        // not reachable until `contractToolFor` below, and a flag that needed
-        // a manifest would be dead on exactly the first-call situation an
-        // agent is most likely to hit. With no schema, a failed parse is NOT
-        // recorded (the guard's safe default), so this step can only ever
-        // PARSE, never refuse — the verdict is step 2, below.
+        // `schemaAt` is the REAL declared schema, which REQ-1318's hoist made
+        // reachable here (the lookup above runs before this block). REQ-1338
+        // is what put it to use: the flag skips a position the manifest declares
+        // a `string`/`number`/`boolean`, so a JSON literal a caller meant as
+        // TEXT is forwarded as the text it is. Before that, step 1 was
+        // deliberately schema-blind (`schemaAt: () => undefined`) and the
+        // comment here claimed the schema was unreachable until
+        // `contractToolFor` below — which had been stale since the hoist, and
+        // false about the design.
+        //
+        // `undefined` is still the flag's remaining purpose, and it is not an
+        // accident of ordering: an unknown method, a compact-mode first call
+        // before any `describe()`, a legacy free-text manifest or
+        // `FIGPEA_DISABLE_CONTRACT_FETCH=1` all reach `applyRawJson` with no
+        // schema, and there the flag PARSES. A flag that needed a manifest
+        // would be dead on exactly the first-call situation an agent is most
+        // likely to hit. With no schema, a failed parse is also NOT recorded
+        // (the guard's safe default), so this step can only ever PARSE, never
+        // refuse — the verdict is step 2, below.
         //
         // AC-6, structurally: `_rawJson` is read from `rawArgs` and never
         // merged into `args`, so it cannot reach the tab — there is no strip
@@ -910,10 +923,15 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         // default. Nothing else moved: `contractToolFor` is a memoised pure
         // lookup on `activeManifest` (contractIndex is rebuilt only when the
         // manifest identity changes), and the `if (contractTool)` block below
-        // and every statement in it are exactly where they were.
+        // and every statement in it are exactly where they were. REQ-1338 then
+        // gave the same hoisted lookup to the flag branch, which is why steps 1
+        // and 2 cannot disagree about whether a position is a parse candidate.
         const contractTool = contractToolFor(group, method);
         if (rawJsonRequested) {
-          args = applyRawJson(args, { schemaAt: () => undefined, pathAt: (i) => `args[${i}]` }).value;
+          args = applyRawJson(args, {
+            schemaAt: (i) => contractTool?.paramSchemas?.[contractTool.inputKeys[i] ?? ''],
+            pathAt: (i) => `args[${i}]`,
+          }).value;
         } else if (contractTool) {
           // REQ-1318 — a structured parameter may travel as a JSON string,
           // with NO flag. Same placement as the flag's step 1, for the same
@@ -1145,12 +1163,16 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           }
           // REQ-1280 T3 STEP 2 — the VERDICT, late, where the declared schema
           // finally is reachable. Same `applyRawJson` as step 1 and full mode,
-          // now with the schema: a value that looks like JSON but does not
-          // parse is refused by name ONLY where the schema proves a
-          // structured value was intended (AC-8) — which is exactly where the
-          // tab would have rejected it after a wasted round trip. The values
-          // are already parsed, so this re-run is a cheap no-op on the array;
-          // what it supplies is the schema, the only thing the verdict needs.
+          // and since REQ-1338 the same `schemaAt` too, so this is a cheap
+          // no-op on the array: every value step 1 was allowed to parse is
+          // already parsed, and every position step 1 skipped is skipped again
+          // here for the same reason. What this re-run supplies is the schema
+          // the verdict needs: a value that looks like JSON but does not parse
+          // is refused by name ONLY where the schema proves a structured value
+          // was intended (AC-8) — which is exactly where the tab would have
+          // rejected it after a wasted round trip. The scalar half of the rule
+          // is now shared with step 1, so a declared `string` is provably never
+          // parsed on either.
           //
           // Rebase note: this now runs AFTER the REQ-1296 arity check above,
           // and the order is deliberate rather than incidental. An arity error
@@ -1575,6 +1597,12 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         // (the `setName(id, '[Hero]')` class), so no call that works today
         // changes. It also makes the failure LOUD and FREE: today such a value
         // is forwarded and the tab rejects it after a wasted round trip.
+        //
+        // REQ-1338 — this call site is unchanged and stays so: it already
+        // passed the real declared schema, so the whole of full mode's half of
+        // the fix lives inside the shared loop. There is deliberately no second
+        // implementation to drift (that is AC-7's guarantee, and this REQ does
+        // not weaken it).
         const applied = applyRawJson(effectiveRawArgs, {
           keys: inputKeys,
           schemaAt: (i) => tool?.paramSchemas?.[inputKeys[i] ?? ''],

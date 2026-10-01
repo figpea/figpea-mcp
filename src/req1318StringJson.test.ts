@@ -612,8 +612,12 @@ describe('REQ-1318 AC-3 — nothing that works today changes', () => {
     expect(result.ok).toBe(true);
     expect(captured).toHaveLength(1);
     // This is the row that separates this REQ's schema-scoped default from
-    // REQ-1280's schema-blind flag (REQ-1338's residual). A string-position
-    // name that happens to be valid JSON must survive intact.
+    // REQ-1280's opt-in `_rawJson` flag. A string-position name that happens to
+    // be valid JSON must survive intact — and as of REQ-1338 that is true of
+    // the flag too, wherever the manifest declares the position. What still
+    // distinguishes the two routes is the OTHER direction: with no declaration
+    // in memory this route touches nothing, while the flag still parses,
+    // because there is nothing to scope a parse to.
     expect(captured[0]!.args).toEqual(['L1', '[1,2,3]']);
   });
 
