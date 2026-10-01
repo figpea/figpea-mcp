@@ -1031,6 +1031,74 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           } else if (kindVal === 'image' && props !== null && typeof props === 'object' && 'filePath' in props && (props as any).filePath !== undefined && typeof (props as any).filePath !== 'string') {
             return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'props.filePath must be a string' }));
           }
+        } else if (toolName === 'layer_batch') {
+          // /design run 2026-10-01-kiln-spring-workshops-d3. `layer.batch`'s
+          // `ops` is `args[0]`, and per the editor's own descriptor each op's
+          // `args` is "the same array the direct figpea_layer_<method> call
+          // would take" — so an op's image `filePath` lives at
+          // `args[0][i].args[1].filePath`, which NO branch above reads. It was
+          // forwarded verbatim, the editor's image loader treated the absolute
+          // filesystem path as a URL, and the fetch failed with a 404 that
+          // quoted the path — so the obvious reading was "the file is missing"
+          // for a file the bridge had just served. Since `batch` is
+          // all-or-nothing, ONE untranslated op rolled back a complete
+          // 12-layer build.
+          //
+          // Scoped to this ONE method on purpose: the op shape is read
+          // positionally (`method`, then `args[0]` the kind, then `args[1]` the
+          // props) rather than by walking for any key named `filePath`, because
+          // a blanket deep rewrite would also mangle values that legitimately
+          // carry that key as ordinary data — a `setName` op whose name is the
+          // string "filePath", or a non-image create's props.
+          //
+          // Every outcome below is the sibling `layer_create` branch's own, and
+          // the refusals RETURN EARLY for the same reason it does: a batch is
+          // all-or-nothing, so forwarding half a translated batch would trade
+          // one all-or-nothing failure for another. The wording is asserted
+          // against the sibling's live answer in
+          // src/designfixBatchFilePath.test.ts, so the two cannot drift.
+          const ops = effectiveArgs[0];
+          if (Array.isArray(ops)) {
+            let rewritten: unknown[] | undefined;
+            for (let i = 0; i < ops.length; i++) {
+              const op = ops[i];
+              // `in` REJECTS a primitive, so the object guard is load-bearing
+              // — an ops array holding a bare string must not throw here.
+              if (op === null || typeof op !== 'object' || Array.isArray(op)) continue;
+              const opRecord = op as Record<string, unknown>;
+              if (opRecord.method !== 'create') continue;
+              const opArgs = opRecord.args;
+              if (!Array.isArray(opArgs) || opArgs[0] !== 'image') continue;
+              const opProps = opArgs[1];
+              if (opProps === null || typeof opProps !== 'object' || Array.isArray(opProps)) continue;
+              const opPropsRecord = opProps as Record<string, unknown>;
+              const opFp = opPropsRecord.filePath;
+              if (typeof opFp === 'string' && opFp) {
+                const okOpFile = await isValidFile(opFp);
+                if (!okOpFile) {
+                  return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: `file not found or not readable: ${opFp}` }));
+                }
+                const newOpProps: Record<string, unknown> = { ...opPropsRecord };
+                newOpProps.url = toBridgeUrl(opFp);
+                delete newOpProps.filePath;
+                // Copy-on-write, once: the first rewritten op snapshots the
+                // array, and every op — rewritten or not — is then edited on the
+                // snapshot, so a caller's own array is never mutated.
+                if (!rewritten) rewritten = ops.slice();
+                const newOpArgs = [...opArgs];
+                newOpArgs[1] = newOpProps;
+                rewritten[i] = { ...opRecord, args: newOpArgs };
+              } else if (opFp !== undefined && typeof opFp !== 'string') {
+                // Parity with the sibling's non-string refusal. An EMPTY string
+                // is deliberately NOT refused: `layer_create`'s guard is
+                // `typeof fp !== 'string'`, so it forwards one unchanged, and
+                // inventing a rejection here would be precisely the drift the
+                // shared wording exists to prevent.
+                return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'props.filePath must be a string' }));
+              }
+            }
+            if (rewritten) effectiveArgs[0] = rewritten;
+          }
         }
 
         const effectiveTimeoutMs = resolveTimeoutMs(toolName, rawTimeout);
@@ -1675,6 +1743,58 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'props.filePath must be a string' }));
         } else if (kindVal === 'image' && typeof fp === 'string' && fp.trim() === '') {
           return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'filePath cannot be empty' }));
+        }
+      } else if (toolName === 'layer_batch') {
+        // /design run 2026-10-01-kiln-spring-workshops-d3 — the full-mode twin
+        // of the compact lane's `layer_batch` branch, and deliberately a second
+        // call site rather than a shared one, for the reason REQ-1283 gave for
+        // `session_openFile`: this is full mode's generated `layer_batch` tool,
+        // a different handler, so wiring only the compact one would fix the
+        // default calling convention and leave the one real MCP clients use
+        // forwarding a local path to the editor — which fetches it as a URL,
+        // fails, and (batch being all-or-nothing) rolls back the whole build.
+        // Measured before this branch existed: the tab received
+        // `[{"method":"create","args":["image",{"filePath":"/abs/plate.jpg"}]}]`.
+        //
+        // Same method, same positional op shape, same refusal wording as this
+        // lane's `layer_create` above — including its extra EMPTY-string
+        // refusal, which this lane has and the compact one does not. Both are
+        // asserted against the live sibling in
+        // src/designfixBatchFilePath.test.ts so neither pair can drift.
+        const ops = (effectiveRawArgs as any).ops;
+        if (Array.isArray(ops)) {
+          let rewritten: unknown[] | undefined;
+          for (let i = 0; i < ops.length; i++) {
+            const op = ops[i];
+            // `in` REJECTS a primitive, so the object guard is load-bearing.
+            if (op === null || typeof op !== 'object' || Array.isArray(op)) continue;
+            const opRecord = op as Record<string, unknown>;
+            if (opRecord.method !== 'create') continue;
+            const opArgs = opRecord.args;
+            if (!Array.isArray(opArgs) || opArgs[0] !== 'image') continue;
+            const opProps = opArgs[1];
+            if (opProps === null || typeof opProps !== 'object' || Array.isArray(opProps)) continue;
+            const opPropsRecord = opProps as Record<string, unknown>;
+            const opFp = opPropsRecord.filePath;
+            if (typeof opFp === 'string' && opFp) {
+              const okOpFile = await isValidFile(opFp);
+              if (!okOpFile) {
+                return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: `file not found or not readable: ${opFp}` }));
+              }
+              const newOpProps: Record<string, unknown> = { ...opPropsRecord };
+              newOpProps.url = toBridgeUrl(opFp);
+              delete newOpProps.filePath;
+              if (!rewritten) rewritten = ops.slice();
+              const newOpArgs = [...opArgs];
+              newOpArgs[1] = newOpProps;
+              rewritten[i] = { ...opRecord, args: newOpArgs };
+            } else if (opFp !== undefined && typeof opFp !== 'string') {
+              return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'props.filePath must be a string' }));
+            } else if (typeof opFp === 'string' && opFp.trim() === '') {
+              return toCallToolResult(resultToContent({ ok: false, code: 'invalid_image_source', message: 'filePath cannot be empty' }));
+            }
+          }
+          if (rewritten) (effectiveRawArgs as any).ops = rewritten;
         }
       }
 
