@@ -16,6 +16,7 @@ import * as os from 'node:os';
 import WebSocket, { WebSocketServer } from 'ws';
 import { BRIDGE_BIND_HOST, BRIDGE_URL_HOST } from './bridgeHost';
 import { DEFAULT_CALL_TIMEOUT_MS, stateCheckHint } from './callTimeout';
+import { createConnectionLedger, deriveDiagnosis, type ConnectionDiagnosis } from './connectionDiagnosis';
 import type { CallFrame, DescribeFrame } from './protocol';
 import { drillManifest, type DescribeFn, type DescribeResultPayload } from './describeDrill';
 import { sessionDirFor, removeSessionDir } from './returnPath';
@@ -58,6 +59,15 @@ export interface BridgeServerHandle {
   readonly token: string;
   /** Whether a tab is currently connected and past the token gate. */
   isTabConnected(): boolean;
+  /**
+   * REQ-1394: what this bridge observed about the pairing attempt, as an
+   * actionable token plus the counters behind it. Per-process — it says
+   * nothing about any previous run, which is what `startedAt` dates.
+   *
+   * Not a socket inspection and not a verdict: `isTabConnected()` remains
+   * authoritative for whether a tab is live RIGHT NOW.
+   */
+  getConnectionDiagnosis(): ConnectionDiagnosis;
   /** Registers a handler invoked with the connected tab's live
    * `figpea.describe()` manifest, each time one is received (initial connect
    * and every reconnect/takeover). */
@@ -226,6 +236,20 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
 
   const wss = new WebSocketServer({ server: httpServer });
 
+  // REQ-1394 — one ledger per run, created HERE so `startedAt` dates the run
+  // that observed the events rather than the module's load time (which, in a
+  // long-lived host process, could be many runs ago).
+  const ledger = createConnectionLedger();
+
+  // REQ-1394: every accepted TCP socket, including REQ-1017's `/file` and
+  // `/blob` requests, which share this listener. The ledger only reports
+  // `transport_only` while nothing has upgraded, so counting them is safe —
+  // see the guard in connectionDiagnosis.ts, and the re-check note any change
+  // to the file endpoints must make.
+  httpServer.on('connection', () => {
+    ledger.record('transport_only');
+  });
+
   // Lives for the server's whole lifetime (not just startup) -- logs rather
   // than throwing, since a single bad frame from a tab must never take the
   // bridge down (AC-3's "pure relay" never trusts the far side).
@@ -359,9 +383,22 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
       // and tears down bookkeeping normally.
     });
 
+    // REQ-1394: the handshake completed. Counted HERE rather than on the
+    // `hello` outcome below so a silent socket suppresses `transport_only` the
+    // moment it reaches the handshake, not up to 5 s later when the timer fires.
+    ledger.recordUpgrade();
+
     let sawHello = false;
     const helloTimer = setTimeout(() => {
       if (!sawHello) {
+        // REQ-1394: recorded at the point the close is INITIATED, not
+        // reconstructed from the close code later — three different causes all
+        // close with 4001 (no hello / malformed hello / bad token), so the code
+        // cannot separate them and the reason must never be re-parsed.
+        ledger.record('hello_timeout', {
+          closeCode: CLOSE_CODE_BAD_TOKEN,
+          closeReason: 'no hello frame received',
+        });
         socket.close(CLOSE_CODE_BAD_TOKEN, 'no hello frame received');
       }
     }, HELLO_TIMEOUT_MS);
@@ -382,6 +419,7 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
       try {
         frame = JSON.parse(data.toString());
       } catch {
+        ledger.record('hello_rejected', { closeCode: CLOSE_CODE_BAD_TOKEN, closeReason: 'malformed hello frame' });
         socket.close(CLOSE_CODE_BAD_TOKEN, 'malformed hello frame');
         return;
       }
@@ -390,11 +428,16 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
       const received = safeDecodeAndTrim(receivedRaw);
       const expected = safeDecodeAndTrim(token);
       if (frame?.type !== 'hello' || !received || received !== expected) {
+        ledger.record('hello_rejected', {
+          closeCode: CLOSE_CODE_BAD_TOKEN,
+          closeReason: 'invalid or missing pairing token',
+        });
         socket.close(CLOSE_CODE_BAD_TOKEN, 'invalid or missing pairing token');
         return;
       }
 
       sawHello = true;
+      ledger.record('hello_accepted');
 
       // Newest-wins takeover (OQ-3): a second valid-token connection
       // supersedes the first, which is closed with a distinct code and
@@ -402,6 +445,16 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
       // "agent connected" indicator on receiving this close code.
       if (activeSocket && activeSocket !== socket && activeSocket.readyState === WebSocket.OPEN) {
         console.error('[figpea-mcp] bridge: a new tab connection superseded the previous one');
+        // REQ-1394: recorded in the branch that performs the takeover, and it
+        // carries the 4002 the displaced tab is about to be closed with. The
+        // displaced socket's own `close` handler below does NOT record
+        // `disconnected`, because it is no longer the active socket by the
+        // time that fires — so the takeover survives instead of being erased
+        // by the close of the tab it displaced.
+        ledger.record('tab_superseded', {
+          closeCode: CLOSE_CODE_SUPERSEDED,
+          closeReason: 'superseded by a newer tab connection',
+        });
         activeSocket.close(CLOSE_CODE_SUPERSEDED, 'superseded by a newer tab connection');
       }
       activeSocket = socket;
@@ -412,10 +465,17 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
 
     socket.on('message', onHelloFrame);
 
-    socket.on('close', () => {
+    // REQ-1394: the listener finally TAKES the close code, which it previously
+    // discarded at the signature. It records `disconnected` only for the
+    // socket that IS the active one — every server-initiated close (bad token,
+    // hello timeout, takeover) recorded its own token and its own code at the
+    // branch that performed it, so a superseded or rejected socket must not
+    // overwrite that with a generic "disconnected" a few milliseconds later.
+    socket.on('close', (code: number, reason: Buffer) => {
       clearTimeout(helloTimer);
       if (activeSocket === socket) {
         activeSocket = undefined;
+        ledger.record('disconnected', { closeCode: code, closeReason: reason.toString() });
       }
     });
   });
@@ -425,6 +485,11 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
     token,
     isTabConnected(): boolean {
       return activeSocket !== undefined && activeSocket.readyState === WebSocket.OPEN;
+    },
+    // REQ-1394: a snapshot derived through the one shared derivation, so the
+    // token an agent reads is the same token the README documents.
+    getConnectionDiagnosis(): ConnectionDiagnosis {
+      return deriveDiagnosis(ledger.snapshot());
     },
     onDescribe(handler: (manifest: unknown) => void): void {
       describeHandlers.push(handler);

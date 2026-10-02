@@ -41,6 +41,13 @@ import {
   type RawJsonSchemaLike,
 } from './rawJson';
 import { resolveTimeoutMs } from './callTimeout';
+// REQ-1394 — the one connection-diagnosis vocabulary and its actionable
+// sentences, imported from the same zero-import leaf the bridge records into.
+// `getConnectionDiagnosis` is OPTIONAL below, so the ~45 test files that build a
+// stub bridge keep compiling untouched; when it is absent, `legacyDiagnosis`
+// derives an honest fallback from the legacy boolean rather than omitting the
+// field.
+import { legacyDiagnosis, type ConnectionDiagnosis } from './connectionDiagnosis';
 // REQ-1283 — the single extension-preserving name resolver, called by BOTH
 // relay paths (compact `figpea_call` and full mode's `session_openFile`) for
 // the same reason as `_rawJson` above: one rule, two call sites, no drift.
@@ -67,6 +74,11 @@ export interface BridgeServerHandleLike {
   getContractVersion?(): string | null;
   getFileUrl?(filePath: string): string;
   registerBlob?(filePath: string): string;
+  /** REQ-1394: what the bridge observed about the pairing attempt. Optional
+   *  DELIBERATELY — this interface is a structural stand-in that ~45 test
+   *  files satisfy with their own stub, and making it required would edit all
+   *  of them for no behavioural gain. Absent ⇒ the legacy fallback. */
+  getConnectionDiagnosis?(): ConnectionDiagnosis;
 }
 
 export interface CreateMcpServerOptions {
@@ -507,6 +519,23 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     return perCall ?? options?.editorBaseUrl ?? process.env.FIGPEA_EDITOR_URL ?? DEFAULT_EDITOR_BASE_URL;
   }
 
+  /**
+   * REQ-1394 — the bridge's connection diagnosis, or the honest fallback.
+   *
+   * Read ONCE per call and shared by every publisher (`status` and both
+   * `no_tab` refusals), so the two can never disagree about what the bridge
+   * observed. The fallback exists so the field is never MISSING: an agent
+   * reading a payload with no `connection` key cannot tell "nothing happened"
+   * from "this build does not report it", and `legacyDiagnosis` renders the one
+   * bit such a bridge has in the same vocabulary rather than inventing
+   * counters it never counted.
+   */
+  function connectionDiagnosis(): ConnectionDiagnosis {
+    return bridge.getConnectionDiagnosis
+      ? bridge.getConnectionDiagnosis()
+      : legacyDiagnosis(bridge.isTabConnected());
+  }
+
   function buildConnectUrl(perCallBaseUrl?: string, fileArg?: string): string {
     const url = new URL(resolveEditorBaseUrl(perCallBaseUrl));
     url.searchParams.set('agent', '1');
@@ -541,7 +570,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     'status',
     {
       description:
-        "Reports the bridge's port, whether an editor tab is connected, the connected tab's contract version (null if none), and how many contract tools are currently registered. Also returns token and url so an LLM can construct the paste-ready pairing string without re-launching (REQ-1035).",
+        "Reports the bridge's port, whether an editor tab is connected, the connected tab's contract version (null if none), and how many contract tools are currently registered. Also returns token and url so an LLM can construct the paste-ready pairing string without re-launching (REQ-1035). Returns a `connection` block naming WHY a tab is not connected — `lastEvent` (no_attempt, transport_only, hello_timeout, hello_rejected, hello_accepted, tab_superseded, disconnected) with the `nextStep` it implies, plus per-process counters and the run's `startedAt`; read it instead of re-trying a pairing blindly.",
     },
     async () => {
       return jsonTextResult({
@@ -551,6 +580,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         tabConnected: bridge.isTabConnected(),
         contractVersion: bridge.getContractVersion ? bridge.getContractVersion() : null,
         toolCount,
+        connection: connectionDiagnosis(),
       });
     },
   );
@@ -849,6 +879,12 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             resultToContent({
               ok: false,
               code: 'no_tab',
+              // REQ-1394 AC-4: the CAUSE arrives with the failure, so an agent
+              // does not have to spend a second round trip on `status` to learn
+              // that its token was stale. `ok`/`code`/`message`/`url` above are
+              // byte-identical — this is additive, and their existing pins stay
+              // untouched.
+              connection: connectionDiagnosis(),
               message: 'No editor tab paired. Open this URL in your browser to connect an editor tab:',
               url: connectUrl,
             }),
@@ -1541,6 +1577,10 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           resultToContent({
             ok: false,
             code: 'no_tab',
+            // REQ-1394 AC-4: the same block the compact `figpea_call` refusal
+            // carries (mcpServer.ts:~851). Both refusal sites, because an agent
+            // in either tool mode is on the same failure path.
+            connection: connectionDiagnosis(),
             message: 'No editor tab paired. Open this URL in your browser to connect an editor tab:',
             url: connectUrl,
           }),

@@ -2,10 +2,23 @@
 
 A Model Context Protocol (MCP) server that lets an AI agent open and drive a live Figpea editor — to view, inspect, and export PSD, Adobe XD, Figma, SVG, and PDF files — entirely on your machine.
 
-> **Guided Pairing & Local Network Access (LNA).** When an agent invokes a contract tool before a tab is paired, it receives an actionable `no_tab` error carrying the exact pairing URL:
+> **Guided Pairing & Local Network Access (LNA).** When an agent invokes a contract tool before a tab is paired, it receives an actionable `no_tab` error carrying the exact pairing URL, plus a `connection` block naming what this bridge observed — so the cause arrives with the failure instead of costing a second call:
 > ```text
-> {"ok":false,"code":"no_tab","message":"No editor tab paired. Open this URL in your browser to connect an editor tab:","url":"https://editor.figpea.com/?agent=1&bridgePort=8080&bridgeToken=abc123token"}
+> {
+>   "ok": false,
+>   "code": "no_tab",
+>   "message": "No editor tab paired. Open this URL in your browser to connect an editor tab:",
+>   "url": "https://editor.figpea.com/?agent=1&bridgePort=8080&bridgeToken=abc123token",
+>   "connection": {
+>     "lastEvent": "hello_rejected",
+>     "nextStep": "the pairing token was rejected — re-read token from this status call and open a freshly minted pairing URL; a token from an earlier server run is always stale",
+>     "tcpConnections": 1, "upgrades": 1, "helloAccepted": 0, "helloRejected": 1, "supersededCount": 0,
+>     "lastCloseCode": 4001, "lastCloseReason": "invalid or missing pairing token",
+>     "startedAt": "2026-10-02T16:23:31.390Z"
+>   }
+> }
 > ```
+> Read `connection.lastEvent` — see [Diagnosing a connection](#diagnosing-a-connection) for every state and what to do about it.
 > Opening that URL opens the editor with an LNA connect notice and explicit **Connect** consent gate button. Chrome may ask permission to reach the local network (accepted once per origin). Once granted, clicking Connect attaches the session safely.
 
 ![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)
@@ -63,7 +76,7 @@ Honors `FIGPEA_EDITOR_URL` (default `https://editor.figpea.com`, override for lo
 | Tool | Always present | What it does |
 |------|-----------------|---------------|
 | `open_editor` | yes | Opens/points at an editor tab wired to this bridge. Returns `{port, token, url}`. |
-| `status` | yes | Reports the bridge's port, token and pairing URL (`port`, `token`, `url`), whether a tab is connected, the connected tab's contract version, and the live tool count. |
+| `status` | yes | Reports the bridge's port, token and pairing URL (`port`, `token`, `url`), whether a tab is connected, the connected tab's contract version, the live tool count, and a `connection` block naming why a tab is not connected (see [Diagnosing a connection](#diagnosing-a-connection)). |
 | `figpea_skill` | yes | Returns Figpea's agent skill reference (the craft guidance for using `window.figpea` well), sourced from the editor origin's `/agent/skill.md` at startup — works even with no tab paired. The answer names the URL it fetched from: the body is that origin's own build, so when a tab is paired from a different origin or a different build, get *the tab's* skill instead with `figpea.SKILL()` in the tab or `GET <the tab's origin>/agent/skill.md` (the answer says so when a tab is connected). Degrades to a structured `{ok:false, code:"skill_unavailable", message}` (never throws) if the fetch failed or was disabled. |
 | `figpea_call` | compact only | Universal dispatcher — `figpea_call({ group, method, args, _timeoutMs })` calls any `group.method` on the paired tab (see below). |
 | `figpea_describe` | compact only | Returns the contract surface for a group or method — the same `doc`/`params`/`result` the editor's own `describe()` returns, from the manifest this server already holds in memory (no tab round trip). `figpea_describe()` → group index, `{group}` → that group's methods, `{group, method}` → one method's wire shape. Degrades to `{ok:false, code:"describe_unavailable"}` (never throws) when the manifest was never fetched. |
@@ -76,6 +89,55 @@ Generated tools (full mode) advertise structured parameter types (string / numbe
 The contract-tool list reflects whatever the connected editor advertises — it is not hardcoded here, and grows with the editor's contract. `status` and `tools/list` are the source of truth for what's callable right now; there is no version-lock between this bridge and the editor.
 
 Every call returns `{ok: true, value}` or `{ok: false, code, message}`. Image-shaped results (`canvas.screenshot`, raster exports) come back as MCP image content alongside a text summary.
+
+### Diagnosing a connection
+
+`tabConnected` is one bit: an editor tab is connected, or it is not. It cannot tell you *which* of the ways pairing failed got you there, so an agent that read only that field re-opened a tab, waited, failed again, and did so for as long as it cared to try. `status` therefore returns a `connection` block beside it — a token naming the state this bridge observed, the action that token implies, and the counters behind it.
+
+```json
+{
+  "port": 8080,
+  "token": "abc123token",
+  "url": "https://editor.figpea.com/?agent=1&bridgePort=8080&bridgeToken=abc123token",
+  "tabConnected": false,
+  "contractVersion": null,
+  "toolCount": 0,
+  "connection": {
+    "lastEvent": "hello_rejected",
+    "nextStep": "the pairing token was rejected — re-read token from this status call and open a freshly minted pairing URL; a token from an earlier server run is always stale",
+    "tcpConnections": 1,
+    "upgrades": 1,
+    "helloAccepted": 0,
+    "helloRejected": 1,
+    "supersededCount": 0,
+    "lastCloseCode": 4001,
+    "lastCloseReason": "invalid or missing pairing token",
+    "startedAt": "2026-10-02T16:23:31.390Z"
+  }
+}
+```
+
+Read `connection.lastEvent`. `connection.nextStep` is the action that token implies, shipped in the same payload, so nothing has to be mapped by hand:
+
+| `lastEvent` | What it means | What to do next |
+|--------------|---------------|-----------------|
+| `no_attempt` | Nothing has ever reached this bridge — no socket, no handshake, no tab. | nothing has reached this bridge yet — open the pairing URL from this status call in a browser to start an editor tab |
+| `transport_only` | A socket reached this port but no WebSocket handshake ever completed. The common cause is a `bridgePort` that is not this bridge's. | a socket reached this port but no WebSocket handshake ever completed — check you are on the exact bridgePort printed above, then reload the editor tab |
+| `hello_timeout` | The handshake completed but no `hello` frame arrived within 5 seconds. | the WebSocket handshake completed but no hello frame arrived within 5s — reload the editor tab, and check nothing (a proxy, an extension) is holding the connection open |
+| `hello_rejected` | The pairing token did not match. A token minted by an earlier server run is the usual reason, and this bridge restarts whenever the MCP server restarts. | the pairing token was rejected — re-read token from this status call and open a freshly minted pairing URL; a token from an earlier server run is always stale |
+| `hello_accepted` | A tab completed the handshake. Paired. | a tab is paired — proceed; read tabConnected for live truth |
+| `tab_superseded` | A newer tab completed the handshake and took the connection over. Still paired — this is a healthy state, not a fault. | a newer tab took over the connection — paired, proceed; if you expected the older tab, close the newer one |
+| `disconnected` | The paired tab went away after pairing. | the paired tab has gone away — open a fresh pairing URL from this status call to pair again |
+
+That table is authoritative **in both directions**, the same way the per-method timeout table above is: `connection.nextStep` is read from the same map this table is written from, and the package's own test fails if the two ever disagree.
+
+The counters (`tcpConnections`, `upgrades`, `helloAccepted`, `helloRejected`, `supersededCount`) are **per-process**: they cover this MCP server process only, they begin at zero every time it starts, and they are not a historical record — they say nothing about any previous run and are never persisted. `connection.startedAt` is the ISO-8601 instant this run started, and it is how you tell this run's numbers from an earlier one's.
+
+**A wrong port is the one case no token can name, and this is why.** The card's fifth state — a pairing URL pointing at an address nothing is listening on — is defined relative to an address that is *not* the bridge answering your question, so from inside, "no tab was ever opened" and "you used the wrong port" are the same silence. What separates them is the identity published beside the diagnosis: compare the `bridgePort` and `bridgeToken` in the URL you are holding against the `port` and `token` this call returned. If they do not match, you are talking to a run that no longer exists — open a URL minted by a live `status` call.
+
+A `no_tab` refusal carries the same `connection` block on the failing call itself — on `figpea_call` in compact mode and on every contract tool in full mode — so the cause arrives with the failure instead of costing a second round trip.
+
+None of this prevents a connection failure or fixes one. It makes whatever happened legible to whoever is trying to pair: the bridge reports what *this process* observed, never why the failure occurred.
 
 ### Off-band binary returns (`returnAs: "path"`)
 
@@ -256,7 +318,7 @@ Automated or headless browsers cannot answer native Local Network Access permiss
 
 ## Troubleshooting
 
-- **`no_tab`** — open an editor tab first, via `open_editor` or by visiting the printed pairing URL.
+- **`no_tab`** — the refusal carries a `connection` block naming what happened; read `connection.lastEvent` and its `nextStep` before trying again ([Diagnosing a connection](#diagnosing-a-connection)). In the ordinary case it is `no_attempt` and the fix is to open an editor tab, via `open_editor` or by visiting the printed pairing URL. If `lastEvent` is `hello_rejected`, the pairing token is stale — re-read `token` from a fresh `status` call and open the URL that call prints, because a token from an earlier server run never matches. If it is `transport_only` or `hello_timeout`, the handshake never completed: check you are on the `bridgePort` this run reports, then reload the tab.
 - **Nothing prints on stdout** — that's by design. stdio is the MCP JSON-RPC channel; every diagnostic goes to stderr.
 - **Port already in use** — pass `--port=<n>` to bind a specific port instead of an OS-assigned one.
 

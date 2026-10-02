@@ -266,9 +266,16 @@ export function buildToolsFromManifest(manifest: ManifestLike): GeneratedTool[] 
   return tools;
 }
 
+/**
+ * The failure branch's optional `connection` block (REQ-1394) is deliberately
+ * `unknown`-typed here: `tools.ts` is dependency-free and must stay that way,
+ * so it neither imports the diagnosis type nor re-declares its shape. It only
+ * has to PASS the value through — `mcpServer.ts` builds it from
+ * `connectionDiagnosis.ts`, the one module that owns the vocabulary.
+ */
 export type FigpeaCallResultLike =
   | { ok: true; value: unknown }
-  | { ok: false; code: string; message?: string; url?: string };
+  | { ok: false; code: string; message?: string; url?: string; connection?: unknown };
 
 export interface McpTextContentLike {
   type: 'text';
@@ -374,12 +381,26 @@ const RETURN_PATH_WRITE_FAILED = 'return_path_write_failed';
  * `{ok:true, value}` branch exactly as before. `filename` rides along in both
  * (it is part of the payload's own shape), and reaches the path payload only
  * when the payload actually carried one.
- */
+  *
+  * ⛔ REQ-1394 — the failure branch REBUILDS the object from a whitelist
+  * rather than passing it through, so adding a field at the call site alone
+  * ships NOTHING: `ok`/`code`/`message`/`url` are re-stringified here and
+  * everything else is silently discarded. `connection` is therefore forwarded
+  * explicitly, and only when present — so a failure that carries no diagnosis
+  * still maps to exactly the byte-identical payload it did before.
+  */
 export function resultToContent(result: FigpeaCallResultLike, opts?: ReturnAsOptions): MappedToolResultLike {
   if (!result.ok) {
+    const failure: Record<string, unknown> = {
+      ok: false,
+      code: result.code,
+      message: result.message,
+      url: result.url,
+    };
+    if (result.connection !== undefined) failure.connection = result.connection;
     return {
       isError: true,
-      content: [{ type: 'text', text: JSON.stringify({ ok: false, code: result.code, message: result.message, url: result.url }) }],
+      content: [{ type: 'text', text: JSON.stringify(failure) }],
     };
   }
 
