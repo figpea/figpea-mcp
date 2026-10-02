@@ -238,6 +238,27 @@ A string that does not parse, or that parses to the wrong kind for its declared 
 
 Image-returning methods (`canvas.screenshot`, raster `export.*`) return both an MCP `image` content block and a `text` summary block.
 
+#### Per-call argument budget
+
+Every call carries **one** budget: the **total serialized size of `args`** is capped, and over the cap the call is refused with `arg_size_exceeded` and **nothing is applied** — there is no partial result to recover from.
+
+This is a limit on **every** call, whatever the payload. It is not an image-only footnote: `layer.batch` is the method where large `args` are normal, and a dense page of shape and text ops reaches the cap at well under 90 ops.
+
+| | |
+|---|---|
+| Read the live value | `figpea_describe({ selector: "limits" })` → `{ "argsChars": 22000 }`, or `limits.argsChars` on the bare `figpea.describe()` index |
+| Unit | **characters** — UTF-16 code units of `JSON.stringify(args)`, not bytes |
+| Aim for | roughly **two-thirds** of the limit per call |
+| Over the cap | `arg_size_exceeded`; nothing applied |
+| Remedy | split the op list across calls of that size, passing ids from earlier results literally |
+
+Two things worth knowing before you size a call:
+
+- **Non-ASCII payloads reach the cap earlier.** The limit counts characters, but the transport caps *bytes*. A payload carrying emoji or other multi-unit characters can measure under `argsChars` while its wire size is several times that, so budget lower for those.
+- **Image bytes are the fastest way to hit it.** An inline `data:image/png;base64,…` URI for a 200×200 PNG is already 20–40 KB. For anything larger, stage the bytes on a local CORS origin (`http://127.0.0.1:<port>` with `Access-Control-Allow-Origin: *`) and pass that `http://…` URL — this server fetches it and embeds the bytes, so the tool call itself stays small. This server relays the editor's refusal verbatim, so the remedy it names depends on whether your payload actually carried image bytes.
+
+Do not hardcode today's number: the editor owns the threshold and publishes it, and a threshold move is then a read rather than a guess. Each chunk is its own undo step, so splitting a batch trades one atomic undo for a correctly sized call.
+
 ### Configuration
 
 | Flag / Env var | Values | Default | Precedence |

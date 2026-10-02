@@ -143,6 +143,43 @@ export { MAX_CALL_TIMEOUT_MS, DEFAULT_TIMEOUT_TABLE_MS } from './callTimeout';
 const TIMEOUT_KNOB_ADVICE =
   'The default can be too low during a burst of mutations, where the editor is still settling after the relay has already given up — pass _timeoutMs deliberately (90000 is a legal value) rather than discovering the limit by timing out. Clamped to 120000, not rejected.';
 
+/**
+ * REQ-1432 T6 — the per-call args budget, on `figpea_call`'s own description
+ * AND its `args` meta description.
+ *
+ * The card's evidence is a run authoring a page through this tool: a ~28 KB
+ * `layer.batch` payload was refused outright and the page had to be rebuilt in
+ * ~6 smaller calls, and the refusal named image staging for a payload with no
+ * bytes on it. So the limit was real, common, and advertised nowhere on the tool
+ * an agent is actually calling — the only way to learn it was to be refused.
+ *
+ * Stated as a GENERAL limit on the total serialized `args` of every call, not as
+ * an image footnote: this server relays the editor's refusal verbatim and the
+ * editor now branches its message on whether the payload carries image bytes, so
+ * the caller-facing statement has to match that shape.
+ *
+ * Today's number is quoted so an agent reading only the description can size a
+ * call without a round trip, but it is stated ALONGSIDE the authoritative
+ * pointer `describe().limits.argsChars` — the editor owns the value, and this is
+ * prose. No live value is interpolated into the description: registration order
+ * vs. the contract fetch makes that fragile, and the pointer is the honest
+ * construction. A future threshold move is therefore a one-line edit here.
+ *
+ * Guidance only — parse behaviour is unchanged and no call is newly rejected
+ * (the `TIMEOUT_KNOB_ADVICE` precedent).
+ */
+const ARGS_BUDGET_ADVICE =
+  'Every call carries one budget: the TOTAL serialized size of args is capped (currently ~22000 characters — ' +
+  'read the live value at describe().limits.argsChars, or figpea_describe({selector:"limits"}), and do not ' +
+  'hardcode it). This applies to EVERY call, whatever the payload — not only image data URIs. A dense ' +
+  'layer.batch of shape and text ops reaches the cap at well under 90 ops, and image bytes reach it far ' +
+  'sooner. Over the cap the call is refused with arg_size_exceeded and NOTHING is applied, so there is no ' +
+  'partial result to recover from. Chunk instead: aim for roughly two-thirds of the limit per call and split ' +
+  'the op list across calls of that size, passing ids from earlier results literally. Each chunk is its own ' +
+  'undo step. The limit is measured in characters (UTF-16 code units of JSON.stringify(args)), not bytes, ' +
+  'so a payload carrying emoji or other multi-unit characters reaches the transport cap earlier than the ' +
+  'number suggests — budget lower for those.';
+
 /** REQ-1020 — the three tools whose off-band return is *documented* as an image
  * return, and the worked example set the README uses. This used to gate the
  * `returnAs` declaration in `buildInputShape`; REQ-1279 removed that gate,
@@ -869,7 +906,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       'figpea_call',
       {
         description:
-          'Universal dispatcher — calls any group.method on the paired editor tab via bridge.callTab(group, method, args, _timeoutMs?). In compact mode this is the only way to reach contract methods; in full mode the individual tools are also available. group/method are the describe() surface names, and args is the POSITIONAL argument array for that method, in that method\'s own parameter order. FLAT example: ["rect", {rwidth:100}] for layer.create. NESTED example — when a parameter is itself an array (e.g. layer.batch\'s ops), that parameter is passed as ONE element of args, so the element is an array of {method, args} ops: {"group":"layer","method":"batch","args":[[{"method":"create","args":["page",{"name":"probe","pageWidth":100,"pageHeight":100}]}]]}. Each op\'s own args is likewise a positional ARRAY, never an object. Unsure of a method\'s shape? Call figpea_describe({group, method}) first — it returns that method\'s doc and params from the manifest with no round trip to the tab. Image results return MCP image content + a text summary. Pass returnAs:"path" to receive a binary result off-band as a session file path instead of inline base64 — it reaches every binary export, e.g. canvas_screenshot / export_layer / export_artboard for images and export_project for a native .fp. ' + TIMEOUT_KNOB_ADVICE,
+          'Universal dispatcher — calls any group.method on the paired editor tab via bridge.callTab(group, method, args, _timeoutMs?). In compact mode this is the only way to reach contract methods; in full mode the individual tools are also available. group/method are the describe() surface names, and args is the POSITIONAL argument array for that method, in that method\'s own parameter order. FLAT example: ["rect", {rwidth:100}] for layer.create. NESTED example — when a parameter is itself an array (e.g. layer.batch\'s ops), that parameter is passed as ONE element of args, so the element is an array of {method, args} ops: {"group":"layer","method":"batch","args":[[{"method":"create","args":["page",{"name":"probe","pageWidth":100,"pageHeight":100}]}]]}. Each op\'s own args is likewise a positional ARRAY, never an object. Unsure of a method\'s shape? Call figpea_describe({group, method}) first — it returns that method\'s doc and params from the manifest with no round trip to the tab. Image results return MCP image content + a text summary. Pass returnAs:"path" to receive a binary result off-band as a session file path instead of inline base64 — it reaches every binary export, e.g. canvas_screenshot / export_layer / export_artboard for images and export_project for a native .fp. ' + TIMEOUT_KNOB_ADVICE + ' ' + ARGS_BUDGET_ADVICE,
         // REQ-1296 D1 — loose for the SAME reason as buildInputShape, and it is
         // load-bearing rather than cosmetic here: `figpea_call` is the ONLY way
         // to reach a contract method in compact mode, so if its schema keeps
@@ -900,12 +937,12 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             .array(z.any())
             .optional()
             .describe(
-              'Positional arguments for the method, in that method\'s own parameter order (defaults to []). When a parameter is itself an array (e.g. layer.batch\'s ops), pass it as ONE element of args — that element is an array of {method, args} ops, e.g. [[{method:"create", args:["rect",{rwidth:100}]}]]. Each op\'s args is an array too, never an object. If your harness cannot send a nested object or array, any param the method declares as an object/array may instead be sent as a JSON string with no flag, and this server parses it before the round trip — e.g. "args":["[{\"method\":\"create\",\"args\":[\"rect\",{\"rwidth\":100}]}]"]. A string is a scalar, so nothing collapses it; figpea_describe({group, method}) lists which of this method\'s params accept that as stringJsonParams.',
+              'Positional arguments for the method, in that method\'s own parameter order (defaults to []). When a parameter is itself an array (e.g. layer.batch\'s ops), pass it as ONE element of args — that element is an array of {method, args} ops, e.g. [[{method:"create", args:["rect",{rwidth:100}]}]]. Each op\'s args is an array too, never an object. If your harness cannot send a nested object or array, any param the method declares as an object/array may instead be sent as a JSON string with no flag, and this server parses it before the round trip — e.g. "args":["[{\"method\":\"create\",\"args\":[\"rect\",{\"rwidth\":100}]}]"]. A string is a scalar, so nothing collapses it; figpea_describe({group, method}) lists which of this method\'s params accept that as stringJsonParams. ' + ARGS_BUDGET_ADVICE,
             )
             .meta({
               type: 'array',
               description:
-                'Positional argument array, in the method\'s own parameter order. An array-typed parameter (e.g. layer.batch\'s ops) is passed as ONE element of args, and that element is itself an array of {method, args} ops — e.g. [[{method:"create", args:["rect",{rwidth:100}]}]]. Each op\'s args is an array, never an object. If your harness cannot send a nested object or array, any param the method declares as an object/array may instead be sent as a JSON string with no flag, and this server parses it before the round trip — e.g. "args":["[{\"method\":\"create\",\"args\":[\"rect\",{\"rwidth\":100}]}]"]. A string is a scalar, so nothing collapses it; figpea_describe({group, method}) lists which of this method\'s params accept that as stringJsonParams.',
+                'Positional argument array, in the method\'s own parameter order. An array-typed parameter (e.g. layer.batch\'s ops) is passed as ONE element of args, and that element is itself an array of {method, args} ops — e.g. [[{method:"create", args:["rect",{rwidth:100}]}]]. Each op\'s args is an array, never an object. If your harness cannot send a nested object or array, any param the method declares as an object/array may instead be sent as a JSON string with no flag, and this server parses it before the round trip — e.g. "args":["[{\"method\":\"create\",\"args\":[\"rect\",{\"rwidth\":100}]}]"]. A string is a scalar, so nothing collapses it; figpea_describe({group, method}) lists which of this method\'s params accept that as stringJsonParams. ' + ARGS_BUDGET_ADVICE,
             }),
           // REQ-1282 AC-5 — the advice an agent needs at the moment it decides
           // whether to pass this at all, carried in BOTH halves for the reason
