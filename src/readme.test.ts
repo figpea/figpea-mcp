@@ -593,4 +593,87 @@ describe('README.md (AC-5)', () => {
       /works? out of the box|no build step|no build required|npm test just works|ready to run without/,
     );
   });
+
+  // REQ-1444 — the rot-guard for the change that stops the MISLEADING 404 from
+  // being reachable at all, and for the two relayed messages that now carry
+  // their own remedy.
+  //
+  // Why structural, again: the coherence pin above already records what happens
+  // when these are presence-only. Every counter-example here is paired with the
+  // message the call ACTUALLY returns, and each pair is read off its OWN
+  // comment block — so a reworded example elsewhere in the file cannot satisfy
+  // them, and a message moved onto a different example cannot either.
+  it('quotes the message each counter-example actually returns after REQ-1444', () => {
+    const lines = readme.split('\n');
+    /** The contiguous `//` block above the first line matching `re`, plus the
+     *  label check every counter-example in this section owes. */
+    const commentAbove = (re: RegExp, what: string, labelledCounterExample = true): string => {
+      const idx = lines.findIndex((l) => re.test(l));
+      expect(idx, `${what}: the example line exists`).toBeGreaterThan(-1);
+      const comment: string[] = [];
+      for (let i = idx - 1; i >= 0 && /^\s*\/\//.test(lines[i]!); i--) comment.unshift(lines[i]!);
+      const joined = comment.join('\n');
+      // ⛔ NOT every example in this section is a counter-example, and the
+      // distinction is load-bearing. The `create()`-nests example below is a
+      // CORRECT call — nested style IS how create() takes it — whose comment
+      // explains what happens when that same object is sent to stylePatch.
+      // Demanding a `WRONG` label there would make the document lie about a
+      // working call, so the label is only required where it is true.
+      if (labelledCounterExample) {
+        expect(joined, `${what}: the example is labelled a counter-example`).toMatch(/WRONG/);
+      }
+      return joined;
+    };
+
+    // openFile: the envelope is now REFUSED, so the message it returns is the
+    // pre-flight's `invalid_params` — and `open_fetch_failed` becomes the
+    // inverse reading: seeing it means you did NOT send the envelope. The
+    // sentence claiming nothing server-side looks inside that envelope is the
+    // one that stops being true, so it is pinned as ABSENT.
+    const openFile = commentAbove(/"method":\s*"openFile"[^\n]*"input"\s*:/, 'the openFile envelope counter-example');
+    expect(openFile, 'the refusal it now gets is named').toContain('invalid_params');
+    expect(openFile, 'and it is refused before the fetch that used to happen').toMatch(/before (any )?(fetch|file fetch)/i);
+    expect(openFile, 'the old failure is reframed as the INVERSE, not deleted').toMatch(/open_fetch_failed/);
+    expect(openFile, 'as the reading that means you did NOT send this envelope').toMatch(/did not send|did NOT send/i);
+    expect(
+      openFile,
+      'the now-false claim that nothing inspects the envelope is GONE — a doc that still promises it teaches the wrong cure',
+    ).not.toMatch(/nothing server-side looks inside that envelope/i);
+
+    // stylePatch: a `create()` prop sent as a style key keeps the editor's
+    // `unsupported_style_key` — the card asks for the message to name the flat
+    // form "not only" that — and now says which call to make instead.
+    const createProp = commentAbove(/"method":\s*"create"[^\n]*"style"\s*:/, 'the create()-nests contrast', false);
+    expect(createProp, "the editor's own code is still there").toContain('unsupported_style_key');
+    expect(createProp, 'and the flat form to send instead is named').toMatch(/stylePatch\(id, \{fontSize: 26\}\)/);
+
+    // setPageFill: the editor's clause stays VERBATIM — the coherence pin above
+    // already requires exactly that — and the comment now also carries both
+    // ways out.
+    const setPageFill = commentAbove(/"method":\s*"setPageFill"[^\n]*"patch"\s*:\s*"/, 'the setPageFill counter-example');
+    expect(setPageFill, "the editor's clause is still quoted verbatim").toMatch(/patch must be object \(got string\)/);
+    expect(setPageFill, 'the positional form is named').toMatch(/setPageFill\(pageId, \{…\}\)/);
+    expect(setPageFill, 'and why the JSON-string route did not save it').toMatch(/never descends into an object/i);
+  });
+
+  it('points at figpea_describe rather than quoting the new diagnostic text (REQ-1444)', () => {
+    // The pointer has to name the ONE authority that cannot drift. Quoting the
+    // pre-flight's own sentence here would put a second copy of it in the
+    // document, free to rot independently — the failure this section has
+    // already made once.
+    const lines = readme.split('\n');
+    const start = lines.findIndex((l) => /Object-valued parameters — the object IS the positional slot/.test(l));
+    expect(start, 'the object-is-the-slot paragraph exists').toBeGreaterThan(-1);
+    const paragraph: string[] = [];
+    for (let i = start; i < lines.length && !/^\s*```/.test(lines[i]!); i++) paragraph.push(lines[i]!);
+    const text = paragraph.join('\n');
+    expect(text, 'the authority is named').toContain('figpea_describe');
+    // The consequence, stated rather than left to be rediscovered: retrying the
+    // wrong shape fails identically, so the ARGUMENT is what has to change.
+    expect(text, 'retrying this shape fails identically').toMatch(/retry\w*[^.]*identically/i);
+    expect(
+      text,
+      "the new pre-flight's own sentence is NOT quoted here — figpea_describe is the authority, not a copy of the message",
+    ).not.toMatch(/leaves nothing for it to translate/i);
+  });
 });

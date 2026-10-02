@@ -42,6 +42,19 @@ export interface ArgShapeMismatch {
    * reporting family instead of two wrappers that each know their own code.
    */
   code?: string;
+  /**
+   * REQ-1444 — the value this rule is ABOUT, carried rather than re-derived at
+   * the reporting site.
+   *
+   * Both new rules answer a question the pure module cannot: "is the file this
+   * path names actually there?" That needs `fs.stat`, and an `fs` call in here
+   * would break the very property (no I/O, unit-testable in isolation) that
+   * makes this module worth having. So the predicate reports the VALUE and the
+   * one site that already does I/O picks the code — which is also the only way
+   * both readings of a "did the pre-flight swallow the missing-file case?"
+   * requirement can be satisfied with the answer that is true in each.
+   */
+  offendingValue?: string;
 }
 
 /** Bounds, so a pathological payload cannot make the check expensive. The
@@ -491,6 +504,318 @@ export function findDeclaredWrapperMismatch(
     };
   }
   return undefined;
+}
+
+/* ------------------------------------------------------------------ *
+ * REQ-1444 — the THREE wrong-shape families, and the one predicate each needs.
+ *
+ * The incident (card REQ-1444, from the `2026-10-01-counterform-specimen-og`
+ * `/design` run): an agent read `describe()`'s NAMED declaration and sent
+ * exactly that — `openFile({input:{filePath:"/abs/path/design.fp"}})`. Compact
+ * mode's local-file translation reads `args[0].filePath` POSITIONALLY, so the
+ * envelope put the key one level too deep, nothing was translated, and the bare
+ * local path was forwarded to the editor as a URL — which answered
+ * `open_fetch_failed: HTTP 404 Not Found` about a file that exists. Three round
+ * trips of that one class went into the filesystem instead of into the
+ * argument.
+ *
+ * Every header rule above applies here without exception: pure, schema-driven,
+ * no bridge, no I/O; derive, never enumerate; decline rather than guess; detect
+ * and explain, never repair.
+ * ------------------------------------------------------------------ */
+
+/**
+ * The transport's own key. Not an enumeration: this module exists to reason
+ * about the one key this server reads positionally at three call sites, so the
+ * key is the SUBJECT of the rule rather than one entry in a hard-coded list —
+ * the same standing `isSingleKeyEnvelope` above has for `item`.
+ */
+const FILE_PATH_KEY = 'filePath';
+
+/**
+ * The explanation for a declared-wrapper envelope around a positional
+ * `filePath`. ⛔ IT NEVER QUOTES A FETCH FAILURE, and that is the whole point:
+ * no fetch happened, because the file was never asked for. Naming a 404 here
+ * would repeat the very confusion this rule exists to end.
+ */
+function filePathEnvelopeHint(path: string, sentKeys: string[]): string {
+  return (
+    `The object at this position arrived keyed by ${sentKeys.map((k) => `"${k}"`).join(', ')} — this method's own named ` +
+    `DECLARATION, sent around the contents that belong here. ` +
+    `The local-file translation this server performs reads "${FILE_PATH_KEY}" straight out of ${path}, so an envelope leaves ` +
+    `nothing for it to translate, and a bare local path reaches the editor where it expects a URL. ` +
+    `Retrying this shape fails identically — the argument is what has to change, not the error. ` +
+    `Send the contents flat, with "${FILE_PATH_KEY}" among them, e.g. {"${FILE_PATH_KEY}": "<absolute path>"}.`
+  );
+}
+
+/**
+ * Finds a single-argument declared-wrapper envelope that carries a local
+ * `filePath` one level too deep for this server's own positional read, or
+ * `undefined` when this call has no opinion — which includes every call the
+ * editor accepts.
+ *
+ * ⛔ THE RULE IS NOT "WRAPPER ⇒ REFUSE". It fires only when all of these hold,
+ * and each guard is the conservative direction because a false rejection of a
+ * call the editor accepts is the expensive mistake:
+ *
+ *  1. **Exactly one argument.** At two or more the wrapper is not the whole of
+ *     `args` and the editor cannot expand it (`registry.ts:130`, `raw.length
+ *     !== 1`); the argument in front is what arrives instead, so no positional
+ *     read is defeated by an envelope at all.
+ *  2. **A plain object at `args[0]`**, and a wrapper SIGNATURE — every one of
+ *     its keys is a declared parameter name of this method. The CORRECT flat
+ *     spelling (`args[0]` being `{filePath: …}`) fails here and has to: that is
+ *     what separates "the declaration was sent" from "the contents were sent".
+ *  3. **A non-empty STRING path**, one level in, at one of those declared slots.
+ *     `url`, `bytes` and the filename aliases carry nothing for the translation
+ *     to miss, so `openFile({input:{url:"https://…"}})` — which SUCCEEDS today,
+ *     because the editor expands the wrapper and opens the URL — is declined.
+ *     So are an empty, blank or non-string path, which the reporting site's own
+ *     guards already answer with their own messages.
+ *
+ * It reports `offendingValue` (the INNER path) so the one site that already
+ * does I/O can answer the truthful thing in each case: `open_failed` /
+ * `invalid_image_source` for a file that is not there, `invalid_params` for one
+ * that is. See `ArgShapeMismatch.offendingValue` for why the verdict cannot
+ * live here.
+ *
+ * @param pathFor          renders a param name as the path this lane names it
+ * @param positionalLength the array the TAB will receive — the editor's own
+ *                         `raw.length`, and the same number in both lanes
+ */
+export function findFilePathEnvelopeMismatch(
+  paramSchemas: Record<string, ParamSchemaLike> | undefined,
+  args: readonly unknown[],
+  pathFor: (paramName: string) => string,
+  positionalLength: number,
+  budget: Budget = { nodes: 0 },
+): ArgShapeMismatch | undefined {
+  if (!paramSchemas) return undefined;
+  if (positionalLength !== 1) return undefined;
+  if (budget.nodes++ > MAX_NODES) return undefined;
+  const only = args[0];
+  if (!isPlainObject(only)) return undefined;
+  const declaredNames = new Set(Object.keys(paramSchemas));
+  const sentKeys = Object.keys(only);
+  if (sentKeys.length === 0) return undefined;
+  // (2) wrapper signature — only this method's own names can form one.
+  if (!sentKeys.every((key) => declaredNames.has(key))) return undefined;
+  // (3) the contents, one level in, carrying a real path to translate.
+  for (const paramName of Object.keys(paramSchemas)) {
+    if (budget.nodes++ > MAX_NODES) return undefined;
+    if (paramSchemas[paramName]?.type !== 'object') continue;
+    const inner = only[paramName];
+    if (!isPlainObject(inner)) continue;
+    const filePath = inner[FILE_PATH_KEY];
+    if (typeof filePath !== 'string' || filePath.trim() === '') continue;
+    const path = pathFor(paramName);
+    return {
+      path,
+      expected: `the object itself at this position, with "${FILE_PATH_KEY}" as one of its own keys`,
+      got: describeValue(only),
+      hint: filePathEnvelopeHint(path, sentKeys),
+      offendingValue: filePath,
+    };
+  }
+  return undefined;
+}
+
+/* ------------------------------------------------------------------ *
+ * The create()-prop derivation, for the RELAY-SIDE half (REQ-1444 AC-4).
+ *
+ * `layer.create` accepts a `style` PROP — geometry and appearance nested one
+ * level down, `{style:{fontSize:26}}` — while `stylePatch` takes style keys
+ * FLAT. An agent that learned the first and called the second is answered
+ * `unsupported_style_key: "style"`, which is accurate about what arrived and
+ * points at the wrong thing to change, exactly like the envelope above.
+ *
+ * ⛔ DERIVED, NEVER ENUMERATED. The common-prop set is read out of the
+ * manifest this server already holds (`params.props.shape` of any
+ * create-shaped declaration), so a prop added upstream is right here with no
+ * edit, and a method published the same way is covered for free.
+ * ------------------------------------------------------------------ */
+
+const CREATE_COMMON_PROP_NAMES = new WeakMap<ParamSchemaLike, ReadonlySet<string>>();
+
+/**
+ * The props that apply to EVERY kind, derived from a create-shaped params
+ * declaration — an object param publishing per-kind entries — and memoized on
+ * that declaration's schema object exactly as `kindAllowedKeys` above memoizes
+ * its own, so a check that runs on every relayed failure costs one
+ * `WeakMap.get` thereafter and returns the IDENTICAL frozen instance.
+ *
+ * `undefined` (no opinion) when there is no such declaration, or when it
+ * declares no `shape`: an empty set would read as "this method has no common
+ * props", which is a claim, and this rule has none to make.
+ */
+export function createCommonPropNames(createPropsSchema: ParamSchemaLike | undefined): ReadonlySet<string> | undefined {
+  if (!createPropsSchema) return undefined;
+  if (!createPropsSchema.byKind || Object.keys(createPropsSchema.byKind).length === 0) return undefined;
+  if (!createPropsSchema.shape) return undefined;
+  const cached = CREATE_COMMON_PROP_NAMES.get(createPropsSchema);
+  if (cached) return cached;
+  const built = Object.freeze(new Set(Object.keys(createPropsSchema.shape))) as ReadonlySet<string>;
+  CREATE_COMMON_PROP_NAMES.set(createPropsSchema, built);
+  return built;
+}
+
+/** `{fontSize: 26, fontFamily: "Inter"}` — a payload to copy rather than an
+ *  abstract rule, rendered from the keys the caller actually sent (the
+ *  REQ-1268 idiom). A nested value renders as `…` rather than being expanded:
+ *  the claim being made is about the KEYS being flat, not about their depth. */
+function renderFlatObject(value: Record<string, unknown>): string {
+  const entries = Object.entries(value).map(([key, v]) => `${key}: ${v !== null && typeof v === 'object' ? '…' : JSON.stringify(v)}`);
+  return `{${entries.join(', ')}}`;
+}
+
+/**
+ * The lesson for a `create()` prop sent as a style key, or `undefined` when it
+ * would explain nothing — which is every `unsupported_style_key` that is not
+ * this mistake.
+ *
+ * Fires only when ALL hold: the offending key IS one of the create-shaped
+ * declaration's common props (read from the manifest, not from a list); an
+ * object parameter of the CALLED method carries it; and the value sent under it
+ * is a PLAIN OBJECT. That last guard is what makes "send it flat" unambiguous
+ * and what lets the message show the keys actually sent. A genuinely unknown
+ * style key, or a `style` sent as anything but an object, is somebody else's
+ * error and gets no lesson here.
+ *
+ * ⛔ The leading argument of the rendered flat form is the caller's OWN first
+ * positional value, not a literal placeholder for a named parameter: naming one
+ * would be the enumeration this module's header forbids, and it would read as a
+ * claim about a parameter name that a future declaration could change.
+ */
+export function createPropStyleHint(
+  group: string,
+  method: string,
+  createPropsSchemas: readonly ParamSchemaLike[],
+  paramSchemas: Record<string, ParamSchemaLike> | undefined,
+  values: Record<string, unknown> | undefined,
+  propName: string,
+  firstArg: unknown,
+): string | undefined {
+  if (!paramSchemas || !values) return undefined;
+  const isCommonProp = createPropsSchemas.some((schema) => createCommonPropNames(schema)?.has(propName));
+  if (!isCommonProp) return undefined;
+  for (const [paramName, schema] of Object.entries(paramSchemas)) {
+    if (schema.type !== 'object') continue;
+    const sent = values[paramName];
+    if (!isPlainObject(sent)) continue;
+    const inner = sent[propName];
+    if (!isPlainObject(inner) || Object.keys(inner).length === 0) continue;
+    const lead = typeof firstArg === 'string' ? firstArg : '…';
+    return (
+      `"${propName}" is a create() top-level prop, not a style key — ${method} takes style keys FLAT, so send them as ` +
+      `${method}(${lead}, ${renderFlatObject(inner)}) with no "${propName}" wrapper. ` +
+      `Learn the exact shape first: figpea_describe({group:"${group}", method:"${method}"}).`
+    );
+  }
+  return undefined;
+}
+
+/* ------------------------------------------------------------------ *
+ * The JSON-string blind spot, for the RELAY-SIDE half (REQ-1444 AC-5).
+ *
+ * The escape hatch a host that collapses nesting needs is real and correct: a
+ * string is a scalar, and this server parses a JSON-looking string at any
+ * position the manifest declares as `object`/`array`/`matrix`. But
+ * `applyStructuredStringJson` (`rawJson.ts:263-306`) iterates `positions` —
+ * the container's TOP-LEVEL indices — and gates each on
+ * `expectsStructuredValue(opts.schemaAt(i))`. With `args = [{pageId, patch:"…"}]`
+ * position 0's schema is `pageId`, declared a string, so the gate is false and
+ * the inner `patch` string is never visited.
+ *
+ * The result is a dead end: `setPageFill(): patch must be object (got string)`
+ * names what arrived and nothing about what to send. This rule supplies both
+ * ways out — and, deliberately, reuses `looksLikeJsonLiteral` above verbatim so
+ * the lesson and the parse it explains can never disagree about what
+ * "JSON-looking" means.
+ * ------------------------------------------------------------------ */
+
+/** `setPageFill(pageId, {…})` — the positional form, rendered from the
+ *  manifest's own declared parameter names and order, with the offending slot
+ *  shown as the object it has to be. Derived: a method this has never seen
+ *  renders correctly. */
+function renderPositionalCall(method: string, inputKeys: readonly string[], paramName: string): string {
+  return `${method}(${inputKeys.map((name) => (name === paramName ? '{…}' : name)).join(', ')})`;
+}
+
+/**
+ * Finds a JSON-looking string sitting at a parameter declared `object`/`array`
+ * INSIDE a whole-`args` wrapper, or `undefined` when this call has no opinion.
+ *
+ * Declines on: no schemas (a legacy free-text manifest included), any arity but
+ * one, a non-object `args[0]`, an object with no keys, keys that are not all
+ * declared parameter names, a real object in the slot, a parameter declared a
+ * scalar — a JSON-looking string at a declared `string` is a NAME and is never
+ * parsed (`rawJson.ts`'s gate), so this rule has nothing to add — a string
+ * that is not JSON-looking, and an exhausted budget.
+ */
+export function findNestedStructuredStringMismatch(
+  paramSchemas: Record<string, ParamSchemaLike> | undefined,
+  args: readonly unknown[],
+  pathFor: (paramName: string) => string,
+  budget: Budget = { nodes: 0 },
+  positionalLength: number = args.length,
+): ArgShapeMismatch | undefined {
+  if (!paramSchemas) return undefined;
+  if (positionalLength !== 1) return undefined;
+  if (budget.nodes++ > MAX_NODES) return undefined;
+  const only = args[0];
+  if (!isPlainObject(only)) return undefined;
+  const declaredNames = new Set(Object.keys(paramSchemas));
+  const sentKeys = Object.keys(only);
+  if (sentKeys.length === 0) return undefined;
+  if (!sentKeys.every((key) => declaredNames.has(key))) return undefined;
+  for (const paramName of Object.keys(paramSchemas)) {
+    if (budget.nodes++ > MAX_NODES) return undefined;
+    const schema = paramSchemas[paramName];
+    if (schema?.type !== 'object' && !isArraySchema(schema)) continue;
+    const value = only[paramName];
+    if (!looksLikeJsonLiteral(value)) continue;
+    return {
+      // The slot the editor reads AFTER it expands the wrapper — which is also
+      // the form the hint tells the caller to send, so the two cannot disagree.
+      path: pathFor(paramName),
+      expected: describeSchema(schema),
+      got: describeValue(value),
+      hint:
+        `A JSON-looking string is not parsed where it sits: the JSON-string route visits WHOLE positional slots and never ` +
+        `descends into an object, so a value stringified inside a real object arrives as the string it is. ` +
+        `Send it as its own positional slot, with a real object there.`,
+      offendingValue: value,
+    };
+  }
+  return undefined;
+}
+
+/**
+ * Both ways out, in one sentence: the positional form rendered from the
+ * manifest, and WHY the JSON-string route did not save the call. Ends with the
+ * same `figpea_describe` clause every other hint here uses, which is also what
+ * makes `appendShapeHint` decline and keeps the agent to one appended sentence.
+ */
+export function nestedStringHint(
+  group: string,
+  method: string,
+  inputKeys: readonly string[],
+  paramSchemas: Record<string, ParamSchemaLike> | undefined,
+  paramName: string,
+): string | undefined {
+  // No declaration of this parameter, no way to render its positional slot —
+  // and a hint built from a guess is the same error as a pre-flight built from
+  // one. `findNestedStructuredStringMismatch` has already proved the parameter
+  // exists; this is the guard that keeps the two from drifting apart.
+  if (!paramSchemas || !Object.prototype.hasOwnProperty.call(paramSchemas, paramName)) return undefined;
+  return (
+    `The JSON-string route visits WHOLE positional slots and never descends into an object, so a JSON string nested inside a ` +
+    `real object is never parsed — which is what left "${paramName}" a string here. ` +
+    `Send it positionally as ${renderPositionalCall(method, inputKeys, paramName)}, where "${paramName}" is its own slot with a ` +
+    `real object in it. ` +
+    `Learn the exact shape first: figpea_describe({group:"${group}", method:"${method}"}).`
+  );
 }
 
 /** Renders a schema as a short JSON-ish example, for an error message that

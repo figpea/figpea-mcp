@@ -41,6 +41,12 @@ const SRC_DIR = path.join(PACKAGE_ROOT, 'src');
 
 /** UPDATING THE BASELINE — see the note above. Measured at this branch tip. */
 const BASELINE_TEST_FILES = [
+  // REQ-1444 adds the two suites this requirement's tests live in, extended
+  // here in this REQ's own commit with its own justification, exactly as the
+  // note above instructs: a new suite must EXTEND the baseline, never bypass
+  // it. Both are added by this requirement's T1/T2 and neither removes,
+  // skips or loosens anything.
+  'argShapeEnvelope.test.ts',
   'bridgeFileEndpoint.test.ts',
   'bridgeServer.test.ts',
   'bridgeServerTolerant.test.ts',
@@ -81,6 +87,7 @@ const BASELINE_TEST_FILES = [
   'req1443BuildGuard.test.ts',
   'req1443SpawnWiring.test.ts',
   'req1443SuiteIntegrity.test.ts',
+  'req1444EnvelopeDiagnostics.test.ts',
   'req870.test.ts',
   'skillFetch.test.ts',
   'skillProvenance.test.ts',

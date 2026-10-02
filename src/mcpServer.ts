@@ -18,6 +18,7 @@ import {
   type GeneratedTool,
   type ManifestLike,
   type McpContentBlockLike,
+  type ParamSchemaLike,
 } from './tools';
 import { writeImageReturn, sessionDirFor } from './returnPath';
 // REQ-1301 — the one place the loopback host is decided. Imported from a
@@ -28,7 +29,7 @@ import { writeImageReturn, sessionDirFor } from './returnPath';
 // constant so a fallback can never disagree with the canonical host again.
 import { BRIDGE_URL_HOST } from './bridgeHost';
 import { groupNamesFromCompactIndex } from './describeDrill';
-import { findArgShapeMismatch, findKindPropMismatch, findDeclaredWrapperMismatch, renderSchemaExample } from './argShape';
+import { findArgShapeMismatch, findKindPropMismatch, findDeclaredWrapperMismatch, renderSchemaExample, findFilePathEnvelopeMismatch, findNestedStructuredStringMismatch, createPropStyleHint, nestedStringHint, type ArgShapeMismatch } from './argShape';
 import { wireEncoding, groupEncodingNote } from './wireShape';
 // REQ-1280 — the single `_rawJson` implementation, called by BOTH relay paths
 // (full mode's contract handler and compact mode's `figpea_call`) so they
@@ -561,6 +562,55 @@ function positionalValues(inputKeys: readonly string[], args: readonly unknown[]
 }
 
 /**
+ * This method's expected positional args, rendered from its own declared
+ * schemas — `["…", { … }]` — for the `Expected … args: […]` clause every
+ * pre-flight refusal ends with.
+ *
+ * REQ-1444: this was written out four times, once per pre-flight site, and a
+ * fourth copy is exactly how two sites end up saying the same thing in two
+ * different ways. `req1295WireEncoding.test.ts:563` and `:594` assert the
+ * resulting text, so the extraction had to be byte-identical — which is why it
+ * is a lift of the existing expression and not a rewording.
+ */
+function expectedArgsExample(contractTool: GeneratedTool | undefined): string {
+  if (!contractTool) return '…';
+  return contractTool.inputKeys
+    .map((k) => {
+      const sch = contractTool.paramSchemas?.[k];
+      return sch ? renderSchemaExample(sch) : '…';
+    })
+    .join(', ');
+}
+
+/**
+ * THE one sentence grammar a pre-flight refusal is written in: what arrived,
+ * where, what to send instead, what this method takes, and the one call that
+ * teaches the shape.
+ *
+ * REQ-1444 (AC-6/AC-7): this template existed three times and the envelope
+ * pre-flight needed a fourth. An agent that trips two different pre-flights
+ * must read one grammar, not two — and `req1295WireEncoding.test.ts` asserts
+ * this exact text for the existing sites, so it is byte-identical to what those
+ * three produced. `code` is deliberately NOT here: the per-kind rule carries
+ * the editor's `invalid_transform` and the wire rules carry ours, and the
+ * caller owns that choice because it is the caller's rule.
+ */
+function refusalMessage(
+  toolName: string,
+  group: string,
+  method: string,
+  mismatch: ArgShapeMismatch,
+  expectedArgs: string,
+): string {
+  return (
+    `${toolName}: ${mismatch.path} must be ${mismatch.expected}, but it arrived as ${mismatch.got}. ` +
+    `${mismatch.hint} ` +
+    `Expected ${toolName} args: [${expectedArgs}]. ` +
+    `Learn the exact shape first: figpea_describe({group:"${group}", method:"${method}"}).`
+  );
+}
+
+/**
  * Builds the `McpServer` for a bridge: `open_editor` + `status` are always
  * registered (OQ-4); contract tools are registered/updated from the bridge's
  * live `describe()` manifest on every connect/reconnect.
@@ -819,6 +869,11 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
   // compact mode's `status.toolCount === 0` is untouched.
   let contractIndex: Map<string, GeneratedTool> | null = null;
   let contractIndexFor: ManifestLike | undefined;
+  /** REQ-1444 (AC-4) — every create-shaped params declaration in the manifest
+   *  this server holds, memoized on the same manifest identity (and so the same
+   *  invalidation signal) as `contractIndex` above. */
+  let createPropsIndex: ParamSchemaLike[] | null = null;
+  let createPropsIndexFor: ManifestLike | undefined;
 
   /** REQ-1268 T5 — belt-and-braces half of AC-5.
    *
@@ -897,6 +952,143 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       contractIndexFor = manifest;
     }
     return contractIndex.get(`${groupName}_${methodName}`);
+  }
+
+  /**
+   * REQ-1444 (AC-4) — every create-shaped params declaration the manifest
+   * holds: an object param that publishes PER-KIND entries.
+   *
+   * ⛔ DERIVED, NEVER ENUMERATED. Nothing here names `layer.create`, a kind, or
+   * a prop. A method published the same way upstream is covered with no edit
+   * here, and a manifest this build has never seen answers correctly for free.
+   * The structural signature is the one REQ-1309's own rule already keys on,
+   * so the two agree on what "create-shaped" means.
+   *
+   * The set is the union of those declarations' COMMON props, so the lesson
+   * fires when the offending key is a common prop of something the editor can
+   * create — and is silent when it is not, which is what keeps the hint off an
+   * error it does not explain.
+   */
+  function createPropsSchemas(): readonly ParamSchemaLike[] {
+    const manifest = activeManifest;
+    if (!manifest) return [];
+    if (createPropsIndex === null || createPropsIndexFor !== manifest) {
+      const found: ParamSchemaLike[] = [];
+      for (const tool of buildToolsFromManifest(manifest)) {
+        for (const schema of Object.values(tool.paramSchemas ?? {})) {
+          if (schema.byKind && Object.keys(schema.byKind).length > 0) found.push(schema);
+        }
+      }
+      createPropsIndex = found;
+      createPropsIndexFor = manifest;
+    }
+    return createPropsIndex;
+  }
+
+  /**
+   * REQ-1444 T4 (AC-4) — the third relay-side lesson, beside the two above.
+   *
+   * A `create()` prop sent where style keys go: `layer.create` NESTS them
+   * (`{style:{fontSize:26}}`) because geometry and appearance live in props,
+   * while `layer.stylePatch` takes them FLAT. An agent that learned the first
+   * and called the second is answered `unsupported_style_key: "style"` — which
+   * is accurate about what arrived and points at the wrong thing to change.
+   *
+   * ⛔ IT APPENDS ONLY. The editor's code and message are the ones that have to
+   * survive: the card asks for a message naming the flat form "not only
+   * `unsupported_style_key`", which only has meaning if that code is still
+   * there. Replacing a message this server does not own would also break the
+   * coherence pin in `readme.test.ts`, which requires the editor's own clause
+   * verbatim on the counter-example and forbids relaxing it.
+   *
+   * ⛔ NOT A PRE-FLIGHT, and that is a decision rather than an oversight. A
+   * pre-flight would have to PROVE the editor would reject the payload, and a
+   * false rejection of a call the editor accepts is the expensive direction; an
+   * append cannot reject anything, because the call has already happened.
+   *
+   * Exclusive with `appendWrapperHint` above by construction: a key that is a
+   * declared parameter name is REQ-1295's declaration mistake, and that lesson
+   * must win.
+   */
+  function appendCreatePropHint<T>(
+    result: T,
+    group: string,
+    method: string,
+    contractTool: GeneratedTool | undefined,
+    createPropsSchemas: readonly ParamSchemaLike[],
+    values: Record<string, unknown> | undefined,
+  ): T {
+    const r = result as { ok?: unknown; code?: unknown; message?: unknown };
+    if (r?.ok !== false) return result;
+    if (r.code !== 'unsupported_style_key') return result;
+    if (typeof r.message !== 'string') return result;
+    if (r.message.includes('figpea_describe')) return result; // idempotent
+    const offending = /unsupported style key "([^"]+)"/.exec(r.message)?.[1];
+    if (offending === undefined) return result;
+    // A declared parameter name is REQ-1295's case, and that lesson wins.
+    if (contractTool?.inputKeys.includes(offending)) return result;
+    const hint = createPropStyleHint(
+      group,
+      method,
+      createPropsSchemas,
+      contractTool?.paramSchemas,
+      values,
+      offending,
+      values ? values[contractTool!.inputKeys[0] ?? ''] : undefined,
+    );
+    if (!hint) return result;
+    r.message = `${r.message} — ${hint}`;
+    return result;
+  }
+
+  /**
+   * REQ-1444 T4 (AC-5) — the fourth relay-side lesson.
+   *
+   * The JSON-string escape hatch is real and correct — a string is a scalar and
+   * this server parses a JSON-looking string at any position the manifest
+   * declares as `object`/`array`/`matrix`. But the parse iterates the
+   * container's TOP-LEVEL positions (`rawJson.ts:263-306`), so a string nested
+   * INSIDE a real object is never visited: at `args:[{pageId, patch:"…"}]`
+   * position 0's schema is `pageId`, declared a string, and the gate is false.
+   * The editor's `setPageFill(): patch must be object (got string)` is then a
+   * dead end — it names what arrived and nothing about what to send.
+   *
+   * Runs BEFORE `appendShapeHint` in the composed pass, because the appended
+   * sentence carries its own `figpea_describe` clause and `appendShapeHint`
+   * declines on that — which is how the agent reads ONE appended sentence
+   * rather than two (REQ-1295's rule, applied to the new half).
+   *
+   * ⛔ IT APPENDS ONLY, for the same reason as its sibling above.
+   */
+  function appendNestedStringHint<T>(
+    result: T,
+    group: string,
+    method: string,
+    contractTool: GeneratedTool | undefined,
+    args: readonly unknown[],
+  ): T {
+    const r = result as { ok?: unknown; code?: unknown; message?: unknown };
+    if (r?.ok !== false) return result;
+    if (r.code !== 'invalid_params') return result;
+    if (typeof r.message !== 'string') return result;
+    if (r.message.includes('figpea_describe')) return result; // idempotent
+    // The editor's own clause is the load-bearing evidence that this IS the
+    // stringified case, so nothing here fires without it.
+    if (!/\(\): \w+ must be (?:object|array|matrix) \(got string\)/.test(r.message)) return result;
+    const inputKeys = contractTool?.inputKeys ?? [];
+    const paramSchemas = contractTool?.paramSchemas;
+    const mismatch = findNestedStructuredStringMismatch(
+      paramSchemas,
+      args,
+      (name) => `args[${inputKeys.indexOf(name)}]`,
+    );
+    if (!mismatch) return result;
+    const paramName = inputKeys[Number(/^args\[(\d+)\]/.exec(mismatch.path)?.[1] ?? -1)];
+    if (paramName === undefined) return result;
+    const hint = nestedStringHint(group, method, inputKeys, paramSchemas, paramName);
+    if (!hint) return result;
+    r.message = `${r.message} — ${hint}`;
+    return result;
   }
 
   // REQ-1018 — figpea_call dispatcher (compact mode only)
@@ -1138,7 +1330,64 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
 
         // Clone args shallowly for mutation
         let effectiveArgs: unknown[] = [...args];
+
+        /**
+         * REQ-1444 (AC-1/AC-2) — THE PRE-FLIGHT, shared by the three sites
+         * below that read a local `filePath` POSITIONALLY.
+         *
+         * The defect: an agent sends `describe()`'s named declaration
+         * (`{input:{filePath}}`) instead of the contents, so the key sits one
+         * level too deep for the translation on the very next line, nothing is
+         * translated, and the bare local path is forwarded to the editor AS A
+         * URL — which answers `open_fetch_failed: HTTP 404 Not Found` about a
+         * file that exists, and fails identically on every retry.
+         *
+         * Why one helper for three sites rather than one per method: the
+         * translation is implemented at exactly three places here, an envelope
+         * defeats all three identically, and a rule keyed on a method name
+         * would be the drift generator this module's every other rule is
+         * written to avoid — while leaving two reachable copies of the exact
+         * defect. Detection is derived from the manifest by `argShape.ts`; the
+         * ONE thing that is not derivable is which code a missing file should
+         * answer with, and that is this site's own business, so it is passed in
+         * and used exactly as the sibling branch below already uses it.
+         *
+         * ⛔ THE PEEK IS DIAGNOSTIC ONLY. Nothing is unwrapped and nothing is
+         * forwarded differently: the unwrapped call is refused either way, so
+         * this never becomes a second accepted spelling of anything. That is
+         * what makes it safe to check for the missing-file case at all.
+         */
+        const refuseFilePathEnvelope = async (missingCode: string): Promise<CallToolResult | undefined> => {
+          if (!contractTool) return undefined;
+          const mismatch = findFilePathEnvelopeMismatch(
+            contractTool.paramSchemas,
+            effectiveArgs,
+            (name) => `args[${contractTool.inputKeys.indexOf(name)}]`,
+            effectiveArgs.length,
+          );
+          if (typeof mismatch?.offendingValue !== 'string') return undefined;
+          // A file that is not there is not there whatever shape it arrived in,
+          // and reshaping the argument will not conjure it — so the answer is
+          // the missing-file answer, naming the path the caller actually sent.
+          if (!(await isValidFile(mismatch.offendingValue))) {
+            return toCallToolResult(
+              resultToContent({ ok: false, code: missingCode, message: `file not found or not readable: ${mismatch.offendingValue}` }),
+            );
+          }
+          return toCallToolResult(
+            resultToContent({
+              ok: false,
+              code: 'invalid_params',
+              message: refusalMessage(toolName, group, method, mismatch, expectedArgsExample(contractTool)),
+            }),
+          );
+        };
+
         if (toolName === 'session_openFile') {
+          // FIRST in the branch, before `input.filePath` is read below, so the
+          // refusal lands before any fetch and before any bridge round trip.
+          const envelopeRefusal = await refuseFilePathEnvelope('open_failed');
+          if (envelopeRefusal) return envelopeRefusal;
           // args[0] is expected to be input object {filePath?, url?, ...}
           const input = effectiveArgs[0] as Record<string, unknown> | undefined;
           const filePathVal = (input as any)?.filePath as string | undefined;
@@ -1165,6 +1414,9 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             return toCallToolResult(resultToContent({ ok: false, code: 'open_failed', message: 'input.filePath must be a string' }));
           }
         } else if (toolName === 'layer_setImageFill') {
+          // Same envelope, same defect, this site's own missing-file code.
+          const envelopeRefusal = await refuseFilePathEnvelope('invalid_image_source');
+          if (envelopeRefusal) return envelopeRefusal;
           const source = effectiveArgs[0] as Record<string, unknown> | undefined;
           // Actually layer_setImageFill signature is (id, source) — source is args[1] if id is args[0]
           // Handle both single-arg and two-arg forms defensively: look for any arg that looks like {filePath}
@@ -1195,6 +1447,14 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             }
           }
         } else if (toolName === 'layer_create') {
+          // Third and last site. `layer_batch` is deliberately NOT covered: an
+          // op's `filePath` lives inside an array at `args[0][i].args[1]`, so
+          // catching it means resolving each op's own method against the
+          // manifest — real work, no acceptance criterion asks for it, and the
+          // same KNOWN RESIDUAL `argShape.ts` records. Recorded so the gap does
+          // not read as an oversight.
+          const envelopeRefusal = await refuseFilePathEnvelope('invalid_image_source');
+          if (envelopeRefusal) return envelopeRefusal;
           // args: [kind, props] — props may contain filePath when kind==='image'
           const kindVal = effectiveArgs[0] as string | undefined;
           const props = effectiveArgs[1] as Record<string, unknown> | undefined;
@@ -1307,12 +1567,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           if (effectiveArgs.length > contractTool.inputKeys.length) {
             const surplusIndex = contractTool.inputKeys.length;
             const arity = contractTool.inputKeys.length;
-            const expectedArgs = contractTool.inputKeys
-              .map((k, idx) => {
-                const sch = contractTool.paramSchemas?.[k];
-                return sch ? renderSchemaExample(sch) : '…';
-              })
-              .join(', ');
+            const expectedArgs = expectedArgsExample(contractTool);
             return toCallToolResult(
               resultToContent({
                 ok: false,
@@ -1378,21 +1633,11 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             effectiveArgs.length,
           );
           if (wrapperMismatch) {
-            const expectedArgs = contractTool.inputKeys
-              .map((k, idx) => {
-                const sch = contractTool.paramSchemas?.[k];
-                return sch ? renderSchemaExample(sch) : '…';
-              })
-              .join(', ');
             return toCallToolResult(
               resultToContent({
                 ok: false,
                 code: wrapperMismatch.code ?? 'invalid_params',
-                message:
-                  `${toolName}: ${wrapperMismatch.path} must be ${wrapperMismatch.expected}, but it arrived as ${wrapperMismatch.got}. ` +
-                  `${wrapperMismatch.hint} ` +
-                  `Expected ${toolName} args: [${expectedArgs}]. ` +
-                  `Learn the exact shape first: figpea_describe({group:"${group}", method:"${method}"}).`,
+                message: refusalMessage(toolName, group, method, wrapperMismatch, expectedArgsExample(contractTool)),
               }),
             );
           }
@@ -1406,21 +1651,11 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             if (key === undefined) break;
             const mismatch = findArgShapeMismatch(effectiveArgs[i], contractTool.paramSchemas?.[key], `args[${i}]`);
             if (!mismatch) continue;
-            const expectedArgs = contractTool.inputKeys
-              .map((k, idx) => {
-                const sch = contractTool.paramSchemas?.[k];
-                return sch ? renderSchemaExample(sch) : '…';
-              })
-              .join(', ');
             return toCallToolResult(
               resultToContent({
                 ok: false,
                 code: mismatch.code ?? 'invalid_params',
-                message:
-                  `${toolName}: ${mismatch.path} must be ${mismatch.expected}, but it arrived as ${mismatch.got}. ` +
-                  `${mismatch.hint} ` +
-                  `Expected ${toolName} args: [${expectedArgs}]. ` +
-                  `Learn the exact shape first: figpea_describe({group:"${group}", method:"${method}"}).`,
+                message: refusalMessage(toolName, group, method, mismatch, expectedArgsExample(contractTool)),
               }),
             );
           }
@@ -1448,21 +1683,11 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             (name) => `args[${contractTool.inputKeys.indexOf(name)}]`,
           );
           if (kindMismatch) {
-            const expectedArgs = contractTool.inputKeys
-              .map((k, idx) => {
-                const sch = contractTool.paramSchemas?.[k];
-                return sch ? renderSchemaExample(sch) : '…';
-              })
-              .join(', ');
             return toCallToolResult(
               resultToContent({
                 ok: false,
                 code: kindMismatch.code ?? 'invalid_params',
-                message:
-                  `${toolName}: ${kindMismatch.path} must be ${kindMismatch.expected}, but it arrived as ${kindMismatch.got}. ` +
-                  `${kindMismatch.hint} ` +
-                  `Expected ${toolName} args: [${expectedArgs}]. ` +
-                  `Learn the exact shape first: figpea_describe({group:"${group}", method:"${method}"}).`,
+                message: refusalMessage(toolName, group, method, kindMismatch, expectedArgsExample(contractTool)),
               }),
             );
           }
@@ -1475,15 +1700,34 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             return toCallToolResult(resultToContent(resolvedReturnAs.error));
           }
           const result = (await bridge.callTab(group, method, effectiveArgs, effectiveTimeoutMs)) as FigpeaCallResultLike;
-          // REQ-1295 T4 — both relay-side halves, in one pass, so the agent sees
-          // one appended sentence rather than two appended sentences.
+          // REQ-1295 T4 / REQ-1444 T4 (AC-5) — ALL FOUR relay-side halves, in
+          // ONE pass, so the agent sees one appended sentence rather than two
+          // appended sentences. `appendNestedStringHint` runs FIRST because its
+          // sentence carries its own `figpea_describe` clause, which makes
+          // `appendShapeHint` decline — and `appendCreatePropHint` sits inside
+          // `appendWrapperHint` because the two are exclusive by the offending
+          // key: a declared parameter name is REQ-1295's lesson and must win.
+          // Every one of them appends only; none rewrites a code or a message.
+          const relayedValues = contractTool ? positionalValues(contractTool.inputKeys, effectiveArgs) : undefined;
+          const composed = appendShapeHint(
+            appendWrapperHint(
+              appendCreatePropHint(
+                appendNestedStringHint(result, group, method, contractTool, effectiveArgs),
+                `${group}`,
+                `${method}`,
+                contractTool,
+                createPropsSchemas(),
+                relayedValues,
+              ),
+              new Set(contractTool?.inputKeys ?? []),
+              relayedValues,
+            ),
+            `${group}`,
+            `${method}`,
+          );
           return toCallToolResult(
             resultToContent(
-              appendWrapperHint(
-                appendShapeHint(result, `${group}`, `${method}`),
-                new Set(contractTool?.inputKeys ?? []),
-                contractTool ? positionalValues(contractTool.inputKeys, effectiveArgs) : undefined,
-              ),
+              composed,
               returnAsOpts(bridge, toolName, resolvedReturnAs.mode),
             ),
           );

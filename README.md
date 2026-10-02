@@ -173,7 +173,7 @@ By default `figpea-mcp` runs in **compact mode** — only 5 tools (`open_editor`
 
 **Nesting rule.** `args` is the positional array in the method's own parameter order. When a parameter is itself an array — `layer.batch`'s `ops` is the one that bites — that parameter goes in as **one element of `args`**, and the element is an array of `{method, args}` ops. Each op's `args` is a positional array as well. So `ops` is `[[{…}]]`, never `{ops: […]}` and never `{"item": […]}` (the latter is what some host harnesses produce when they collapse a nested array; `figpea_call` answers that with an `invalid_params` naming the path and the expected shape, without spending a tab round trip). When in doubt, call `figpea_describe({ group: "layer", method: "batch" })` first — it returns the authoritative shape from the manifest.
 
-**Object-valued parameters — the object IS the positional slot.** When a parameter is a plain object, that object occupies `args[n]` *on its own*; you never wrap it in a second envelope keyed by the parameter's own name. This is the shape that bites hardest, precisely because several parameters are **named** `input` or `patch` — so writing that name into your payload is the mistake, not the fix:
+**Object-valued parameters — the object IS the positional slot.** When a parameter is a plain object, that object occupies `args[n]` *on its own*; you never wrap it in a second envelope keyed by the parameter's own name. This is the shape that bites hardest, precisely because several parameters are **named** `input` or `patch` — so writing that name into your payload is the mistake, not the fix. `figpea_describe({ group, method })` is the authority on which is which: it returns each parameter's name, type and shape in that method's own positional order, so a parameter's *name* tells you nothing about how to nest it. One consequence worth stating outright, because it is what turns a wrong call into a filesystem hunt: retrying a wrong shape here fails **identically** every time, because the argument — not the message — is what is wrong, so a clearer error on the next try cannot help. Change the shape.
 
 The one wrapper that IS legal is a **single** object as the whole of `args`, keyed by the method's own parameter names — the editor expands it to positional order. That expansion needs the call to carry exactly one argument, so the moment a positional argument goes in front of it — `stylePatch`'s layer id, `setPosition`'s layer id — it stops expanding, and the wrapper arrives as the object itself. Your keys were fine; the envelope was the mistake.
 
@@ -181,12 +181,14 @@ The one wrapper that IS legal is a **single** object as the whole of `args`, key
 // session.openFile(input) — `input` IS args[0]. figpea-mcp maps a `filePath`
 // here to http://localhost:<port>/file?path=… so the editor can fetch it.
 { "group": "session", "method": "openFile", "args": [{ "filePath": "/abs/path/design.fp" }] }
-// WRONG — the file-path translation reads args[0].filePath, finds nothing, and the
-// bare path reaches the editor as a URL: open_fetch_failed: HTTP 404 Not Found for
-// "/abs/path/design.fp". The file EXISTS; the 404 is your argument shape, not the
-// filesystem and not the bridge. Check this shape before you go looking for the file.
-// Nothing server-side looks inside that envelope, so retrying this shape fails
-// identically — the cure is the shape above, not a clearer error on the next try.
+// WRONG — the file-path translation reads args[0].filePath, and this envelope puts
+// it one level too deep, so the call is REFUSED BEFORE ANY FETCH with an
+// invalid_params naming args[0] as where filePath belongs — no tab round trip spent.
+// Inverted, if you see open_fetch_failed: HTTP 404 Not Found for
+// "/abs/path/design.fp" then you did NOT send this envelope: the shape above was
+// used, the path really was forwarded, and the file exists, so look at the path,
+// the file, or the bridge — not at your argument shape.
+// Either way retrying fails identically, so the argument is what has to change.
 { "group": "session", "method": "openFile", "args": [{ "input": { "filePath": "/abs/path/design.fp" } }] }
 
 // layer.stylePatch(id, patch) — the style keys go in FLAT, with no `style` wrapper
@@ -201,7 +203,8 @@ The one wrapper that IS legal is a **single** object as the whole of `args`, key
 { "group": "layer", "method": "stylePatch", "args": [{ "id": "L_kicker", "patch": { "fontFamily": "Inter", "fontSize": 26, "fill": "#1A1A1A" } }] }
 // create() nests them and stylePatch does NOT — that asymmetry is real:
 // { "style": { … } } is answered unsupported_style_key: "style" — "style" is a
-// create() top-level prop, not a style key.
+// create() top-level prop, not a style key — and the message now also names the
+// flat form to send instead: stylePatch(id, {fontSize: 26}).
 { "group": "layer", "method": "create", "args": ["text", { "text": "Counterform", "style": { "fontSize": 26 } }] }
 
 // layer.setPageFill(pageId, patch) — a scalar, then an object, positionally
@@ -211,6 +214,9 @@ The one wrapper that IS legal is a **single** object as the whole of `args`, key
 // is the whole of `args`. The mistake is
 // `patch` itself — a stringified object NESTED INSIDE a real object is never parsed, so it
 // stays a string: invalid_params: setPageFill(): patch must be object (got string)
+// …and the message now adds both ways out: send it positionally as
+// setPageFill(pageId, {…}), and know why stringifying did not save it — the JSON-string
+// route visits whole positional slots and never descends into an object.
 { "group": "layer", "method": "setPageFill", "args": [{ "pageId": "P_1", "patch": "{\"fill\":\"#EFEBE3\"}" }] }
 ```
 
