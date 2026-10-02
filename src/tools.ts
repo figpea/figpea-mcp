@@ -21,6 +21,13 @@ export interface ManifestMethodDescriptorLike {
 
 export type ManifestLike = Record<string, Record<string, ManifestMethodDescriptorLike>>;
 
+// REQ-1295 — the encoding derivation, imported rather than re-implemented so
+// the compact lane's `wire` key and this lane's description line are ONE
+// function's output and cannot drift apart. `wireShape.ts` is
+// dependency-free, so this costs nothing at runtime and keeps this module's
+// own no-`ws`/SDK/zod-value-imports constraint intact.
+import { namedKeyEncodingLine } from './wireShape';
+
 /**
  * REQ-093 T4/T5 (AC-3/AC-4) — the reserved top-level manifest key `describe()`
  * composes the error-code catalog under (`src/agent/results.ts`'s
@@ -231,6 +238,20 @@ function buildDescription(descriptor: ManifestMethodDescriptorLike): string {
   if (descriptor.params !== undefined) {
     lines.push(`Params: ${describeShape(descriptor.params)}`);
   }
+  // REQ-1295 (AC-4, T5) — `figpea_describe` is registered COMPACT-ONLY
+  // (`mcpServer.ts:634`), and full mode is the LIBRARY default
+  // (`mcpServer.ts:516`), so this lane has no drill tool to ask: `Params:` above
+  // is a named DECLARATION and nothing on this surface said it was not the
+  // encoding. For a method declaring an object parameter the two forms diverge,
+  // and the line is derived by the SAME helper the compact lane's `wire` key
+  // uses — so the two lanes cannot state the rule differently.
+  //
+  // Derived, not enumerated, like every other manifest-driven surface here: a
+  // method published this way is covered with no edit, and the change to
+  // `tools.ts`'s output is a ONE-TIME re-registration on reconnect after the
+  // upgrade (`isUnchanged` compares descriptions), not a loop.
+  const encoding = namedKeyEncodingLine(descriptor);
+  if (encoding) lines.push(encoding);
   if (descriptor.result !== undefined) {
     lines.push(`Result: ${describeShape(descriptor.result)}`);
   }

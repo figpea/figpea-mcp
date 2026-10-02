@@ -387,6 +387,112 @@ export function findKindPropMismatch(
   return undefined;
 }
 
+/* ------------------------------------------------------------------ *
+ * REQ-1295 — the DECLARED-WRAPPER rule.
+ *
+ * The incident: an agent read `describe()`'s `params` — a NAMED declaration —
+ * and sent exactly that, so the wrapper arrived where the object itself was
+ * due. The editor then validated the WRAPPER as the patch and answered
+ * `unsupported_style_key: patch`: an error asserting that a style key the
+ * caller never sent was disallowed, sending the agent hunting a problem it does
+ * not have. The declaration is the editor's and is correct; the description is
+ * what misleads, so the refusal is relay-side and pre-flight.
+ *
+ * ⛔ THREE CONDITIONS, ALL NARROWER THAN THE CLASS, because a false rejection
+ * of a call the editor accepts is the expensive direction (the rule recorded
+ * above this section). In particular the editor EXPANDS a single object keyed
+ * by a method's own parameter names — `registry.ts:130`, `raw.length !== 1` —
+ * so "never pass a name-keyed object" would be false, and two published
+ * examples depend on the form working.
+ *
+ * ⛔ DECLINE RATHER THAN GUESS, like every other rule here: no schemas, no
+ * declared shape to tell two readings apart, a value that is not an object, an
+ * exhausted budget, or a call the editor might still expand ⇒ forward it.
+ */
+
+/**
+ * The explanation, derived from the manifest so it cannot name a parameter
+ * that does not exist, and carrying NO claim about style keys — the one thing
+ * today's message gets wrong. An appended hint that kept the editor's wording
+ * would reintroduce the false lesson with extra words.
+ */
+function declaredWrapperHint(
+  paramName: string,
+  contents: string[],
+  sentKeys: string[],
+): string {
+  const sample = contents.slice(0, 3).join(', ');
+  return (
+    `The object at this position arrived keyed by ${sentKeys.map((k) => `"${k}"`).join(', ')} — the manifest's own ` +
+    `DECLARATION of ${paramName}, sent instead of the contents. The declaration is not the encoding: ` +
+    `${paramName} IS this positional slot, so send its contents flat (keys: ${sample}${contents.length > 3 ? ', …' : ''}) ` +
+    `with no "${paramName}" wrapper. `
+  );
+}
+
+/**
+ * Finds a declared wrapper sent where an object's CONTENTS were due, or
+ * `undefined` when this call has no opinion — which includes every call the
+ * editor accepts.
+ *
+ * Fires only when all three hold:
+ *  1. **Wrapper signature** — every key of the value is a declared param name
+ *     of this method, and there is at least one. This is what "you sent the
+ *     descriptor's named declaration" means, and it is why an arbitrary
+ *     unknown key is never flagged: only this method's own names can form the
+ *     signature.
+ *  2. **Not contents** — the parameter declares a `shape` (or `byKind`), and
+ *     NO key of the value is one of its legal keys. A legitimate contents
+ *     object that happens to contain a param-named key is therefore never
+ *     flagged, and a parameter with no declared shape is declined outright:
+ *     with nothing to tell the two readings apart, the tab's answer is the
+ *     one that counts.
+ *  3. **Provably unexpandable** — `positionalLength >= 2`. The tab receives
+ *     this very array, spread into the method (`bridge/client.ts:69`,
+ *     `fn(...frame.args)`), and the editor's wrapper expansion runs only for a
+ *     call of exactly one argument. So at two or more there is no reading of
+ *     the payload that works, and refusing costs nothing. At one, we decline.
+ *
+ * @param positionalLength the array the TAB will receive — the editor's own
+ *                         `raw.length`, and the same number in both lanes
+ */
+export function findDeclaredWrapperMismatch(
+  paramSchemas: Record<string, ParamSchemaLike> | undefined,
+  values: Record<string, unknown>,
+  pathFor: (paramName: string) => string,
+  positionalLength: number,
+  budget: Budget = { nodes: 0 },
+): ArgShapeMismatch | undefined {
+  if (!paramSchemas) return undefined;
+  if (positionalLength < 2) return undefined;
+  const declaredNames = new Set(Object.keys(paramSchemas));
+  for (const [paramName, schema] of Object.entries(paramSchemas)) {
+    if (budget.nodes++ > MAX_NODES) return undefined;
+    if (schema.type !== 'object') continue;
+    const value = values[paramName];
+    if (!isPlainObject(value)) continue;
+    const sentKeys = Object.keys(value);
+    if (sentKeys.length === 0) continue;
+    // (1) wrapper signature — every key is one of this method's param names.
+    if (!sentKeys.every((key) => declaredNames.has(key))) continue;
+    // (2) not contents — a declared shape must exist and none of the sent keys
+    // may be one of its legal keys.
+    const legal = new Set(Object.keys(schema.shape ?? {}));
+    for (const kindFields of Object.values(schema.byKind ?? {})) {
+      for (const key of Object.keys(kindFields)) legal.add(key);
+    }
+    if (legal.size === 0) continue;
+    if (sentKeys.some((key) => legal.has(key))) continue;
+    return {
+      path: pathFor(paramName),
+      expected: `the contents of "${paramName}" flat at this position`,
+      got: describeValue(value),
+      hint: declaredWrapperHint(paramName, Array.from(legal), sentKeys),
+    };
+  }
+  return undefined;
+}
+
 /** Renders a schema as a short JSON-ish example, for an error message that
  *  shows the shape instead of only naming it. */
 

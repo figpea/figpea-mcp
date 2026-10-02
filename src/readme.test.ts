@@ -386,6 +386,98 @@ describe('README.md (AC-5)', () => {
     expect(readme, 'the conditional filename key is documented').toMatch(/only when the payload carried one/i);
   });
 
+  // REQ-1295 — the section this lands in currently CONTRADICTS itself: `:176`
+  // says "you never wrap it in a second envelope keyed by the parameter's own
+  // name", while `:199-200` says a name-keyed single object "is a legal `args`,
+  // and it expands to positional order". Both are true; the missing qualifier is
+  // a fact in the editor (`registry.ts:130` — expansion runs only when the call
+  // carries exactly one argument). These pins are structural rather than
+  // presence-only, for the reason the coherence pin above already records: an
+  // example paired with a rule it does not actually obey is exactly what let
+  // the contradiction ship.
+  it('states the one legal wrapper and the exactly-one-argument reason for it (REQ-1295 R1)', () => {
+    // The prohibition itself survives verbatim — it is true as far as it goes.
+    expect(readme, 'the object-is-the-positional-slot rule is still stated').toMatch(/object IS the positional slot/i);
+    // …and the exception that makes it true rather than a contradiction.
+    expect(readme, 'the single-object whole-args wrapper is named as legal').toMatch(/only while it is the whole of `args`|the whole of `args`, keyed by the method/i);
+    // The reason, stated rather than asserted: expansion is a one-argument fact.
+    expect(readme, 'and the reason is the exactly-one-argument rule').toMatch(/exactly one argument/i);
+    // …and what stops it, named as the thing an agent actually did.
+    expect(readme, 'the positional argument in front is what breaks it').toMatch(/goes in front of it|goes in front/i);
+    // Claims discipline: no adverb this change cannot measure.
+    expect(readme, 'no unmeasured reliability adverb').not.toMatch(/now correct|lossless|never wastes a round trip/i);
+  });
+
+  it('carries the stylePatch WRONG example beside the flat one, and the same wrapper shown legal on its own (REQ-1295 R2)', () => {
+    const lines = readme.split('\n');
+    const wrongIdx = lines.findIndex((l) => l.includes('"method": "stylePatch"') && /"args":\s*\[\s*"L_\w+",\s*\{\s*"patch"/.test(l));
+    expect(wrongIdx, 'the two-positional-argument stylePatch counter-example is present').toBeGreaterThan(-1);
+    // The flat form is still there beside it, unchanged.
+    const flatIdx = lines.findIndex((l) => l.includes('"method": "stylePatch"') && /"args":\s*\[\s*"L_\w+",\s*\{\s*"font/.test(l));
+    expect(flatIdx, 'the flat stylePatch example survived').toBeGreaterThan(-1);
+    // The load-bearing third line: the SAME wrapper, correct on its own.
+    const legalIdx = lines.findIndex((l) => l.includes('"method": "stylePatch"') && /"args":\s*\[\s*\{\s*"id":\s*"L_/.test(l));
+    expect(legalIdx, 'the same wrapper is shown legal as the whole of args').toBeGreaterThan(-1);
+    // The error is named, and READ as the wrapper mistake rather than a bad key.
+    expect(readme, 'the editor code is named so the failure is recognisable').toContain('unsupported_style_key');
+    expect(readme, 'and it is read as the declaration, not a style key').toMatch(/is not a style key|instead of its contents/i);
+  });
+
+  // The STRUCTURAL coherence pin (brief §3e): the WRONG example really does
+  // carry two positional arguments with the declared key inside the object, the
+  // flat form sits beside it, and the single-object wrapper is its own example.
+  // Asserted by parsing the three calls, NOT by "both strings appear" — the
+  // shape is the entire claim, and a rewording of the prose must not be able to
+  // make it true.
+  it('the three stylePatch examples are structurally distinct — a wrapper at two args, the flat form, and the wrapper alone (REQ-1295)', () => {
+    const lines = readme.split('\n');
+    const pick = (re: RegExp) => {
+      const idx = lines.findIndex((l) => re.test(l));
+      expect(idx, `an example matching ${re} exists`).toBeGreaterThan(-1);
+      return { idx, call: JSON.parse(lines[idx]!.trim()) };
+    };
+    const wrong = pick(/"method":\s*"stylePatch"[^\n]*"patch"\s*:\s*\{/);
+    const flat = pick(/"method":\s*"stylePatch",\s*"args":\s*\[\s*"L_\w+",\s*\{\s*"font/);
+    const legal = pick(/"method":\s*"stylePatch",\s*"args":\s*\[\s*\{\s*"id":/);
+
+    // WRONG: two positional args, the declared key nested inside the object —
+    // the exact shape the editor cannot expand.
+    expect(wrong.call.group).toBe('layer');
+    expect(wrong.call.method).toBe('stylePatch');
+    expect(Array.isArray(wrong.call.args), 'the counter-example has an args array').toBe(true);
+    expect(wrong.call.args.length, 'it carries TWO positional arguments, so nothing expands it').toBe(2);
+    expect(typeof wrong.call.args[0], 'args[0] is the layer id').toBe('string');
+    expect(Object.keys(wrong.call.args[1]), 'the object is keyed by the DECLARED param name').toEqual(['patch']);
+    expect(typeof wrong.call.args[1].patch, 'and the real contents sit inside it').toBe('object');
+
+    // FLAT: same method, two positional args, the contents at args[1] with no
+    // envelope key at all.
+    expect(flat.call.args.length).toBe(2);
+    expect(typeof flat.call.args[0]).toBe('string');
+    expect(Object.keys(flat.call.args[1]), 'nothing is wrapped').not.toContain('patch');
+
+    // LEGAL: the SAME wrapper, as the whole of args — one argument.
+    expect(legal.call.args.length, 'the legal form carries exactly ONE argument, which is why it expands').toBe(1);
+    expect(Object.keys(legal.call.args[0]).sort()).toEqual(['id', 'patch']);
+
+    // The counter-example is LABELLED, so a reader skimming the block cannot
+    // copy it out as if it were a right one.
+    const comment: string[] = [];
+    for (let i = wrong.idx - 1; i >= 0 && /^\s*\/\//.test(lines[i]!); i--) comment.unshift(lines[i]!);
+    expect(comment.join('\n'), 'the pair is labelled WRONG and quotes the code it produces').toMatch(/WRONG/);
+    expect(comment.join('\n')).toMatch(/unsupported_style_key/);
+  });
+
+  it('says params is the DECLARATION not the encoding, and names the wire key it ships (REQ-1295 R4)', () => {
+    expect(readme, 'the declaration/encoding distinction is stated').toMatch(/`params` is the \*\*declaration\*\*, not the \*\*encoding\*\*/);
+    // The wire key, by the name actually shipped — the README and the tool
+    // description must not drift onto two different names.
+    expect(readme, 'the per-method wire key is documented').toMatch(/`wire`/);
+    // …and it is described as derived, so a reader trusts it for a method the
+    // document never names.
+    expect(readme, 'the key is stated to be derived from the manifest').toMatch(/derived from the same manifest|derived from the manifest/i);
+  });
+
   // REQ-1296 T5 — the rot-guard for the failure class this change closed. The
   // requirement found its way: an agent passed `filePath` to
   // `canvas_screenshot`, was answered `ok: true` with the image inline, and

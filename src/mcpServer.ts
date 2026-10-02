@@ -28,7 +28,8 @@ import { writeImageReturn, sessionDirFor } from './returnPath';
 // constant so a fallback can never disagree with the canonical host again.
 import { BRIDGE_URL_HOST } from './bridgeHost';
 import { groupNamesFromCompactIndex } from './describeDrill';
-import { findArgShapeMismatch, findKindPropMismatch, renderSchemaExample } from './argShape';
+import { findArgShapeMismatch, findKindPropMismatch, findDeclaredWrapperMismatch, renderSchemaExample } from './argShape';
+import { wireEncoding, groupEncodingNote } from './wireShape';
 // REQ-1280 — the single `_rawJson` implementation, called by BOTH relay paths
 // (full mode's contract handler and compact mode's `figpea_call`) so they
 // cannot drift (AC-7).
@@ -503,6 +504,26 @@ export function structuredParamNames(descriptor: { params?: unknown } | undefine
 }
 
 /**
+ * The positional array re-keyed by the method's own declared parameter names —
+ * the SAME correspondence both lanes use to build the array the tab receives.
+ *
+ * REQ-1295 needs it because a pre-flight and a relay-side hint both have to
+ * ask "what did this server send under the parameter named X", and in this
+ * server that question is asked positionally: an agent writes
+ * `figpea_call({group, method, args: [...]})` or `{id, patch}`, while the
+ * manifest speaks only in names. Deriving the map once, from one helper, is
+ * what keeps the two lanes and the two halves of the fix from disagreeing.
+ */
+function positionalValues(inputKeys: readonly string[], args: readonly unknown[]): Record<string, unknown> {
+  const values: Record<string, unknown> = {};
+  for (let i = 0; i < inputKeys.length; i++) {
+    const key = inputKeys[i];
+    if (key !== undefined) values[key] = args[i];
+  }
+  return values;
+}
+
+/**
  * Builds the `McpServer` for a bridge: `open_editor` + `status` are always
  * registered (OQ-4); contract tools are registered/updated from the bridge's
  * live `describe()` manifest on every connect/reconnect.
@@ -636,7 +657,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       'figpea_describe',
       {
         description:
-          "Returns the agent contract surface for a group or method — the same doc/params/result the editor's own describe() returns, served from the manifest this server already holds in memory (no round trip to the tab). Call it with no arguments for the group index, {group} for one group's methods, or {group, method} for one method's wire shape. In compact mode this is how you learn a method's argument shape instead of probing: e.g. figpea_describe({group:'layer', method:'batch'}) returns the ops shape, whose args is a POSITIONAL array of {method, args} ops. A per-method response also carries stringJsonParams: the names of THIS method's params you may send as a JSON string instead of a real object/array, because the server parses them before the round trip (e.g. [\"[{\\\"method\\\":\\\"create\\\",\\\"args\\\":[\\\"rect\\\",{\\\"rwidth\\\":100}]}]\"] for ops). The key is absent when the method declares no such param, and it is derived from the manifest, so it is right for any method without this description being updated.",
+          "Returns the agent contract surface for a group or method — the same doc/params/result the editor's own describe() returns, served from the manifest this server already holds in memory (no round trip to the tab). Call it with no arguments for the group index, {group} for one group's methods, or {group, method} for one method's wire shape. In compact mode this is how you learn a method's argument shape instead of probing: e.g. figpea_describe({group:'layer', method:'batch'}) returns the ops shape, whose args is a POSITIONAL array of {method, args} ops. A per-method response also carries stringJsonParams: the names of THIS method's params you may send as a JSON string instead of a real object/array, because the server parses them before the round trip (e.g. [\"[{\\\"method\\\":\\\"create\\\",\\\"args\\\":[\\\"rect\\\",{\\\"rwidth\\\":100}]}]\"] for ops). The key is absent when the method declares no such param, and it is derived from the manifest, so it is right for any method without this description being updated. A per-method response also carries wire: this method's parameters as the POSITIONAL slots they occupy — encoding, a callAs line showing e.g. layer.stylePatch(id, patchContents), and each slot's index, name, type, an object slot's legal contents, and the one envelope not to send. Read it because params is the DECLARATION and not the encoding: an object-valued parameter IS its positional slot, so its contents go flat and never inside an envelope keyed by the parameter's name. A group listing states the same thing once for every method it holds, as encodingNote. The wire key is absent when the method declares no positional arguments, and it is derived from the same manifest params is read from, so it is right for any method without this description being updated.",
         inputSchema: {
           group: z.string().optional().describe("Contract group name (e.g. layer, canvas, session, export). Omit for the index of all groups."),
           method: z.string().optional().describe('Method name within the group (e.g. create, batch). Requires group.'),
@@ -693,15 +714,33 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             // below — this server does not restate the editor's docs, it only
             // adds the one fact the manifest itself cannot express.
             const stringJson = structuredParamNames(descriptor);
+            // REQ-1295 (AC-2/AC-4) — the sibling additive key, and the one the
+            // declaration itself cannot express. `params` publishes a NAMED
+            // DECLARATION while `figpea_call` takes its arguments POSITIONALLY,
+            // so for a method whose argument is an object the shape an agent
+            // reads and the shape it must send are two different things and
+            // nothing on this surface said which was which — the one fact that
+            // turned `unsupported_style_key: patch` into a dead end.
+            //
+            // Absent when this server has no opinion (no declared schemas, or a
+            // method with no parameters) rather than sent as a partial listing,
+            // and additive beside everything the editor documented: this server
+            // does not restate the editor's docs, it adds the one thing the
+            // manifest cannot express.
+            const wire = wireEncoding(descriptor, `${group}.${method}`);
             return jsonTextResult({
               ok: true,
               group,
               method,
               ...(stringJson.length > 0 ? { stringJsonParams: stringJson } : {}),
+              ...(wire ? { wire } : {}),
               ...descriptor,
             });
           }
-          return jsonTextResult({ ok: true, group, methods });
+          // REQ-1295 — the group listing states the encoding ONCE for every
+          // method it holds, so the rule is learnable before a drill rather
+          // than one describe round trip per method.
+          return jsonTextResult({ ok: true, group, encodingNote: groupEncodingNote(), methods });
         }
 
         // Bare index, mirroring the editor's own compact index: a reserved
@@ -760,6 +799,57 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     if (r.message.includes('figpea_describe')) return result;
     r.message =
       `${r.message} — to see this method's exact argument shape, call figpea_describe({group:"${group}", method:"${method}"}).`;
+    return result;
+  }
+
+  /**
+   * REQ-1295 T4 (AC-3) — the belt-and-braces half of the DECLARED-WRAPPER
+   * lesson, extending `appendShapeHint` above with the case that rule cannot
+   * reach.
+   *
+   * A pre-flight derives its verdict from declared schemas, so it declines
+   * whenever there is nothing to derive from: a legacy free-text manifest, an
+   * object parameter with no declared `shape`, a wrapper nested inside an op's
+   * own `args` (that method declares only `ops`, so the op's parameter names
+   * are not THIS method's). In each of those the payload is forwarded and the
+   * editor answers `unsupported_style_key: <paramName>` — naming an internal
+   * key the caller never sent, which is the misleading lesson this REQ exists
+   * to remove.
+   *
+   * ⛔ It appends only. It never rewrites the editor's code and never rewrites
+   * the editor's message — those are the editor's, and they are right about
+   * what it actually received. It is idempotent, and it fires only when BOTH
+   * facts hold: the offending key is a declared parameter name of the called
+   * method AND the value this server sent under that key was a plain object.
+   * Any other `unsupported_style_key` is left exactly as it arrived, because
+   * appending a wrapper lesson to a genuine style-key problem would be the same
+   * error one word later.
+   *
+   * KNOWN RESIDUAL, stated rather than papered over: inside `layer.batch` the
+   * called method IS `batch` (params `{ops}`), so a wrapper inside an op's own
+   * `args` has no declared parameter name to match and BOTH halves decline. The
+   * tab still answers, and REQ-1268's `invalid_params` hint above still applies
+   * to the stringified case. Teaching the batch-nested wrapper would mean
+   * resolving each op's own method against the manifest — real work, which no
+   * acceptance criterion asks for. Deliberate non-goal, recorded here so the
+   * next reader does not read the gap as an oversight.
+   */
+  function appendWrapperHint<T>(result: T, paramNames: ReadonlySet<string>, values: Record<string, unknown> | undefined): T {
+    const r = result as { ok?: unknown; code?: unknown; message?: unknown };
+    if (r?.ok !== false) return result;
+    if (r.code !== 'unsupported_style_key') return result;
+    if (typeof r.message !== 'string') return result;
+    if (r.message.includes('the declaration is not the encoding')) return result; // idempotent
+    const offending = /unsupported style key "([^"]+)"/.exec(r.message)?.[1];
+    if (offending === undefined) return result;
+    if (!paramNames.has(offending)) return result;
+    const sent = values?.[offending];
+    if (sent === null || typeof sent !== 'object' || Array.isArray(sent)) return result;
+    r.message =
+      `${r.message} — read that key as this method's own DECLARATION arriving where its contents were due, ` +
+      `not as a style key you may not send: ${offending} IS its positional slot here, so send its contents flat ` +
+      `with no "${offending}" wrapper. ` +
+      `Expected ${offending} contents: ${Object.keys(sent as Record<string, unknown>).join(', ') || '…'}.`;
     return result;
   }
   function contractToolFor(groupName: string, methodName: string): GeneratedTool | undefined {
@@ -1233,6 +1323,42 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           effectiveArgs = effectiveArgs.map((value, i) =>
             coerceValue(value, contractTool.paramSchemas?.[contractTool.inputKeys[i]]),
           );
+          // REQ-1295 T3 — the DECLARED-WRAPPER pre-flight, immediately after
+          // coercion and BEFORE both the shape loop and the per-kind rule. That
+          // order is load-bearing, not stylistic: `layer.create`'s `props`
+          // carries a `byKind`, so a wrapped `props` would otherwise be answered
+          // by REQ-1309's rule as `invalid_transform` naming the wrapper key as
+          // an INAPPLICABLE PROP — a second, equally misleading message about
+          // the one mistake, one rule earlier than the right one.
+          //
+          // `positionalLength` is `effectiveArgs.length`, the very array the tab
+          // is about to receive, so "the editor cannot expand this" is a proof
+          // rather than a heuristic (see the rule for the narrowing).
+          const wrapperMismatch = findDeclaredWrapperMismatch(
+            contractTool.paramSchemas,
+            positionalValues(contractTool.inputKeys, effectiveArgs),
+            (name) => `args[${contractTool.inputKeys.indexOf(name)}]`,
+            effectiveArgs.length,
+          );
+          if (wrapperMismatch) {
+            const expectedArgs = contractTool.inputKeys
+              .map((k, idx) => {
+                const sch = contractTool.paramSchemas?.[k];
+                return sch ? renderSchemaExample(sch) : '…';
+              })
+              .join(', ');
+            return toCallToolResult(
+              resultToContent({
+                ok: false,
+                code: wrapperMismatch.code ?? 'invalid_params',
+                message:
+                  `${toolName}: ${wrapperMismatch.path} must be ${wrapperMismatch.expected}, but it arrived as ${wrapperMismatch.got}. ` +
+                  `${wrapperMismatch.hint} ` +
+                  `Expected ${toolName} args: [${expectedArgs}]. ` +
+                  `Learn the exact shape first: figpea_describe({group:"${group}", method:"${method}"}).`,
+              }),
+            );
+          }
           // REQ-1268 T5 (AC-5) — shape pre-flight, AFTER coercion and BEFORE
           // the round trip, so a mangled payload costs zero bridge calls. The
           // message has to be actionable on its own: it names the offending
@@ -1312,8 +1438,17 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             return toCallToolResult(resultToContent(resolvedReturnAs.error));
           }
           const result = (await bridge.callTab(group, method, effectiveArgs, effectiveTimeoutMs)) as FigpeaCallResultLike;
+          // REQ-1295 T4 — both relay-side halves, in one pass, so the agent sees
+          // one appended sentence rather than two appended sentences.
           return toCallToolResult(
-            resultToContent(appendShapeHint(result, `${group}`, `${method}`), returnAsOpts(bridge, toolName, resolvedReturnAs.mode)),
+            resultToContent(
+              appendWrapperHint(
+                appendShapeHint(result, `${group}`, `${method}`),
+                new Set(contractTool?.inputKeys ?? []),
+                contractTool ? positionalValues(contractTool.inputKeys, effectiveArgs) : undefined,
+              ),
+              returnAsOpts(bridge, toolName, resolvedReturnAs.mode),
+            ),
           );
         } catch (e) {
           return toCallToolResult(
@@ -1887,6 +2022,37 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         const schema = tool?.paramSchemas?.[key];
         return coerceValue(raw, schema);
       });
+      // REQ-1295 T3 — the same declared-wrapper rule the compact lane runs, at
+      // the same point in the pipeline (after coercion, before the round trip)
+      // and AHEAD of the per-kind rule, for the same ordering reason: on
+      // `layer.create` the wrapped `props` would otherwise be answered
+      // `invalid_transform` naming the wrapper key as an inapplicable prop.
+      //
+      // `positionalLength` is `args.length`, which is `inputKeys.length` by
+      // construction — this lane maps declared keys to a full-length positional
+      // array, `undefined` for an omitted one. So a two-parameter method always
+      // presents 2 (and is checked), while a ONE-parameter method always
+      // presents 1 and is correctly declined: a single object alone in `args`
+      // is the form the editor expands.
+      const fullKindValues = positionalValues(inputKeys, args);
+      const wrapperMismatch = findDeclaredWrapperMismatch(
+        tool?.paramSchemas,
+        fullKindValues,
+        (name) => name,
+        args.length,
+      );
+      if (wrapperMismatch) {
+        return toCallToolResult(
+          resultToContent({
+            ok: false,
+            code: wrapperMismatch.code ?? 'invalid_params',
+            message:
+              `${toolName}: ${wrapperMismatch.path} must be ${wrapperMismatch.expected}, but it arrived as ${wrapperMismatch.got}. ` +
+              `${wrapperMismatch.hint} ` +
+              `Learn the exact shape first: figpea_describe({group:"${groupName}", method:"${methodName}"}).`,
+          }),
+        );
+      }
       // REQ-1309 T4 — the SAME per-kind prop rule the compact lane runs, at
       // the SAME point in the pipeline: after the `_rawJson` verdict and after
       // coercion — and, since REQ-1337 moved that parse, BEFORE the
@@ -1903,8 +2069,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       //
       // `pathFor` is the bare param name because that is how this lane names
       // things: the caller wrote `{kind, props}`, not `args[1]`.
-      const kindValues: Record<string, unknown> = {};
-      for (let i = 0; i < inputKeys.length; i++) kindValues[inputKeys[i]] = args[i];
+      const kindValues: Record<string, unknown> = fullKindValues;
       const kindMismatch = findKindPropMismatch(tool?.paramSchemas, kindValues, (name) => name);
       if (kindMismatch) {
         return toCallToolResult(
@@ -1920,7 +2085,20 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       }
       try {
         const result = (await bridge.callTab(groupName, methodName, args, effectiveTimeoutMs)) as FigpeaCallResultLike;
-        return toCallToolResult(resultToContent(result, returnAsOpts(bridge, toolName, resolvedReturnAs.mode)));
+        // REQ-1295 T4 — this lane did not call `appendShapeHint` at all before,
+        // a genuine gap for this whole failure class: the very sentence a caller
+        // needs after a wrong shape is the one it never got here. Same function,
+        // not a new one, so the two lanes cannot state the remedy differently.
+        return toCallToolResult(
+          resultToContent(
+            appendWrapperHint(
+              appendShapeHint(result, `${groupName}`, `${methodName}`),
+              new Set(inputKeys),
+              fullKindValues,
+            ),
+            returnAsOpts(bridge, toolName, resolvedReturnAs.mode),
+          ),
+        );
       } catch (e) {
         return toCallToolResult(
           resultToContent({ ok: false, code: 'bridge_error', message: e instanceof Error ? e.message : String(e) }),

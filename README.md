@@ -175,6 +175,8 @@ By default `figpea-mcp` runs in **compact mode** — only 5 tools (`open_editor`
 
 **Object-valued parameters — the object IS the positional slot.** When a parameter is a plain object, that object occupies `args[n]` *on its own*; you never wrap it in a second envelope keyed by the parameter's own name. This is the shape that bites hardest, precisely because several parameters are **named** `input` or `patch` — so writing that name into your payload is the mistake, not the fix:
 
+The one wrapper that IS legal is a **single** object as the whole of `args`, keyed by the method's own parameter names — the editor expands it to positional order. That expansion needs the call to carry exactly one argument, so the moment a positional argument goes in front of it — `stylePatch`'s layer id, `setPosition`'s layer id — it stops expanding, and the wrapper arrives as the object itself. Your keys were fine; the envelope was the mistake.
+
 ```json
 // session.openFile(input) — `input` IS args[0]. figpea-mcp maps a `filePath`
 // here to http://localhost:<port>/file?path=… so the editor can fetch it.
@@ -189,6 +191,14 @@ By default `figpea-mcp` runs in **compact mode** — only 5 tools (`open_editor`
 
 // layer.stylePatch(id, patch) — the style keys go in FLAT, with no `style` wrapper
 { "group": "layer", "method": "stylePatch", "args": ["L_kicker", { "fontFamily": "Inter", "fontSize": 26, "fill": "#1A1A1A" }] }
+// WRONG — and here the wrapper IS the mistake: the id in front of it means the call no
+// longer carries exactly one argument, so nothing expands it, the wrapper object is
+// received AS the patch, and `patch` fails the style whitelist.
+// unsupported_style_key: patch — read that as "you sent the descriptor's named
+// declaration instead of its contents". `patch` is not a style key.
+{ "group": "layer", "method": "stylePatch", "args": ["L_kicker", { "patch": { "fontFamily": "Inter", "fontSize": 26, "fill": "#1A1A1A" } }] }
+// …while the SAME wrapper is CORRECT on its own, as the whole of args:
+{ "group": "layer", "method": "stylePatch", "args": [{ "id": "L_kicker", "patch": { "fontFamily": "Inter", "fontSize": 26, "fill": "#1A1A1A" } }] }
 // create() nests them and stylePatch does NOT — that asymmetry is real:
 // { "style": { … } } is answered unsupported_style_key: "style" — "style" is a
 // create() top-level prop, not a style key.
@@ -197,13 +207,14 @@ By default `figpea-mcp` runs in **compact mode** — only 5 tools (`open_editor`
 // layer.setPageFill(pageId, patch) — a scalar, then an object, positionally
 { "group": "layer", "method": "setPageFill", "args": ["P_1", { "fill": "#EFEBE3", "fillType": "solid" }] }
 // WRONG — the wrapper below is NOT the mistake: a single object keyed by a method's own
-// parameter names is a legal `args`, and it expands to positional order. The mistake is
+// parameter names is a legal `args`, and it expands to positional order — and only while it
+// is the whole of `args`. The mistake is
 // `patch` itself — a stringified object NESTED INSIDE a real object is never parsed, so it
 // stays a string: invalid_params: setPageFill(): patch must be object (got string)
 { "group": "layer", "method": "setPageFill", "args": [{ "pageId": "P_1", "patch": "{\"fill\":\"#EFEBE3\"}" }] }
 ```
 
-Two conventions meet here, and mixing them is the trap. In **full mode** a generated tool takes its parameters **by name**, so the same `input` object really is `session_openFile({ "input": { … } })` and `export_project({ "input": { "format": "figpea" } })`. **`figpea_call` positions them**, so the very same object is `{ … }` and not `{ "input": { … } }`. Both spellings are correct; each mode's spelling, used in the other, is the bug. `figpea_describe({ group, method })` settles it without a round trip: it returns each parameter's name, type and shape **in the method's own positional order**, so the first entry is `args[0]`, the second is `args[1]`, and the name a parameter happens to have tells you nothing about how to nest it.
+Two conventions meet here, and mixing them is the trap. In **full mode** a generated tool takes its parameters **by name**, so the same `input` object really is `session_openFile({ "input": { … } })` and `export_project({ "input": { "format": "figpea" } })`. **`figpea_call` positions them**, so the very same object is `{ … }` and not `{ "input": { … } }`. Both spellings are correct; each mode's spelling, used in the other, is the bug. `figpea_describe({ group, method })` settles it without a round trip: it returns each parameter's name, type and shape **in the method's own positional order**, so the first entry is `args[0]`, the second is `args[1]`, and the name a parameter happens to have tells you nothing about how to nest it. `params` is the **declaration**, not the **encoding**: a param whose type is `object` occupies its slot with its contents flat, so `stylePatch`'s `args[1]` is the patch itself, never `{patch: …}`. A per-method response also carries `wire` — this method's parameters as the positional slots they occupy, derived from the same manifest `params` is read from, so it is right for any method.
 
 **If your harness cannot send a nested object or array.** Some host harnesses serialise nested arrays into `{"item": …}` envelopes, and one that does that may not survive being told to send a real nested array. The one thing such a host cannot damage is a **scalar** — so any parameter the method declares as an `object`, `array` or `matrix` may be sent as a **JSON string** instead, and this server parses it before the round trip. **No flag is required**, and a string position is never touched, so `setName(id, "[Hero]")` is still the name `[Hero]`. **The string must be the whole positional slot**: the parse visits `args[0]`, `args[1]`, … as complete positions and never descends into an object you also sent, so the `setPageFill` call above is *not* rescued by stringifying its `patch`. No flag, key or spelling makes a nested string parse:
 
