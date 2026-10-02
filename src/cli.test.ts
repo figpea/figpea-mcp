@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import * as http from 'node:http';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { requireBuiltCli } from './testSupport/requireBuiltCli.test-helper';
 
 /**
  * REQ-074 T1 — shipped-bin stdio smoke (plan §8 OQ-B).
@@ -34,6 +35,11 @@ const CLI_ENTRY = path.join(PACKAGE_ROOT, 'dist', 'cli.js');
 
 describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
   it('tools/list returns the static open_editor + status tools with no tab connected', async () => {
+    // REQ-1443 AC-1/AC-2: a missing build must fail here by name, not
+    // surface later as "MCP error -32000: Connection closed", which
+    // attributes it to untested product code.
+    requireBuiltCli(CLI_ENTRY);
+
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [CLI_ENTRY],
@@ -55,6 +61,11 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
   }, 15_000);
 
   it('honors FIGPEA_DISABLE_CONTRACT_FETCH=1 (AC-10)', async () => {
+    // REQ-1443 AC-1/AC-2: a missing build must fail here by name, not
+    // surface later as "MCP error -32000: Connection closed", which
+    // attributes it to untested product code.
+    requireBuiltCli(CLI_ENTRY);
+
     // Spawns with FIGPEA_DISABLE_CONTRACT_FETCH=1, ensuring zero network calls and working cold start
     const transport = new StdioClientTransport({
       command: process.execPath,
@@ -80,6 +91,11 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
   }, 15_000);
 
   it('targets the origin specified by FIGPEA_EDITOR_URL to fetch contract AND skill (AC-4)', async () => {
+    // REQ-1443 AC-1/AC-2: a missing build must fail here by name, not
+    // surface later as "MCP error -32000: Connection closed", which
+    // attributes it to untested product code.
+    requireBuiltCli(CLI_ENTRY);
+
     // REQ-705: cli.ts now fetches BOTH /agent/contract.json and
     // /agent/skill.md from the same origin at startup -- track every
     // requested path (not a single reassigned variable) so both fetches are
@@ -154,6 +170,11 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
   }, 15_000);
 
   it('yields a working cold-start server when contract fetch fails / unreachable origin (AC-5)', async () => {
+    // REQ-1443 AC-1/AC-2: a missing build must fail here by name, not
+    // surface later as "MCP error -32000: Connection closed", which
+    // attributes it to untested product code.
+    requireBuiltCli(CLI_ENTRY);
+
     // Port 1 on localhost is unreachable / connection refused
     const badOrigin = 'http://127.0.0.1:1';
 
@@ -189,6 +210,11 @@ describe('figpea-mcp bin — stdio smoke (plan §8 OQ-B)', () => {
   }, 15_000);
 
   it('fetches contract AND skill at most once each per server run across lifecycle and operations (AC-6)', async () => {
+    // REQ-1443 AC-1/AC-2: a missing build must fail here by name, not
+    // surface later as "MCP error -32000: Connection closed", which
+    // attributes it to untested product code.
+    requireBuiltCli(CLI_ENTRY);
+
     let contractRequestCount = 0;
     let skillRequestCount = 0;
     const server = http.createServer((req, res) => {

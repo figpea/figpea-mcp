@@ -554,4 +554,43 @@ describe('README.md (AC-5)', () => {
     );
     expect(readme, 'and as costing no tab round trip').toMatch(/round trip/i);
   });
+
+  // REQ-1443 AC-5 — the build-before-test rule, documented in the one place a
+  // contributor reads before running this package's suite. Three of these suites
+  // spawn the BUILT dist/cli.js over real stdio, so on a cold checkout they fail
+  // with the build precondition unmet. The failure now names its own remedy
+  // (REQ-1443 T2), but a contributor should learn the order from the README
+  // rather than by being lied to once.
+  //
+  // These pin the three *facts* AC-5 asks for — the order, the reason, and the
+  // absence of an over-promise — not one phrasing. The last one matters most:
+  // a testing section that said "npm test just works" would be a lie the
+  // contributor discovers the hard way, since the cold run is REQUIRED to fail.
+  it('documents the required order — build before test — and why three suites need it (REQ-1443)', () => {
+    const testing = readme.match(/^## Testing\s*$([\s\S]*?)(?=^## )/m);
+    expect(testing, 'README has no `## Testing` section').toBeTruthy();
+    const section = testing![1];
+
+    // The order, stated as an order: build first, then test.
+    const buildAt = section.indexOf('npm run build');
+    const testAt = section.indexOf('npm test');
+    expect(buildAt, 'the testing section names the build step').toBeGreaterThan(-1);
+    expect(testAt, 'the testing section names the test step').toBeGreaterThan(-1);
+    expect(
+      buildAt,
+      'the build must come before the tests — these suites spawn a build artifact, so test-then-build is the wrong order',
+    ).toBeLessThan(testAt);
+
+    // The reason, not just the order: what is built, and why it matters.
+    expect(section, 'it names the built entry the suites spawn').toMatch(/dist\/cli\.js/);
+    expect(section, 'it says the suites drive the built entry').toMatch(/built/i);
+    expect(section, 'it says how they drive it — a real process over stdio, not an import').toMatch(/stdio/i);
+
+    // The honest limit: a cold run still fails, and the README must not say
+    // otherwise (AC-1 requires the failure; promising otherwise would teach
+    // the next contributor to trust a green gate that never ran).
+    expect(section.toLowerCase(), 'it must not promise a suite that works with no build step').not.toMatch(
+      /works? out of the box|no build step|no build required|npm test just works|ready to run without/,
+    );
+  });
 });

@@ -5,6 +5,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { createMcpServer } from './mcpServer';
+import { requireBuiltCli } from './testSupport/requireBuiltCli.test-helper';
 
 const PACKAGE_ROOT = path.resolve(__dirname, '..');
 const CLI_ENTRY = path.join(PACKAGE_ROOT, 'dist', 'cli.js');
@@ -344,6 +345,11 @@ describe('REQ-1035 AC-4 — all three paste families round-trip', () => {
 // --- AC-1 stderr paste-ready via StdioClientTransport (plan T1/T2) + AC-5 stdout hygiene ---
 describe('REQ-1035 AC-1 — stderr is paste-ready (dist/cli.js via StdioClientTransport, capturing stderr)', () => {
   it('default ephemeral: stderr contains pairing URL parseable via parsePairingFromPaste and zero stdout (valid JSON-RPC)', async () => {
+    // REQ-1443 AC-1/AC-2: a missing build must fail here by name, not
+    // surface later as "MCP error -32000: Connection closed", which
+    // attributes it to untested product code.
+    requireBuiltCli(CLI_ENTRY);
+
     const stderrChunks: Buffer[] = [];
     const transport = new StdioClientTransport({
       command: process.execPath,
@@ -391,6 +397,11 @@ describe('REQ-1035 AC-1 — stderr is paste-ready (dist/cli.js via StdioClientTr
   }, 15_000);
 
   it('FIGPEA_EDITOR_URL variant: stderr URL honors custom origin and parses', async () => {
+    // REQ-1443 AC-1/AC-2: a missing build must fail here by name, not
+    // surface later as "MCP error -32000: Connection closed", which
+    // attributes it to untested product code.
+    requireBuiltCli(CLI_ENTRY);
+
     const customOrigin = 'http://localhost:9000';
     const stderrChunks: Buffer[] = [];
     const transport = new StdioClientTransport({
@@ -422,6 +433,11 @@ describe('REQ-1035 AC-1 — stderr is paste-ready (dist/cli.js via StdioClientTr
   }, 15_000);
 
   it('--port variant: stderr URL reflects explicit port and header uses that port', async () => {
+    // REQ-1443 AC-1/AC-2: a missing build must fail here by name, not
+    // surface later as "MCP error -32000: Connection closed", which
+    // attributes it to untested product code.
+    requireBuiltCli(CLI_ENTRY);
+
     const fixedPort = await getFreePort();
     const stderrChunks: Buffer[] = [];
     const transport = new StdioClientTransport({
@@ -458,6 +474,11 @@ describe('REQ-1035 AC-1 — stderr is paste-ready (dist/cli.js via StdioClientTr
 
 describe('REQ-1035 AC-5 — stdout hygiene (StdioClientTransport spawn monitoring raw stdout bytes)', () => {
   it('stdout remains valid MCP JSON-RPC with no stray writes across startup and tool calls', async () => {
+    // REQ-1443 AC-1/AC-2: a missing build must fail here by name, not
+    // surface later as "MCP error -32000: Connection closed", which
+    // attributes it to untested product code.
+    requireBuiltCli(CLI_ENTRY);
+
     const stderrChunks: Buffer[] = [];
     // StdioClientTransport stdout is pipe for JSON-RPC; any stray console.log would break framing.
     // We monitor stderr separately and assert MCP operations succeed — which they only do with valid stdout.

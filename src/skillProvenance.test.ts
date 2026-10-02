@@ -6,6 +6,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { createMcpServer } from './mcpServer';
 import { fetchSkill } from './skillFetch';
+import { requireBuiltCli } from './testSupport/requireBuiltCli.test-helper';
 
 /**
  * `figpea_skill` must be honest about WHERE the body it returns came from.
@@ -253,6 +254,11 @@ describe('figpea_skill — the answer must be honest about which editor it came 
   });
 
   it('end to end: the shipped bin names the origin it fetched from (real startup fetch over real stdio)', async () => {
+    // REQ-1443 AC-1/AC-2: a missing build must fail here by name, not
+    // surface later as "MCP error -32000: Connection closed", which
+    // attributes it to untested product code.
+    requireBuiltCli(CLI_ENTRY);
+
     // The reproduction as it was reported — the MCP process starts with a
     // startup origin, and figpea_skill is called. This test names no internal
     // option: it drives dist/cli.js over stdio exactly as a run does, so it

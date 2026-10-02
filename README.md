@@ -327,6 +327,20 @@ Automated or headless browsers cannot answer native Local Network Access permiss
 2. **Programmatically click Connect** on the editor notice.
 3. **Localhost exemption**: Editors served from `http://localhost` are same-address-space and exempt from LNA entirely.
 
+## Testing
+
+Build before you test — this package's tests run against the **built** server, not the TypeScript source:
+
+```bash
+npm install
+npm run build   # required first — see below
+npm test
+```
+
+Three suites (`src/cli.test.ts`, `src/req1035.test.ts`, `src/skillProvenance.test.ts`) spawn `dist/cli.js` as a real child process over stdio, the same way an agent runs it, so they exercise the actual published entry point rather than importing it. `dist/` is a build artifact and is not in a fresh clone, which means those tests need `npm run build` to have run first. On a cold checkout they fail and say so, naming the missing `dist/cli.js` and this remedy — they are not a green suite over untested code.
+
+The remaining suites exercise the server in-process and do not need a build.
+
 ## Troubleshooting
 
 - **`no_tab`** — the refusal carries a `connection` block naming what happened; read `connection.lastEvent` and its `nextStep` before trying again ([Diagnosing a connection](#diagnosing-a-connection)). In the ordinary case it is `no_attempt` and the fix is to open an editor tab, via `open_editor` or by visiting the printed pairing URL. If `lastEvent` is `hello_rejected`, the pairing token is stale — re-read `token` from a fresh `status` call and open the URL that call prints, because a token from an earlier server run never matches. If it is `transport_only` or `hello_timeout`, the handshake never completed: check you are on the `bridgePort` this run reports, then reload the tab.
