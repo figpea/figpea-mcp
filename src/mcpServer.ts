@@ -62,6 +62,14 @@ import { resolveOpenFileName } from './openFileName';
 // REQ-1296 wraps the whole literal in `z.looseObject` — REQ-1280's text is
 // preserved verbatim inside REQ-1296's wrapper, which is the correct merge.
 import { findUnknownTopLevelKeys, FULL_MODE_RESERVED, COMPACT_RESERVED } from './unknownParams';
+// REQ-1457 — the one build-identity ledger: the version this process runs, the
+// artifact it loaded, and whether that artifact is still the artifact on disk.
+// It is a leaf precisely so BOTH sides can read it — `bridgeServer.ts` stamps
+// the AC-4 timeout envelope from the same source, which is the only way the two
+// surfaces can be guaranteed to name the same build. `SERVER_VERSION` lives
+// there too, and is re-exported below so any existing importer keeps working.
+import { servingBuild, SERVER_VERSION, type BuildStatus } from './buildIdentity';
+export { SERVER_VERSION } from './buildIdentity';
 
 /** What this module needs from a started bridge (bridgeServer.ts's real
  * `BridgeServerHandle` is a superset — `getContractVersion` is optional here
@@ -105,11 +113,25 @@ export interface CreateMcpServerOptions {
    * (REQ-1268) `figpea_describe`; full restores all contract tools instead of
    * the two compact-only ones. */
   toolMode?: 'compact' | 'full';
+  /** REQ-1457: the build facts `status` publishes. Read ONCE PER `status`
+   *  CALL, never cached at construction — staleness is a live fact, and a
+   *  provider frozen at startup would answer `false` forever.
+   *
+   *  Optional DELIBERATELY, for exactly the reason `getConnectionDiagnosis` is:
+   *  `CreateMcpServerOptions` is a structural stand-in that ~45 test files
+   *  satisfy with their own stub, so a required member would edit all of them
+   *  for zero behavioural gain. Absent ⇒ the real module. It is also the only
+   *  honest way to pin AC-7 deterministically: a unit test must not have to
+   *  `touch` the repo to observe a stale build. */
+  buildStatus?: () => BuildStatus;
 }
 
 const DEFAULT_EDITOR_BASE_URL = 'https://editor.figpea.com';
 const SERVER_NAME = 'figpea-mcp';
-const SERVER_VERSION = '2.6.0';
+// REQ-1457 moved `SERVER_VERSION` to `./buildIdentity` (see that module's
+// docblock): the bridge needs it for the timeout stamp, and this leaf must not
+// import the heavier module. Re-exported above, and the literal form kept
+// byte-identical because `metadata.test.ts` regexes it out of its source file.
 
 /** REQ-772 AC-1 — the documented maximum a per-call `_timeoutMs` override may
  * raise a single bridge call's timeout to. Values above it are clamped (not
@@ -644,6 +666,19 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       : legacyDiagnosis(bridge.isTabConnected());
   }
 
+  /**
+   * REQ-1457 — which build is answering, and is it still the one on disk.
+   *
+   * Read once per call through the optional seam, defaulting to the real module.
+   * `buildStale` stays a TOP-LEVEL scalar because that is the shape an agent can
+   * branch on without reading a nested key, while the multi-field identity sits
+   * in a nested block — the shape REQ-1394's `connection` established on this
+   * exact tool. Loose flat keys would bloat a payload six other keys share.
+   */
+  function buildFacts(): BuildStatus {
+    return options?.buildStatus ? options.buildStatus() : servingBuild();
+  }
+
   function buildConnectUrl(perCallBaseUrl?: string, fileArg?: string): string {
     const url = new URL(resolveEditorBaseUrl(perCallBaseUrl));
     url.searchParams.set('agent', '1');
@@ -678,9 +713,10 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     'status',
     {
       description:
-        "Reports the bridge's port, whether an editor tab is connected, the connected tab's contract version (null if none), and how many contract tools are currently registered. Also returns token and url so an LLM can construct the paste-ready pairing string without re-launching (REQ-1035). Returns a `connection` block naming WHY a tab is not connected — `lastEvent` (no_attempt, transport_only, hello_timeout, hello_rejected, hello_accepted, tab_superseded, disconnected) with the `nextStep` it implies, plus per-process counters and the run's `startedAt`; read it instead of re-trying a pairing blindly.",
+        "Reports the bridge's port, whether an editor tab is connected, the connected tab's contract version (null if none), and how many contract tools are currently registered. Also returns token and url so an LLM can construct the paste-ready pairing string without re-launching (REQ-1035). Returns a `connection` block naming WHY a tab is not connected — `lastEvent` (no_attempt, transport_only, hello_timeout, hello_rejected, hello_accepted, tab_superseded, disconnected) with the `nextStep` it implies, plus per-process counters and the run's `startedAt`; read it instead of re-trying a pairing blindly. Also returns WHICH BUILD is answering: a `build` block (`version`, `buildId`, `builtAt`, `servedAt`, `root`) and a top-level `buildStale` boolean. Read `buildStale` BEFORE spending time on a call that fails in a way the current source would not — your MCP host owns this process and does not restart it when a newer build lands on disk, so a stale process answers with code from before the fix and the failure reads as a bug in the design file. `buildStale: true` means restart the MCP server; when it is false, `build.buildId` is provably the build this process loaded, so match it against the commit you are reading the source of. It says nothing about the connected editor tab's build (REQ-1457).",
     },
     async () => {
+      const { build, stale } = buildFacts();
       return jsonTextResult({
         port: bridge.port,
         token: bridge.token,
@@ -689,6 +725,8 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         contractVersion: bridge.getContractVersion ? bridge.getContractVersion() : null,
         toolCount,
         connection: connectionDiagnosis(),
+        build,
+        buildStale: stale,
       });
     },
   );

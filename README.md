@@ -76,7 +76,7 @@ Honors `FIGPEA_EDITOR_URL` (default `https://editor.figpea.com`, override for lo
 | Tool | Always present | What it does |
 |------|-----------------|---------------|
 | `open_editor` | yes | Opens/points at an editor tab wired to this bridge. Returns `{port, token, url}`. |
-| `status` | yes | Reports the bridge's port, token and pairing URL (`port`, `token`, `url`), whether a tab is connected, the connected tab's contract version, the live tool count, and a `connection` block naming why a tab is not connected (see [Diagnosing a connection](#diagnosing-a-connection)). |
+| `status` | yes | Reports the bridge's port, token and pairing URL (`port`, `token`, `url`), whether a tab is connected, the connected tab's contract version, the live tool count, a `connection` block naming why a tab is not connected (see [Diagnosing a connection](#diagnosing-a-connection)), and WHICH BUILD is answering — a `build` block (`version`, `buildId`, `builtAt`, `servedAt`, `root`) plus a top-level `buildStale` flag (see [Which build is this server running?](#which-build-is-this-server-running)). |
 | `figpea_skill` | yes | Returns Figpea's agent skill reference (the craft guidance for using `window.figpea` well), sourced from the editor origin's `/agent/skill.md` at startup — works even with no tab paired. The answer names the URL it fetched from: the body is that origin's own build, so when a tab is paired from a different origin or a different build, get *the tab's* skill instead with `figpea.SKILL()` in the tab or `GET <the tab's origin>/agent/skill.md` (the answer says so when a tab is connected). Degrades to a structured `{ok:false, code:"skill_unavailable", message}` (never throws) if the fetch failed or was disabled. |
 | `figpea_call` | compact only | Universal dispatcher — `figpea_call({ group, method, args, _timeoutMs })` calls any `group.method` on the paired tab (see below). |
 | `figpea_describe` | compact only | Returns the contract surface for a group or method — the same `doc`/`params`/`result` the editor's own `describe()` returns, from the manifest this server already holds in memory (no tab round trip). `figpea_describe()` → group index, `{group}` → that group's methods, `{group, method}` → one method's wire shape. Degrades to `{ok:false, code:"describe_unavailable"}` (never throws) when the manifest was never fetched. |
@@ -113,7 +113,15 @@ Every call returns `{ok: true, value}` or `{ok: false, code, message}`. Image-sh
     "lastCloseCode": 4001,
     "lastCloseReason": "invalid or missing pairing token",
     "startedAt": "2026-10-02T16:23:31.390Z"
-  }
+  },
+  "build": {
+    "version": "2.6.0",
+    "buildId": "sha256:1a2b3c4d5e6f",
+    "builtAt": "2026-10-03T22:04:11.882Z",
+    "servedAt": "2026-10-03T01:56:02.113Z",
+    "root": "/Users/you/figpea-mcp/dist"
+  },
+  "buildStale": true
 }
 ```
 
@@ -138,6 +146,27 @@ The counters (`tcpConnections`, `upgrades`, `helloAccepted`, `helloRejected`, `s
 A `no_tab` refusal carries the same `connection` block on the failing call itself — on `figpea_call` in compact mode and on every contract tool in full mode — so the cause arrives with the failure instead of costing a second round trip.
 
 None of this prevents a connection failure or fixes one. It makes whatever happened legible to whoever is trying to pair: the bridge reports what *this process* observed, never why the failure occurred.
+
+### Which build is this server running?
+
+Every other field on `status` describes what this process can *see* — the tab, the contract, the tool list. None of them describes the code doing the answering. `status` therefore also returns a `build` block and a top-level `buildStale` flag.
+
+The flag exists for one reason. Your MCP client owns this stdio process and does **not** restart it when a newer build lands on disk, so a fix can merge to `figpea-mcp` while the process answering you has been running since before it. Nothing about that shows up in a `port` or a `toolCount`; a call the current build handles correctly simply fails, and it reads as a bug in the design file rather than as a server that predates the fix.
+
+| Field | What it is |
+|---|---|
+| `build.version` | The `figpea-mcp` version this process is running. |
+| `build.buildId` | A content hash of the `figpea-mcp/dist` build on the machine running this server, as `sha256:<12 hex>`. Match it against your own checkout's build to answer "am I talking to the code I am reading?" — identical bytes give an identical id, which is exactly why it is a content hash and not a timestamp. |
+| `build.builtAt` | When that `dist` build was written (the newest file mtime in it). |
+| `build.servedAt` | When **this process** loaded it. Compare the two: `builtAt` later than `servedAt` means the code answering you is older than what is on disk. |
+| `build.root` | The `dist` directory that was compared, so you can tell which checkout you are looking at. |
+| `buildStale` | `true` when the `dist` build on disk is **not** the one this process loaded. |
+
+**Read `buildStale` before spending time on a failure that looks like a product bug.** It is computed against `figpea-mcp/dist` **on the machine running this MCP server** — nothing else. It says nothing about the connected editor tab, which is a different process on a different origin, and `false` does not mean your build is current in any general sense: it means nothing newer is sitting in that directory.
+
+**One honest false positive: a rebuild with no code change reports `buildStale: true` with the SAME `buildId`.** The flag is a file-fingerprint comparison (size, mtime and inode), because the alternative — content only — cannot see a `touch` at all. So `npm run build` after no source edit rewrites the timestamps and the flag moves even though the code is provably identical. That is the whole point of `buildId`: `stale: true` with a `buildId` you recognise means the directory was rewritten, and `stale: true` with a `buildId` you do **not** recognise means newer code is waiting.
+
+**The remedy is restarting the MCP server.** This package does not respawn or hot-reload its own process, and cannot — the host owns it. `buildStale: true` is a diagnosis, not a fix. The same identity is stamped onto every `bridge_error` timeout message, so a timeout can be matched against your checkout without a second call.
 
 ### Off-band binary returns (`returnAs: "path"`)
 
@@ -304,6 +333,8 @@ The flat default is 60 s rather than 10 s because the editor's render-settle win
 
 When a call does time out, the error says so honestly — `timed out after Nms; the editor may still be executing this call — check state before retrying` — and then **names the call to run**: `session.find({name})` for a create (the check that stops a retry from duplicating the layer), `session.layerById(<id>)` for a patch whose id you already have, `session.layerTree()` when there is no name or id to check by, and a plain "re-issue is safe" for a read. **Do not blindly retry a failed mutation**: the tab keeps working after the relay gives up, so the effect may have landed anyway.
 
+That envelope also ends with the serving build identity — `served by figpea-mcp <version> build <buildId> (built …, loaded …)` — so a timeout can be matched against the commit you believe is running without a second `status` call; when the served build has changed on disk since the process loaded it, the message says so and names the restart ([Which build is this server running?](#which-build-is-this-server-running)).
+
 ### Host request timeout
 
 `_timeoutMs` raises *this package's* deadline only. Your MCP host has its own request timeout on top of it, which `_timeoutMs` cannot raise. When the host's ceiling fires first you get a transport-level error (e.g. `MCP error -32001: Request timed out`) and **no envelope at all** — no message, no named state check, nothing telling you whether the mutation applied. That is the one case where the advice above is not delivered for you: run the state check yourself, and prefer passing `_timeoutMs` up front to waiting under the host's ceiling.
@@ -372,6 +403,7 @@ The remaining suites exercise the server in-process and do not need a build.
 
 - **`no_tab`** — the refusal carries a `connection` block naming what happened; read `connection.lastEvent` and its `nextStep` before trying again ([Diagnosing a connection](#diagnosing-a-connection)). In the ordinary case it is `no_attempt` and the fix is to open an editor tab, via `open_editor` or by visiting the printed pairing URL. If `lastEvent` is `hello_rejected`, the pairing token is stale — re-read `token` from a fresh `status` call and open the URL that call prints, because a token from an earlier server run never matches. If it is `transport_only` or `hello_timeout`, the handshake never completed: check you are on the `bridgePort` this run reports, then reload the tab.
 - **Nothing prints on stdout** — that's by design. stdio is the MCP JSON-RPC channel; every diagnostic goes to stderr.
+- **`buildStale: true`** — the `figpea-mcp/dist` build on disk is not the one this process loaded, so the code answering you predates a merge. This is what a stale server looks like from the outside: a call the current source handles correctly comes back as a failure, and it reads as a bug in the design file. Restart the MCP server; it cannot restart itself, because your MCP client owns the process. Before you go hunting for a product bug, compare `build.buildId` with your own build — an unchanged `buildId` means the directory was simply rebuilt, not that newer code is waiting ([Which build is this server running?](#which-build-is-this-server-running)). Nothing else on `status` is affected, and it says nothing about the editor tab's build.
 - **Port already in use** — pass `--port=<n>` to bind a specific port instead of an OS-assigned one.
 
 ## License

@@ -36,8 +36,15 @@ import * as path from 'node:path';
 
 const PACKAGE_ROOT = path.resolve(__dirname, '..');
 
-/** The suites that spawn the built CLI over real stdio. */
-const SPAWNING_SUITES = ['cli.test.ts', 'req1035.test.ts', 'skillProvenance.test.ts'];
+/** The suites that spawn the built CLI over real stdio. REQ-1457's repro joins
+ *  them: it spawns a scratch COPY of the built CLI, which is still a spawn of
+ *  this package's own entry and can still fail on a missing build. */
+const SPAWNING_SUITES = [
+  'cli.test.ts',
+  'req1035.test.ts',
+  'skillProvenance.test.ts',
+  'req1457Ac1Repro.test.ts',
+];
 
 const SPAWN = /new\s+StdioClientTransport\s*\(/;
 const GUARD = /requireBuiltCli\s*\(/;

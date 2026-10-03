@@ -55,7 +55,16 @@ describe('package.json metadata (AC-3)', () => {
   it('reports the same version over MCP as it declares in package.json', () => {
     // A drifting SERVER_VERSION would misreport the server's identity to
     // every connected client while package.json looked correct.
-    const source = fs.readFileSync(path.join(PACKAGE_ROOT, 'src', 'mcpServer.ts'), 'utf8');
+    //
+    // REQ-1457 moves the constant to `src/buildIdentity.ts`: the bridge needs
+    // it too (for the AC-4 timeout stamp), and reaching it from `mcpServer.ts`
+    // would import the heavier module into the leaf, or create a cycle — the
+    // coupling `callTimeout.ts` explicitly refuses. The regex below is
+    // UNCHANGED; only the file it reads moved. That is why the constant must
+    // keep its exact literal form (`const SERVER_VERSION = '2.6.0'`, no type
+    // annotation) — a `: string =` annotation breaks the match and turns this
+    // red for a reason nobody will connect to that REQ.
+    const source = fs.readFileSync(path.join(PACKAGE_ROOT, 'src', 'buildIdentity.ts'), 'utf8');
     const declared = /const SERVER_VERSION = '([^']+)'/.exec(source)?.[1];
     expect(declared).toBe(pkg.version);
   });

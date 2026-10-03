@@ -17,6 +17,11 @@ import WebSocket, { WebSocketServer } from 'ws';
 import { BRIDGE_BIND_HOST, BRIDGE_URL_HOST } from './bridgeHost';
 import { DEFAULT_CALL_TIMEOUT_MS, stateCheckHint } from './callTimeout';
 import { createConnectionLedger, deriveDiagnosis, type ConnectionDiagnosis } from './connectionDiagnosis';
+// REQ-1457 — the ONE build-identity ledger, a zero-import leaf. It lives in
+// its own module precisely so this file and `mcpServer.ts` can both read it
+// without either importing the other: `SERVER_VERSION` moved there for the same
+// reason, and this is the other half of that reason.
+import { servingBuildStamp } from './buildIdentity';
 import type { CallFrame, DescribeFrame } from './protocol';
 import { drillManifest, type DescribeFn, type DescribeResultPayload } from './describeDrill';
 import { sessionDirFor, removeSessionDir } from './returnPath';
@@ -345,7 +350,14 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
           if (pendingDescribe === settle) pendingDescribe = undefined;
           reject(
             new Error(
-              `figpea-mcp bridgeServer: describe(${selector ?? ''}) timed out after ${DESCRIBE_TIMEOUT_MS}ms`,
+              // REQ-1457 AC-4 — APPENDED after the existing text, never
+              // substituted for it. This is the SECOND authored timeout
+              // envelope in this package (the first is `callTab` below), and
+              // AC-4 says *every*: stamping the relay while leaving the drill
+              // bare would make the guarantee true of one path and false of
+              // the other. The stamp is what lets a caller match a stuck drill
+              // against the commit it believes is running.
+              `figpea-mcp bridgeServer: describe(${selector ?? ''}) timed out after ${DESCRIBE_TIMEOUT_MS}ms; ${servingBuildStamp()}`,
             ),
           );
         }, DESCRIBE_TIMEOUT_MS);
@@ -519,9 +531,15 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
           // Everything above the `;` is the REQ-772 wording, kept byte-for-
           // byte because tests pin those three substrings literally; the
           // state check is appended, never substituted for them.
+          //
+          // REQ-1457 AC-4: the serving build is APPENDED at the very end, for
+          // the same reason and one more — a caller who re-issues a call
+          // against a process that has been running since before the fix needs
+          // to know that before it retries, and the stamp is the only thing in
+          // the message that says which code answered.
           reject(
             new Error(
-              `figpea-mcp bridgeServer: call ${group}.${method} timed out after ${timeoutMs}ms; the editor may still be executing this call — check state before retrying; ${stateCheckHint(group, method, args)}`,
+              `figpea-mcp bridgeServer: call ${group}.${method} timed out after ${timeoutMs}ms; the editor may still be executing this call — check state before retrying; ${stateCheckHint(group, method, args)}; ${servingBuildStamp()}`,
             ),
           );
         }, timeoutMs);

@@ -346,7 +346,13 @@ describe('REQ-1394 AC-2 — nothing that `status` means today changed', () => {
       const bridge = await liveBridge();
       const client = await connectedClient(bridge, { toolMode });
       const s = await statusOf(client);
-      expect(Object.keys(s).sort(), `status key set in ${toolMode} mode`).toEqual([...OLD_KEYS, 'connection'].sort());
+      // REQ-1457 grows this set by exactly two named fields (`build`, `buildStale`)
+      // — a deliberate re-pin of a collection this requirement is approved to
+      // grow. It stays EXACT: a future removal, or a key nobody declared, still
+      // fails here. Do not loosen it to `toContain`.
+      expect(Object.keys(s).sort(), `status key set in ${toolMode} mode`).toEqual(
+        [...OLD_KEYS, 'connection', 'build', 'buildStale'].sort(),
+      );
     });
   }
 
