@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach, beforeAll } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as ts from 'typescript';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createMcpServer } from './mcpServer';
@@ -334,10 +335,36 @@ describe('REQ-1309 AC-3 guard: the rule names no method and no kind', () => {
 
   it('the rule imports nothing outside this package (AC-5 standalone-degrade)', () => {
     const src = fs.readFileSync(path.join(__dirname, 'argShape.ts'), 'utf8');
-    const imports = [...src.matchAll(/from\s+['"]([^'"]+)['"]/g)].map((m) => m[1]);
+    // The specifiers are read with the TypeScript scanner, not with a regex
+    // over `from '…'`. The regex form matched PROSE as well as imports:
+    // REQ-1444 documented findFilePathEnvelopeMismatch with the sentence
+    // `what separates "the declaration was sent" from "the contents were
+    // sent"`, and that trailing `from "…"` was reported here as an import
+    // reaching outside the package — a false red on correct source. The
+    // scanner reads the import/export declarations themselves, so it is
+    // STRICTLY the stronger check: it also sees bare side-effect imports,
+    // `export … from`, and dynamic `import()`, none of which a
+    // `from '…'` regex can see, while reporting nothing for a comment.
+    const imports = ts
+      .preProcessFile(src, true, true)
+      .importedFiles.map((file) => file.fileName);
     for (const spec of imports) {
       expect(spec, `argShape.ts must not reach outside figpea-mcp/src: ${spec}`).toMatch(/^\.\//);
     }
+  });
+
+  it('the scanner that guards AC-5 still sees a real outside import — a guard that cannot fail guards nothing', () => {
+    // The check above is only worth its assertion if the scanner itself
+    // detects an outside specifier. Pinned here so a future "make the red go
+    // away" edit to the scanner cannot quietly turn AC-5 into a no-op.
+    const outside = ts.preProcessFile("import type { A } from 'node:fs';\n", true, true);
+
+    expect(outside.importedFiles.map((file) => file.fileName)).toEqual(['node:fs']);
+    expect(() => {
+      for (const spec of outside.importedFiles.map((file) => file.fileName)) {
+        expect(spec).toMatch(/^\.\//);
+      }
+    }).toThrow();
   });
 });
 
