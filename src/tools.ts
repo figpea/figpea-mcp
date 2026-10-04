@@ -26,7 +26,7 @@ export type ManifestLike = Record<string, Record<string, ManifestMethodDescripto
 // function's output and cannot drift apart. `wireShape.ts` is
 // dependency-free, so this costs nothing at runtime and keeps this module's
 // own no-`ws`/SDK/zod-value-imports constraint intact.
-import { namedKeyEncodingLine } from './wireShape';
+import { namedKeyEncodingLine, arraySlotEncodingLine } from './wireShape';
 
 /**
  * REQ-093 T4/T5 (AC-3/AC-4) — the reserved top-level manifest key `describe()`
@@ -252,6 +252,16 @@ function buildDescription(descriptor: ManifestMethodDescriptorLike): string {
   // upgrade (`isUnchanged` compares descriptions), not a loop.
   const encoding = namedKeyEncodingLine(descriptor);
   if (encoding) lines.push(encoding);
+  // REQ-1498 — the ARRAY half, and NOT cosmetic: `namedKeyEncodingLine` above
+  // returns `undefined` whenever no slot declares an object `shape`, which is
+  // every array/matrix slot — so `layer.batch` got nothing from it and would
+  // still get nothing without this line, leaving AC-5's defect alive in the
+  // lane AC-2's own example calls. One derivation (`wireShape.ts`'s
+  // `wireEncoding`) feeds both halves, so the two cannot state the rule
+  // differently; both are pushed, so a method with an object AND an array
+  // parameter gets both.
+  const arrayEncoding = arraySlotEncodingLine(descriptor);
+  if (arrayEncoding) lines.push(arrayEncoding);
   if (descriptor.result !== undefined) {
     lines.push(`Result: ${describeShape(descriptor.result)}`);
   }

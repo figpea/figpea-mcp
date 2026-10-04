@@ -375,7 +375,18 @@ describe('REQ-1296 AC-3: findUnknownTopLevelKeys — the pure predicate, unit-te
 
   it('exposes exactly the reserved keys each calling convention accepts', () => {
     expect([...FULL_MODE_RESERVED]).toEqual(['_timeoutMs', '_rawJson', 'returnAs']);
-    expect([...COMPACT_RESERVED]).toEqual(['group', 'method', 'args', '_timeoutMs', '_rawJson', 'returnAs']);
+    // DELIBERATE RE-PIN, REQ-1498: `_opsFile` was added to the COMPACT set —
+    // the payload-from-file option the dispatcher reads beside `_rawJson`, so a
+    // long `layer.batch` array can travel as a JSON file instead of being
+    // pasted into the call. `FULL_MODE_RESERVED` is deliberately UNCHANGED: the
+    // full-lane key is the unprefixed `opsFile`, allowed per-tool and DERIVED
+    // from the manifest (`topLevelArrayParamName`), so putting it in a
+    // package-wide set would accept it on tools that have no array payload.
+    // The pin is kept exact rather than loosened, because "the compact
+    // dispatcher's whole accepted top-level surface is exactly this list" is
+    // the property REQ-1296 established and a new key must be a deliberate
+    // decision someone made, not a silent widening.
+    expect([...COMPACT_RESERVED]).toEqual(['group', 'method', 'args', '_timeoutMs', '_rawJson', 'returnAs', '_opsFile']);
   });
 
   it('returns every key that is neither declared nor reserved, in arrival order, with no duplicates', () => {

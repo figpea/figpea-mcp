@@ -85,8 +85,8 @@ Honors `FIGPEA_EDITOR_URL` (default `https://editor.figpea.com`, override for lo
 | `status` | yes | Reports the bridge's port, token and pairing URL (`port`, `token`, `url`), whether a tab is connected, the connected tab's contract version, the live tool count, WHICH TAB it is attached to — a `tab` block (`connectionId`, `origin`, `originSource`, `contractVersion`, `pairedAt`) plus `connections[]` listing every paired tab with its own id, origin, contract version and `active` flag, and `activeConnectionId` — a `connection` block naming why a tab is not connected (see [Diagnosing a connection](#diagnosing-a-connection)), and WHICH BUILD is answering: a `build` block (`version`, `buildId`, `builtAt`, `servedAt`, `root`) plus a top-level `buildStale` flag (see [Which build is this server running?](#which-build-is-this-server-running)). Also `bridgeSlots` (`single` or `multi`) — how this bridge serves tabs. Read `tab.origin` and `tab.contractVersion` before a destructive write: they let you assert you are on the document you expect. |
 | `select_tab` | multi-slot mode only | Chooses which paired tab subsequent calls address: `select_tab({connectionId})`, with the ids `status` lists. Registered **only** when the bridge runs with `--bridge-slots=multi` / `FIGPEA_BRIDGE_SLOTS=multi`, and **absent from `tools/list` on the default single-slot bridge**, where there is nothing to select — a second tab is refused by name instead. Selecting a tab also re-publishes that tab's own contract manifest, so the tools you were given describe the document your next call reaches. |
 | `figpea_skill` | yes | Returns Figpea's agent skill reference (the craft guidance for using `window.figpea` well), sourced from the editor origin's `/agent/skill.md` at startup — works even with no tab paired. The answer names the URL it fetched from: the body is that origin's own build, so when a tab is paired from a different origin or a different build, get *the tab's* skill instead with `figpea.SKILL()` in the tab or `GET <the tab's origin>/agent/skill.md` (the answer says so when a tab is connected). Degrades to a structured `{ok:false, code:"skill_unavailable", message}` (never throws) if the fetch failed or was disabled. |
-| `figpea_call` | compact only | Universal dispatcher — `figpea_call({ group, method, args, _timeoutMs })` calls any `group.method` on the paired tab (see below). |
-| `figpea_describe` | compact only | Returns the contract surface for a group or method — the same `doc`/`params`/`result` the editor's own `describe()` returns, from the manifest this server already holds in memory (no tab round trip). `figpea_describe()` → group index, `{group}` → that group's methods, `{group, method}` → one method's wire shape. Degrades to `{ok:false, code:"describe_unavailable"}` (never throws) when the manifest was never fetched. |
+| `figpea_call` | compact only | Universal dispatcher — `figpea_call({ group, method, args, _timeoutMs, _opsFile })` calls any `group.method` on the paired tab (see below). `_opsFile` names a JSON file whose content is a method's top-level array argument, read by this server instead of that array. |
+| `figpea_describe` | compact only | Returns the contract surface for a group or method — the same `doc`/`params`/`result` the editor's own `describe()` returns, from the manifest this server already holds in memory (no tab round trip). `figpea_describe()` → group index, `{group}` → that group's methods, `{group, method}` → one method's wire shape. `params` is the DECLARATION; the response **states** the encoding beside it, per method, in `wire` — including that an array-valued parameter is its positional slot `args[n]` **as the array itself**, never inside an object or a `{key: …}` envelope, with a worked payload rendered from that slot's own declared element shape. Degrades to `{ok:false, code:"describe_unavailable"}` (never throws) when the manifest was never fetched. |
 | `group_method` (e.g. `layer_setPosition`, `canvas_screenshot`, `export_project`) | full mode only | One MCP tool per method in the connected tab's `figpea.describe()` manifest. |
 
 In **compact mode (default)** the server advertises only `open_editor`, `status`, `figpea_skill`, `figpea_call` and `figpea_describe` — 5 tools, ~600 tokens vs ~9,500 tokens, a ~90–95% reduction. In **full mode** (`--mode=full` or `FIGPEA_TOOL_MODE=full`) it advertises `open_editor`, `status`, `figpea_skill` plus every `group_method` contract tool. In **multi-slot mode** (`--bridge-slots=multi`) it advertises one more, `select_tab`, and only then. See [Tool modes & `figpea_call` dispatcher](#tool-modes--figpea_call-dispatcher) below.
@@ -213,6 +213,8 @@ It reaches **every** binary result, not just images: any payload shaped `{bytes,
 
 Open the file with your host's own file-reading tool (the `url` is the bridge's token-gated `/blob/<token>` alias; the `path` is also fetchable via the existing `GET /file?path=` loopback endpoint). Omit `returnAs` (or pass `"inline"`) for today's behavior, byte-identical. Any other value fails loud with `invalid_params`; a write failure returns `{ok: false, code: "return_path_write_failed"}` with `isError: true` and never partial bytes. The session's temp dir is removed when the bridge session ends (`close()`). Rule of thumb: for >1 MB screenshots, pass `returnAs: "path"` and read the file with your host's file tool; saves ~1.3 tokens/raw byte.
 
+**The mirror image of `returnAs` is `opsFile`, and it is a different thing.** `returnAs: "path"` moves a **result** out of the reply; `opsFile` moves a **payload** into the call — a method's top-level array argument is read from a JSON file you name, so a long batch never has to be pasted into the tool call. Both are loopback-local reads and writes on the machine running this server, neither sends anything anywhere. See [Batch payloads from a file](#batch-payloads-from-a-file-opsfile) below.
+
 **There is no other way to put a result on disk, and an invented parameter is an error, not a no-op.** A parameter this server does not recognise is never dropped: it comes back as `{ok: false, code: "invalid_params", message: "<tool>: unknown parameter \"…\". Accepted parameters: …"}` naming the offending key, before the call reaches the editor and without spending a tab round trip. Passing `filePath` to `canvas_screenshot` used to be silently ignored — the call still answered `ok: true`, nothing was written anywhere, and an agent could report a capture as saved evidence that did not exist. So: to get a capture or an export onto disk, pass `returnAs: "path"` and read the returned path with your host's own file tool; never pass a file path as a parameter. The same rule holds through `figpea_call` in compact mode, where an extra positional argument past the method's declared arity is rejected by the same code.
 
 **A prop the requested kind does not accept is refused before the tab is reached too.** `layer_create` with `{kind: "text", props: {…, x: 120, y: 250}}` is answered `{ok: false, code: "invalid_transform"}` naming `x, y` and listing what `"text"` does accept — `create("text", {…, x, y})` positions nothing, and the editor would have said exactly this one round trip later. The applicable set is not a list baked into this package: it is read per call from the same manifest `figpea_describe` returns, as `params.props.shape` merged with `params.props.byKind[kind]`, so a kind that later gains a field is accepted with no upgrade here. The code is the editor's own, relayed rather than renamed, so an agent that hits this path and the tab path reads one rule. Nothing is forwarded and no tab round trip is spent. Geometry, in short, goes top-level and every visual property goes inside `style{}` — see `layer_create`'s own doc, which states the same rule with the worked examples.
@@ -237,7 +239,7 @@ By default `figpea-mcp` runs in **compact mode** — only 5 tools (`open_editor`
 { "group": "layer", "method": "batch", "args": [[{ "method": "create", "args": ["page", { "name": "probe", "pageWidth": 100, "pageHeight": 100 }] }]] }
 ```
 
-**Nesting rule.** `args` is the positional array in the method's own parameter order. When a parameter is itself an array — `layer.batch`'s `ops` is the one that bites — that parameter goes in as **one element of `args`**, and the element is an array of `{method, args}` ops. Each op's `args` is a positional array as well. So `ops` is `[[{…}]]`, never `{ops: […]}` and never `{"item": […]}` (the latter is what some host harnesses produce when they collapse a nested array; `figpea_call` answers that with an `invalid_params` naming the path and the expected shape, without spending a tab round trip). When in doubt, call `figpea_describe({ group: "layer", method: "batch" })` first — it returns the authoritative shape from the manifest.
+**Nesting rule.** `args` is the positional array in the method's own parameter order. When a parameter is itself an array — `layer.batch`'s `ops` is the one that bites — that parameter goes in as **one element of `args`**, and the element is an array of `{method, args}` ops. Each op's `args` is a positional array as well. So `ops` is `[[{…}]]`, never `{ops: […]}` and never `{"item": […]}` (the latter is what some host harnesses produce when they collapse a nested array; `figpea_call` answers that with an `invalid_params` naming the path and the expected shape, without spending a tab round trip). When in doubt, call `figpea_describe({ group: "layer", method: "batch" })` first — it returns the authoritative shape from the manifest, and its `wire` block **states** this rule for you: each parameter's positional index, and for an array-valued one a worked payload to copy. If the payload is long enough that pasting it into the call is the problem rather than the nesting, `opsFile` takes it as a file instead — see [Batch payloads from a file](#batch-payloads-from-a-file-opsfile) below.
 
 **Object-valued parameters — the object IS the positional slot.** When a parameter is a plain object, that object occupies `args[n]` *on its own*; you never wrap it in a second envelope keyed by the parameter's own name. This is the shape that bites hardest, precisely because several parameters are **named** `input` or `patch` — so writing that name into your payload is the mistake, not the fix. `figpea_describe({ group, method })` is the authority on which is which: it returns each parameter's name, type and shape in that method's own positional order, so a parameter's *name* tells you nothing about how to nest it. One consequence worth stating outright, because it is what turns a wrong call into a filesystem hunt: retrying a wrong shape here fails **identically** every time, because the argument — not the message — is what is wrong, so a clearer error on the next try cannot help. Change the shape.
 
@@ -247,6 +249,14 @@ The one wrapper that IS legal is a **single** object as the whole of `args`, key
 // session.openFile(input) — `input` IS args[0]. figpea-mcp maps a `filePath`
 // here to http://localhost:<port>/file?path=… so the editor can fetch it.
 { "group": "session", "method": "openFile", "args": [{ "filePath": "/abs/path/design.fp" }] }
+// WRONG — a BARE PATH where the object belongs. This is the call that reported success
+// while opening nothing: every pre-flight here declines a string at an object slot, so the
+// path was forwarded verbatim and whatever came back was the tab's answer, relayed.
+// Now it is refused BEFORE the round trip with an invalid_params naming args[0] and the key
+// it wanted — {"filePath": "<absolute path>"}, the first line above. A path to a file that is
+// not there instead answers open_failed: file not found or not readable: <path>, the same as
+// the object form: a missing file is missing whatever shape it arrived in.
+{ "group": "session", "method": "openFile", "args": ["/abs/path/design.fp"] }
 // WRONG — the file-path translation reads args[0].filePath, and this envelope puts
 // it one level too deep, so the call is REFUSED BEFORE ANY FETCH with an
 // invalid_params naming args[0] as where filePath belongs — no tab round trip spent.
@@ -302,10 +312,53 @@ Two conventions meet here, and mixing them is the trap. In **full mode** a gener
 
 A string that does not parse, or that parses to the wrong kind for its declared type, is **refused before the round trip** with an `invalid_params` naming the position and both ways out — never silently forwarded. `figpea_describe({ group, method })` lists this method's own string-capable params under `stringJsonParams`, derived from the manifest, so you do not have to guess.
 
+#### Batch payloads from a file (`opsFile`)
+
+The string route above is the answer when your harness **cannot send** a nested value. This one is the answer when the nested value is **too long to send at all** — a 52-layer plate is ~87,000 characters of ops, and every one of them has to exist twice (once to write the file, once as the tool-call argument) because the tool-call argument is the only channel in. So name a JSON file instead: this server reads it and substitutes its array for the payload before the round trip.
+
+Two spellings, one per lane, because that is how everything else in this document works:
+
+| Lane | Tool | Key | How it is declared |
+|------|------|-----|--------------------|
+| full mode | the generated `layer_batch` | `opsFile` | a per-tool key beside `ops`, advertised in `tools/list` for any tool whose method declares a top-level array parameter |
+| compact mode (default) | `figpea_call` | `_opsFile` | a reserved dispatcher key beside `_rawJson` and `_timeoutMs` |
+
+Either one, **not** the array itself — sending both is refused as ambiguous rather than silently resolved one way:
+
+```json
+// full mode
+{ "opsFile": "/abs/path/plate-ops.json" }
+// compact mode — the array is simply left out of `args`
+{ "group": "layer", "method": "batch", "args": [], "_opsFile": "/abs/path/plate-ops.json" }
+// …whose file content is the ops array itself, with no wrapper of any kind
+[{"method":"create","args":["rect",{"name":"probe","parentId":"P_1","rwidth":100,"rheight":60}]}]
+```
+
+Any path works — no extension, directory or naming convention is required, and it is read as given. The substitution happens here, before the round trip, so the editor measures the array **exactly** as it would have measured one you pasted in.
+
+**The editor's per-call argument budget is unchanged.** `opsFile` moves where the characters come from, not how many there may be: the editor measures the substituted array against the same limit and refuses an over-budget one whole, exactly as before. Read the live number at `figpea_describe({ selector: "limits" })`, aim for roughly two-thirds of it, and split the op list across several files if one does not fit — each chunk is its own undo step. There is no new ceiling and no bypass.
+
+Every failure is `invalid_params` and costs no round trip, and the message names the file rather than the payload:
+
+| What you sent | What you get back |
+|---------------|--------------------|
+| a path to nothing (or to a directory) | `file not found or not readable: <path>` |
+| content that is not parseable JSON | `opsFile: cannot parse <path> — <the JSON error's own message>` |
+| content that parses but is not an array | `opsFile: <path> must contain a JSON array … got an object / a string / a number / null` |
+| `[]` | `opsFile: <path> contains an empty array; "ops" must be a non-empty array` |
+| a file over 2 MiB | `opsFile: <path> is <n> bytes, which exceeds the 2097152-byte read limit` (refused before the bytes are read) |
+| a non-string or empty value | `opsFile must be a string` / `opsFile cannot be empty` |
+| the array AND the path | `opsFile and "ops" were both sent, so this server cannot tell which payload you meant` |
+
+The 2 MiB figure is a **read** guard — it bounds what is loaded into memory before anything else happens — and it is nowhere near the editor's own limit, so nothing that could have succeeded is refused by it.
+
+**No editor behaviour changed.** `describe()`, the contract version and the error codes are as they were; what changed is that this relay can now read one file you name on the machine it already runs on, the same trust boundary its existing local-file translations and `returnAs: "path"` operate inside. Nothing is uploaded and nothing leaves your machine.
+
 - `group` (string, required) — contract group name (`layer`, `canvas`, `session`, `export`, `history`).
 - `method` (string, required) — method within the group (`create`, `screenshot`, `openFile`, …).
-- `args` (array, optional, defaults to `[]`) — positional arguments for that method, in the order `describe()` lists them.
+- `args` (array, optional, defaults to `[]`) — positional arguments for that method, in the order `describe()` lists them. Leave the array-valued slot out when you send `_opsFile`.
 - `_timeoutMs` (number, optional) — per-call timeout override, clamped to 120000 ms (same `MAX_CALL_TIMEOUT_MS` and `DEFAULT_TIMEOUT_TABLE_MS` as granular tools).
+- `_opsFile` (string, optional) — absolute path to a JSON file whose content is this method's top-level array argument (compact mode only; full mode's generated tool takes the same key unprefixed as `opsFile`). Send it **or** the array, never both.
 - `returnAs` (string, optional) — `"inline"` (default) or `"path"`; `"path"` writes a binary result to a session file and returns `{ok, path, mime, width, height, bytes, filename, url}` as text (see "Off-band binary returns" above). Reaches every binary export, images and non-images alike. Typos fail with `invalid_params`.
 
 Image-returning methods (`canvas.screenshot`, raster `export.*`) return both an MCP `image` content block and a `text` summary block.
@@ -328,6 +381,7 @@ Two things worth knowing before you size a call:
 
 - **Non-ASCII payloads reach the cap earlier.** The limit counts characters, but the transport caps *bytes*. A payload carrying emoji or other multi-unit characters can measure under `argsChars` while its wire size is several times that, so budget lower for those.
 - **Image bytes are the fastest way to hit it.** An inline `data:image/png;base64,…` URI for a 200×200 PNG is already 20–40 KB. For anything larger, stage the bytes on a local CORS origin (`http://127.0.0.1:<port>` with `Access-Control-Allow-Origin: *`) and pass that `http://…` URL — this server fetches it and embeds the bytes, so the tool call itself stays small. This server relays the editor's refusal verbatim, so the remedy it names depends on whether your payload actually carried image bytes.
+- **A payload read from a file is measured the same.** `opsFile` / `_opsFile` (see [Batch payloads from a file](#batch-payloads-from-a-file-opsfile)) changes where the characters come from, not how many there may be. The limit is enforced in the editor, against the array it receives, and it applies unchanged to a payload read from a file: over the cap, that call is refused whole with `arg_size_exceeded` and nothing is applied, exactly as for a pasted-in array. There is no new ceiling, no bypass, and nothing that used to be refused is now accepted — split across several files or several calls as before.
 
 Do not hardcode today's number: the editor owns the threshold and publishes it, and a threshold move is then a read rather than a guess. Each chunk is its own undo step, so splitting a batch trades one atomic undo for a correctly sized call.
 

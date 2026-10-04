@@ -40,7 +40,21 @@ export const FULL_MODE_RESERVED = ['_timeoutMs', '_rawJson', 'returnAs'] as cons
  * the same thing through the dispatcher, because the dispatcher forwards to
  * the very same tab method.
  */
-export const COMPACT_RESERVED = ['group', 'method', 'args', '_timeoutMs', '_rawJson', 'returnAs'] as const;
+/**
+ * REQ-1498 adds `_opsFile` — a per-call path to a JSON file whose content is the
+ * method's top-level array/matrix payload. It is a RESERVED key rather than a
+ * declared param because it is read by this server and never forwarded to the
+ * tab, exactly like `_timeoutMs`/`_rawJson` beside it; the declared key a
+ * caller writes on full mode's generated tool is the unprefixed `opsFile`, which
+ * `mcpServer.ts` allows and strips per-tool (derived from the manifest, so no
+ * method name appears in either module).
+ *
+ * `opsFile` is deliberately NOT in this list: on full mode the allowance is
+ * per-tool and derived (only for a tool whose manifest declares a top-level
+ * array/matrix param), so putting it here would advertise the key on every
+ * generated tool whether or not it can mean anything.
+ */
+export const COMPACT_RESERVED = ['group', 'method', 'args', '_timeoutMs', '_rawJson', 'returnAs', '_opsFile'] as const;
 
 /**
  * Returns every key of `raw` that is neither declared nor reserved, in

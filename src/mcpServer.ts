@@ -29,7 +29,7 @@ import { writeImageReturn, sessionDirFor } from './returnPath';
 // constant so a fallback can never disagree with the canonical host again.
 import { BRIDGE_URL_HOST } from './bridgeHost';
 import { groupNamesFromCompactIndex } from './describeDrill';
-import { findArgShapeMismatch, findKindPropMismatch, findDeclaredWrapperMismatch, renderSchemaExample, findFilePathEnvelopeMismatch, findNestedStructuredStringMismatch, createPropStyleHint, nestedStringHint, type ArgShapeMismatch } from './argShape';
+import { findArgShapeMismatch, findKindPropMismatch, findDeclaredWrapperMismatch, renderSchemaExample, findFilePathEnvelopeMismatch, findSingularFilePathMismatch, findNestedStructuredStringMismatch, createPropStyleHint, nestedStringHint, type ArgShapeMismatch } from './argShape';
 import { wireEncoding, groupEncodingNote } from './wireShape';
 // REQ-1280 — the single `_rawJson` implementation, called by BOTH relay paths
 // (full mode's contract handler and compact mode's `figpea_call`) so they
@@ -430,6 +430,33 @@ function buildInputShape(tool: GeneratedTool): z.ZodType {
   // result is not a binary payload, so declaring it everywhere costs nothing
   // and removes the class of "works on three tools" surprise.
   shape['returnAs'] = z.any().meta({ type: 'string', enum: ['inline', 'path'] }).optional();
+  // REQ-1498 — the payload-from-file option, DECLARED for any tool whose
+  // manifest declares a top-level array/matrix param, so `tools/list` advertises
+  // it. Derived from `tool.paramSchemas`, so no method name appears here and a
+  // method published this way gains it with no edit.
+  //
+  // Declared (like every reserved key above) rather than merely permitted,
+  // because an undeclared key is stripped by the SDK's `safeParseAsync` before
+  // the handler runs — which is REQ-1282 AC-5's exact lesson in the other
+  // direction: a knob that exists but is unadvertised is undiscoverable, and a
+  // knob advertised blind is a defect.
+  //
+  // Permissive (`z.any().meta({type:'string'})`), for the REQ-769 reason: this
+  // advertises the type while parse stays literal, so a bad VALUE still reaches
+  // the handler and is refused there by name rather than by an opaque SDK
+  // parse error.
+  //
+  // `topLevelArrayParamName` returns a name only when exactly one top-level
+  // array/matrix param is declared; with zero or several there is no slot to
+  // substitute into, so the key is not declared at all.
+  if (topLevelArrayParamName(tool.paramSchemas)) {
+    shape['opsFile'] = z
+      .any()
+      .meta({ type: 'string' })
+      .optional()
+      .describe(OPS_FILE_ADVICE)
+      .meta({ description: OPS_FILE_ADVICE });
+  }
   if (tool.inputKeys.length === 0) return z.looseObject(shape);
   // REQ-1296 D1 — the early return above carries the same loose wrap, so a
   // zero-param method's unrecognised key is observable too (and not merely
@@ -657,6 +684,206 @@ function refusalMessage(
     `Expected ${toolName} args: [${expectedArgs}]. ` +
     `Learn the exact shape first: figpea_describe({group:"${group}", method:"${method}"}).`
   );
+}
+
+/* ------------------------------------------------------------------ *
+ * REQ-1498 — the PAYLOAD-FROM-A-FILE route, one reader for both lanes.
+ *
+ * The defect: this server read a local file in exactly two places —
+ * `returnPath.ts`'s off-band RESULT writer and the `isValidFile` existence
+ * probe the three `filePath` translations use — and neither is an INBOUND
+ * route. So an agent that wrote `layer.batch`'s ops to a JSON file and passed
+ * the path met the editor's own guard instead
+ * (`v3/src/agent/groups/layer.impl.ts:2519-2527`): `ops must be a non-empty
+ * array of {method, args} operations` — for a string, which is not an array.
+ * Both lanes forwarded it verbatim, because both `layer_batch` branches guard
+ * on `Array.isArray(ops)` and skip a string.
+ *
+ * ⛔ DERIVE, NEVER ENUMERATE. Nothing below names a method. The key is offered
+ * on, and honoured for, any method whose manifest declares a TOP-LEVEL
+ * `array`/`matrix` param — the same predicate `structuredParamNames` already
+ * asks — so a method published that way is covered with no edit here.
+ *
+ * ⛔ EVERY REFUSAL COSTS ZERO ROUND TRIPS, and every one of them reuses
+ * `invalid_params`, already this server's pre-flight code. The published
+ * error-code vocabulary is therefore unchanged.
+ * ------------------------------------------------------------------ */
+
+/**
+ * The read ceiling for the payload file, in bytes. A READ guard, not a budget
+ * claim: the editor still measures the substituted payload against its own
+ * `argsChars` limit and refuses an over-budget array whole, so this number
+ * only bounds what is loaded into memory before that happens.
+ *
+ * Sized so nothing legitimate is refused. The editor refuses above ~22 000
+ * serialized characters of the whole `args`, two orders of magnitude below
+ * this, so a payload that could ever succeed is far inside the ceiling — which
+ * exists to stop a 2 GB path being loaded, not to move a limit.
+ */
+const OPS_FILE_MAX_BYTES = 2 * 1024 * 1024;
+
+/** The option's advertised description. One string, declared in BOTH
+ *  `.describe()` and `.meta()` — the SDK's zod→JSON-Schema conversion takes the
+ *  META description in preference to `.describe()`, so a `.describe()`-only
+ *  declaration ships the knob blind (REQ-1282's recorded lesson). */
+const OPS_FILE_ADVICE =
+  'Optional. Absolute path to a JSON file whose content is this parameter\'s array — read by this server and ' +
+  'substituted for it before the call reaches the editor, so a long payload never has to be pasted into the ' +
+  'tool call. Send this parameter EITHER as a real array OR as this path, never both. The editor\'s per-call ' +
+  'argument budget still applies to the array read from the file, unchanged: read the live value at ' +
+  'describe().limits.argsChars and chunk as usual. A missing file, unreadable file, unparseable JSON, or content ' +
+  'that is not a non-empty array is refused with invalid_params naming the file and the reason.';
+
+/** Human wording for a JSON value's kind, for the not-an-array refusal. */
+function jsonKindOf(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'an array';
+  if (typeof value === 'object') return 'an object';
+  return `a ${typeof value}`;
+}
+
+/**
+ * The name of this method's TOP-LEVEL `array`/`matrix` parameter, or
+ * `undefined` when it declares none — so this server has no opinion about
+ * where a payload-from-file would land.
+ *
+ * ⛔ `undefined` (never a guess) when more than one such parameter is declared:
+ * a file could go in either slot, and picking one would silently discard the
+ * caller's other payload.
+ */
+export function topLevelArrayParamName(paramSchemas: Record<string, ParamSchemaLike> | undefined): string | undefined {
+  if (!paramSchemas) return undefined;
+  const arrayParams = Object.entries(paramSchemas)
+    .filter(([, schema]) => schema?.type === 'array' || schema?.type === 'matrix')
+    .map(([name]) => name);
+  return arrayParams.length === 1 ? arrayParams[0] : undefined;
+}
+
+/** How the option's refusal reads once a param name is known — shared by the
+ *  value checks, so one bad option produces one grammar. */
+function opsFileValueRefusal(optionKey: string, message: string): { ok: false; code: string; message: string } {
+  return { ok: false, code: 'invalid_params', message: `${optionKey} ${message}` };
+}
+
+/**
+ * Reads the JSON file at `raw` and returns the array it holds.
+ *
+ * ONE reader, called from both lanes, because a rule stated twice is two rules.
+ * Every refusal here is pre-flight and zero-round-trip; the caller supplies the
+ * key name it advertised (`_opsFile` in compact mode, `opsFile` on full mode's
+ * generated tool) so the message names what the caller actually wrote.
+ *
+ * `paramSchema` is the slot's own declaration, used only to RENDER the element
+ * wording in the not-an-array refusal — so the example cannot describe an
+ * element shape the manifest does not declare.
+ */
+export async function readArrayPayloadFromFile(
+  raw: unknown,
+  optionKey: string,
+  paramName: string,
+  paramSchema: ParamSchemaLike | undefined,
+): Promise<{ ok: true; value: unknown[] } | { ok: false; code: string; message: string }> {
+  if (typeof raw !== 'string') return opsFileValueRefusal(optionKey, 'must be a string');
+  if (raw.trim() === '') return opsFileValueRefusal(optionKey, 'cannot be empty');
+  let size: number;
+  try {
+    const st = await fs.promises.stat(raw);
+    if (!st.isFile()) {
+      // A directory, or anything else that is not a regular file. Byte-identical
+      // wording to the three existing file branches, so the four cannot drift.
+      return { ok: false, code: 'invalid_params', message: `file not found or not readable: ${raw}` };
+    }
+    size = st.size;
+  } catch {
+    return { ok: false, code: 'invalid_params', message: `file not found or not readable: ${raw}` };
+  }
+  // BEFORE the read: the point of the ceiling is that the bytes are never loaded.
+  if (size > OPS_FILE_MAX_BYTES) {
+    return {
+      ok: false,
+      code: 'invalid_params',
+      message: `${optionKey}: ${raw} is ${size} bytes, which exceeds the ${OPS_FILE_MAX_BYTES}-byte read limit. Split the payload across smaller files, or across several calls.`,
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await fs.promises.readFile(raw, 'utf8'));
+  } catch (e) {
+    // AC-4: a diagnostic naming the FILE and the PARSE FAILURE — the reader's
+    // own message, quoted, so the caller is not left comparing two guesses.
+    const cause = e instanceof Error ? e.message : String(e);
+    return { ok: false, code: 'invalid_params', message: `${optionKey}: cannot parse ${raw} — ${cause}` };
+  }
+  if (!Array.isArray(parsed)) {
+    const element = paramSchema?.of?.shape ? ' of {method, args} operations' : '';
+    return {
+      ok: false,
+      code: 'invalid_params',
+      message: `${optionKey}: ${raw} must contain a JSON array${element} for "${paramName}", got ${jsonKindOf(parsed)}`,
+    };
+  }
+  if (parsed.length === 0) {
+    return {
+      ok: false,
+      code: 'invalid_params',
+      message: `${optionKey}: ${raw} contains an empty array; "${paramName}" must be a non-empty array`,
+    };
+  }
+  return { ok: true, value: parsed };
+}
+
+/**
+ * The positional index this method's top-level array/matrix parameter occupies,
+ * or `undefined` when the manifest does not declare one.
+ *
+ * ⚠️ THIS FUNCTION EXISTS BECAUSE A HARD-CODED `0` WAS A REAL DEFECT (code-review
+ * round 1). The option is DERIVED, so it is offered on every method declaring a
+ * top-level `array`/`matrix` param — and those sit at different indices:
+ * `layer.batch(ops)` at 0, `layer.setTransform(id, transform)` at 1. Reading the
+ * index out of `inputKeys` is what keeps the derivation honest; a literal `0`
+ * made `setTransform` refuse as ambiguous when the caller had sent no matrix,
+ * and made an empty slot drop the arguments after it (`operation` silently lost
+ * with `ok:true`).
+ */
+function opsFileSlotIndex(contractTool: GeneratedTool | undefined, paramName: string | undefined): number | undefined {
+  if (!contractTool || !paramName) return undefined;
+  const index = contractTool.inputKeys.indexOf(paramName);
+  return index >= 0 ? index : undefined;
+}
+
+/**
+ * Is the value at the payload slot a payload — i.e. is the file option actually
+ * competing with something the caller sent?
+ *
+ * `undefined` and `null` are BOTH "no value here": `null` is the JSON spelling of
+ * the same thing a host produces when it drops a key, and neither is an array,
+ * so there is nothing for the file to override. Refusing `args:[null]` as
+ * ambiguous refused a call that means exactly one thing.
+ */
+function opsFileSlotOccupied(value: unknown): boolean {
+  return value !== undefined && value !== null;
+}
+
+/** The refusal when a call sends the payload AND a file carrying it. Refused
+ *  rather than resolved: silently preferring one would discard half the call. */
+function opsFileAmbiguityRefusal(optionKey: string, paramName: string): { ok: false; code: string; message: string } {
+  return {
+    ok: false,
+    code: 'invalid_params',
+    message:
+      `${optionKey} and "${paramName}" were both sent, so this server cannot tell which payload you meant. ` +
+      `Send "${paramName}" as a real array OR set ${optionKey} to a file — never both.`,
+  };
+}
+
+/** And when the call names the option for a method that has no array payload
+ *  to substitute it into. */
+function opsFileNoArrayParamRefusal(optionKey: string): { ok: false; code: string; message: string } {
+  return {
+    ok: false,
+    code: 'invalid_params',
+    message: `${optionKey} is only meaningful for a method whose top-level payload is an array, and this one has no array parameter. figpea_describe({group, method}) lists its params.`,
+  };
 }
 
 /**
@@ -1288,12 +1515,12 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
             .array(z.any())
             .optional()
             .describe(
-              'Positional arguments for the method, in that method\'s own parameter order (defaults to []). When a parameter is itself an array (e.g. layer.batch\'s ops), pass it as ONE element of args — that element is an array of {method, args} ops, e.g. [[{method:"create", args:["rect",{rwidth:100}]}]]. Each op\'s args is an array too, never an object. If your harness cannot send a nested object or array, any param the method declares as an object/array may instead be sent as a JSON string with no flag, and this server parses it before the round trip — e.g. "args":["[{\"method\":\"create\",\"args\":[\"rect\",{\"rwidth\":100}]}]"]. A string is a scalar, so nothing collapses it; figpea_describe({group, method}) lists which of this method\'s params accept that as stringJsonParams. ' + ARGS_BUDGET_ADVICE,
+              'Positional arguments for the method, in that method\'s own parameter order (defaults to []). When a parameter is itself an array (e.g. layer.batch\'s ops), pass it as ONE element of args — that element is an array of {method, args} ops, e.g. [[{method:"create", args:["rect",{rwidth:100}]}]]. Each op\'s args is an array too, never an object. If your harness cannot send a nested object or array, any param the method declares as an object/array may instead be sent as a JSON string with no flag, and this server parses it before the round trip — e.g. "args":["[{\"method\":\"create\",\"args\":[\"rect\",{\"rwidth\":100}]}]"]. A string is a scalar, so nothing collapses it; figpea_describe({group, method}) lists which of this method\'s params accept that as stringJsonParams. REQ-1498: when the payload is too long to paste into the call at all, set _opsFile to the absolute path of a JSON file whose content is that array and leave the array out of args entirely — this server reads it and substitutes it before the round trip; the editor\'s per-call argument budget still applies to the array read from the file. ' + ARGS_BUDGET_ADVICE,
             )
             .meta({
               type: 'array',
               description:
-                'Positional argument array, in the method\'s own parameter order. An array-typed parameter (e.g. layer.batch\'s ops) is passed as ONE element of args, and that element is itself an array of {method, args} ops — e.g. [[{method:"create", args:["rect",{rwidth:100}]}]]. Each op\'s args is an array, never an object. If your harness cannot send a nested object or array, any param the method declares as an object/array may instead be sent as a JSON string with no flag, and this server parses it before the round trip — e.g. "args":["[{\"method\":\"create\",\"args\":[\"rect\",{\"rwidth\":100}]}]"]. A string is a scalar, so nothing collapses it; figpea_describe({group, method}) lists which of this method\'s params accept that as stringJsonParams. ' + ARGS_BUDGET_ADVICE,
+                'Positional argument array, in the method\'s own parameter order. An array-typed parameter (e.g. layer.batch\'s ops) is passed as ONE element of args, and that element is itself an array of {method, args} ops — e.g. [[{method:"create", args:["rect",{rwidth:100}]}]]. Each op\'s args is an array, never an object. If your harness cannot send a nested object or array, any param the method declares as an object/array may instead be sent as a JSON string with no flag, and this server parses it before the round trip — e.g. "args":["[{\"method\":\"create\",\"args\":[\"rect\",{\"rwidth\":100}]}]"]. A string is a scalar, so nothing collapses it; figpea_describe({group, method}) lists which of this method\'s params accept that as stringJsonParams. REQ-1498: when the payload is too long to paste into the call at all, set _opsFile to the absolute path of a JSON file whose content is that array and leave the array out of args entirely — this server reads it and substitutes it before the round trip; the editor\'s per-call argument budget still applies to the array read from the file. ' + ARGS_BUDGET_ADVICE,
             }),
           // REQ-1282 AC-5 — the advice an agent needs at the moment it decides
           // whether to pass this at all, carried in BOTH halves for the reason
@@ -1325,6 +1552,16 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
               'Set _rawJson:true on your figpea_call when your harness STRINGIFIED an object or array argument AND this server cannot tell what that position expects — the method is unknown, the parameter is not declared as an object/array/matrix in the manifest this server holds, or no manifest has been fetched yet. At such a position, and at any position the manifest DOES declare as an object/array/matrix, every element of args that is a string whose trimmed form starts with { or [ and ends with } or ] is JSON-parsed before it reaches the editor, e.g. {"group":"layer","method":"create","args":["page","{\\"name\\":\\"probe\\",\\"pageWidth\\":300,\\"pageHeight\\":200}"],"_rawJson":true}. A position the manifest declares a string/number/boolean is NEVER parsed, even when its text is valid JSON: setName(id, \'[1,2,3]\') still names the layer [1,2,3], and a code sample or a fake API response stays the text you sent. NOTE you usually do NOT need this: a param the method DECLARES as an object/array/matrix is parsed with no flag at all, and the parsed shape is checked against the declaration too, so reach for _rawJson when you cannot scope the position, not as a general-purpose parse. If a value looks like JSON but cannot be parsed, and its position is declared an object/array/matrix, the call is refused by name (invalid_params) instead of being forwarded — nothing is silently ignored.',
             ),
           returnAs: z.any().optional().describe('Reserved: "inline" (default) or "path" — "path" writes a binary result to a session file and returns {ok, path, mime, width, height, bytes, filename?, url} as text, so a non-image export (e.g. a native .fp project) never crosses the wire as base64'),
+          // REQ-1498 — declared on the dispatcher too, for the same
+          // `buildInputShape` reason: undeclared keys are stripped before the
+          // handler runs. `.describe()` AND `.meta()`, so `tools/list` actually
+          // carries it (the SDK's zod→JSON-Schema conversion takes the META
+          // description in preference to `.describe()` — REQ-1282 AC-5).
+          _opsFile: z
+            .any()
+            .optional()
+            .describe(`Reserved, for a method whose top-level payload is an array (e.g. layer.batch's ops). ${OPS_FILE_ADVICE}`)
+            .meta({ description: `Reserved, for a method whose top-level payload is an array (e.g. layer.batch's ops). ${OPS_FILE_ADVICE}` }),
         }),
       },
       async (rawArgs) => {
@@ -1542,10 +1779,98 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           );
         };
 
+        /**
+         * REQ-1498 (AC-6/AC-7) — the SINGULAR wrong-shape family, run beside
+         * the envelope rule above and at the same three call sites, because a
+         * bare path and a wrapped path are the same mistake told two ways.
+         *
+         * The measured pre-fix behaviour (REQ-1498's T3 red run): every
+         * pre-flight DECLINED the bare string, it was forwarded verbatim, and
+         * the `ok:true` was the TAB's answer relayed back. So this is not a
+         * repair of a relay that swallowed the editor's own refusal — it is a
+         * refusal that costs ZERO round trips and holds against ANY paired
+         * editor build, including one that answers `ok:true` to a path.
+         *
+         * The missing-file arm reuses this site's own code and wording, for
+         * the reason `refuseFilePathEnvelope` does: a file that is not there is
+         * not there whatever shape it arrived in, and reshaping the argument
+         * will not conjure it.
+         */
+        const refuseBareFilePath = async (missingCode: string): Promise<CallToolResult | undefined> => {
+          if (!contractTool) return undefined;
+          const mismatch = findSingularFilePathMismatch(
+            contractTool.paramSchemas,
+            (name) => effectiveArgs[contractTool.inputKeys.indexOf(name)],
+            (name) => `args[${contractTool.inputKeys.indexOf(name)}]`,
+          );
+          if (typeof mismatch?.offendingValue !== 'string') return undefined;
+          if (!(await isValidFile(mismatch.offendingValue))) {
+            return toCallToolResult(
+              resultToContent({ ok: false, code: missingCode, message: `file not found or not readable: ${mismatch.offendingValue}` }),
+            );
+          }
+          return toCallToolResult(
+            resultToContent({
+              ok: false,
+              code: 'invalid_params',
+              message: refusalMessage(toolName, group, method, mismatch, expectedArgsExample(contractTool)),
+            }),
+          );
+        };
+
+        /**
+         * The two wrong-shape rules in ONE call, so the three sites below stay
+         * three lines and an agent that trips either reads the same refusal
+         * grammar (`refusalMessage`) rather than two.
+         */
+        const refuseFilePathShapes = async (missingCode: string): Promise<CallToolResult | undefined> => {
+          const enveloped = await refuseFilePathEnvelope(missingCode);
+          if (enveloped) return enveloped;
+          return refuseBareFilePath(missingCode);
+        };
+
+        // REQ-1498 — the payload-from-file route, COMPACT lane's half. FIRST in
+        // this pre-flight region and before the `layer_batch` translation loop
+        // below, so a payload that arrives from disk gets the same `filePath`
+        // handling an inline one does — and before any round trip, so every
+        // refusal here costs zero.
+        //
+        // Read from `rawArgs`, never merged into `args`: there is no strip
+        // statement for it because the tab receives only `effectiveArgs`, and
+        // `effectiveArgs` is already a copy (`let effectiveArgs = [...args]`),
+        // so substituting into it cannot mutate the caller's own array.
+        //
+        // ⚠️ The slot is the manifest's, never a literal: see `opsFileSlotIndex`
+        // (code-review round 1). Both the ambiguity judgement AND the write go
+        // through it, so a method whose payload is not first is neither refused
+        // nor has its other arguments dropped.
+        const compactArrayParam = topLevelArrayParamName(contractTool?.paramSchemas);
+        const compactArraySlot = opsFileSlotIndex(contractTool, compactArrayParam);
+        if ((rawArgs as any)._opsFile !== undefined) {
+          if (!compactArrayParam || compactArraySlot === undefined) {
+            return toCallToolResult(resultToContent(opsFileNoArrayParamRefusal('_opsFile')));
+          }
+          if (opsFileSlotOccupied(effectiveArgs[compactArraySlot])) {
+            return toCallToolResult(resultToContent(opsFileAmbiguityRefusal('_opsFile', compactArrayParam)));
+          }
+          const fromFile = await readArrayPayloadFromFile(
+            (rawArgs as any)._opsFile,
+            '_opsFile',
+            compactArrayParam,
+            contractTool?.paramSchemas?.[compactArrayParam],
+          );
+          if (!fromFile.ok) {
+            return toCallToolResult(resultToContent({ ok: false, code: fromFile.code, message: fromFile.message }));
+          }
+          // INTO the slot, never over the array: the parameters on either side
+          // of it are the caller's own and are none of this option's business.
+          effectiveArgs[compactArraySlot] = fromFile.value;
+        }
+
         if (toolName === 'session_openFile') {
           // FIRST in the branch, before `input.filePath` is read below, so the
           // refusal lands before any fetch and before any bridge round trip.
-          const envelopeRefusal = await refuseFilePathEnvelope('open_failed');
+          const envelopeRefusal = await refuseFilePathShapes('open_failed');
           if (envelopeRefusal) return envelopeRefusal;
           // args[0] is expected to be input object {filePath?, url?, ...}
           const input = effectiveArgs[0] as Record<string, unknown> | undefined;
@@ -1574,7 +1899,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           }
         } else if (toolName === 'layer_setImageFill') {
           // Same envelope, same defect, this site's own missing-file code.
-          const envelopeRefusal = await refuseFilePathEnvelope('invalid_image_source');
+          const envelopeRefusal = await refuseFilePathShapes('invalid_image_source');
           if (envelopeRefusal) return envelopeRefusal;
           const source = effectiveArgs[0] as Record<string, unknown> | undefined;
           // Actually layer_setImageFill signature is (id, source) — source is args[1] if id is args[0]
@@ -1612,7 +1937,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           // manifest — real work, no acceptance criterion asks for it, and the
           // same KNOWN RESIDUAL `argShape.ts` records. Recorded so the gap does
           // not read as an oversight.
-          const envelopeRefusal = await refuseFilePathEnvelope('invalid_image_source');
+          const envelopeRefusal = await refuseFilePathShapes('invalid_image_source');
           if (envelopeRefusal) return envelopeRefusal;
           // args: [kind, props] — props may contain filePath when kind==='image'
           const kindVal = effectiveArgs[0] as string | undefined;
@@ -2133,15 +2458,24 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       // feature; it is the reason the exemption is named per tool rather than
       // folded into the reserved set.
       const toolNameForCheck = `${groupName}_${methodName}`;
+      // REQ-1498 — `opsFile` joins `filePath` below as a DERIVED per-tool
+      // allowance, for the same reason and the same reason it is NOT in
+      // `FULL_MODE_RESERVED`: the key means something only where the manifest
+      // declares a top-level array/matrix param, so advertising or accepting it
+      // on a tool that has no such slot would be a knob that cannot work.
+      const fullArrayParam = topLevelArrayParamName(tool?.paramSchemas);
       const allowedKeys = new Set<string>([...inputKeys, ...FULL_MODE_RESERVED]);
       if (toolNameForCheck === 'session_openFile') allowedKeys.add('filePath');
+      if (fullArrayParam) allowedKeys.add('opsFile');
       const unknownKeys = findUnknownTopLevelKeys(rawArgs, allowedKeys);
       if (unknownKeys.length > 0) {
+        const acceptedNames = [...inputKeys, ...FULL_MODE_RESERVED];
+        if (fullArrayParam) acceptedNames.push('opsFile');
         return toCallToolResult(
           resultToContent({
             ok: false,
             code: 'invalid_params',
-            message: renderUnknownParameterMessage(toolNameForCheck, unknownKeys, [...inputKeys, ...FULL_MODE_RESERVED]),
+            message: renderUnknownParameterMessage(toolNameForCheck, unknownKeys, acceptedNames),
           }),
         );
       }
@@ -2280,6 +2614,83 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           return false;
         }
       };
+
+      // REQ-1498 — the payload-from-file route, FULL lane's half, and the twin of
+      // the compact block above for REQ-1283's reason: this is a different
+      // handler on a different tool surface, so wiring only the compact one
+      // would fix the default calling convention and leave the one real MCP
+      // clients use broken.
+      //
+      // Placed BEFORE the file-translation chain below, so a payload read from
+      // disk is translated exactly like an inline one, and after the reserved
+      // `_rawJson` strip, so the two reserved keys sit side by side.
+      //
+      // Only `inputKeys` are mapped into the positional array further down, so
+      // substituting the declared param here can neither leak the path to the
+      // tab nor reach a log line.
+      if ((effectiveRawArgs as any)['opsFile'] !== undefined) {
+        if (!fullArrayParam) {
+          return toCallToolResult(resultToContent(opsFileNoArrayParamRefusal('opsFile')));
+        }
+        // REQ-1498 round 1 — the SAME predicate the compact lane uses, so a
+        // `null` slot cannot mean "substitute" here and "refuse" there: the plan
+        // requires identical behaviour in both lanes. Nothing ELSE about this
+        // lane changed — it already keyed on the parameter's own NAME rather than
+        // an index, which is why `setTransform`/`booleanOperate` worked here and
+        // not in the compact lane.
+        if (opsFileSlotOccupied((effectiveRawArgs as any)[fullArrayParam])) {
+          return toCallToolResult(resultToContent(opsFileAmbiguityRefusal('opsFile', fullArrayParam)));
+        }
+        const fromFile = await readArrayPayloadFromFile(
+          (effectiveRawArgs as any)['opsFile'],
+          'opsFile',
+          fullArrayParam,
+          tool?.paramSchemas?.[fullArrayParam],
+        );
+        if (!fromFile.ok) {
+          return toCallToolResult(resultToContent({ ok: false, code: fromFile.code, message: fromFile.message }));
+        }
+        (effectiveRawArgs as any)[fullArrayParam] = fromFile.value;
+      }
+      // Stripped whatever the outcome, matching `_rawJson` above, so the key can
+      // never reach the coercion or the positional mapping.
+      delete (effectiveRawArgs as any)['opsFile'];
+
+      // REQ-1498 (AC-6/AC-7) — the SINGULAR wrong-shape rule, this lane's half.
+      // Run beside the three file-translation branches below rather than inside
+      // one of them, because it is DERIVED from the manifest rather than from a
+      // method name: any tool whose declared object param has a `filePath` key
+      // gets it, so there is no `if (toolName === …)` to hang it on. Placed
+      // before all three, so the refusal lands before any fetch and before any
+      // round trip.
+      //
+      // `pathFor` is the bare param name because that is how this lane names
+      // things: the caller wrote `{input}`, not `args[0]`.
+      const barePathRefusal = async (missingCode: string): Promise<CallToolResult | undefined> => {
+        const mismatch = findSingularFilePathMismatch(
+          tool?.paramSchemas,
+          (name) => (effectiveRawArgs as any)[name],
+          (name) => name,
+        );
+        if (typeof mismatch?.offendingValue !== 'string') return undefined;
+        if (!(await isValidFile(mismatch.offendingValue))) {
+          return toCallToolResult(
+            resultToContent({ ok: false, code: missingCode, message: `file not found or not readable: ${mismatch.offendingValue}` }),
+          );
+        }
+        return toCallToolResult(
+          resultToContent({
+            ok: false,
+            code: 'invalid_params',
+            message: refusalMessage(toolName, groupName, methodName, mismatch, expectedArgsExample(tool)),
+          }),
+        );
+      };
+      // This lane's own missing-file code per site, exactly as the branches
+      // below use it — the code is the site's business, not the rule's.
+      const barePathCode = toolNameForCheck === 'session_openFile' ? 'open_failed' : 'invalid_image_source';
+      const barePathOutcome = await barePathRefusal(barePathCode);
+      if (barePathOutcome) return barePathOutcome;
 
       if (toolName === 'session_openFile') {
         // input may be at rawArgs.input or rawArgs itself (some callers pass filePath top-level)

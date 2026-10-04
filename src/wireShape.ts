@@ -47,6 +47,14 @@ export interface WireArg {
    *  from this parameter's own key. Derived, so it cannot name a parameter
    *  that does not exist. */
   notThis?: string;
+  /** REQ-1498 — array/matrix params only: a payload to COPY, rendered from
+   *  this slot's OWN declared element shape. A rule with no example is what the
+   *  card's AC-5 is about: the array's type was declared and its encoding was
+   *  nowhere, so the mistake only appeared on the call. */
+  payload?: string;
+  /** Array/matrix params only: the one wrapper the caller must NOT send,
+   *  rendered from this slot's own key — the array half of `notThis`. */
+  notThisArray?: string;
 }
 
 export interface WireEncoding {
@@ -79,15 +87,32 @@ export function groupEncodingNote(): string {
 }
 
 /**
- * The per-method statement. One fact, in the three sentences that make it
- * usable: what the encoding is, where to read it, and what an object slot
- * takes.
+ * The per-method statement. One fact, in the sentences that make it usable:
+ * what the encoding is, where to read it, what an object slot takes — and, from
+ * REQ-1498, what an ARRAY slot takes, which is the other half of the same trap.
+ *
+ * The array half is conditional on the method actually having one, because a
+ * method with no array parameter would be told about a slot it does not have.
+ * The predicate is the same one `wireEncoding` walks, so the sentence and the
+ * slot list cannot disagree about which methods it applies to.
  */
-function perMethodNote(): string {
-  return (
+function perMethodNote(hasArraySlot: boolean): string {
+  const objectHalf =
     'Arguments are POSITIONAL and unwrapped — figpea_call({group, method, args}) takes args in the order of ' +
     'wire.args. An object-valued parameter IS its positional slot: pass its CONTENTS flat, never an envelope ' +
-    "keyed by the parameter's name."
+    "keyed by the parameter's name.";
+  if (!hasArraySlot) return objectHalf;
+  // ⛔ The position is named from the slot's OWN index, never from the parameter
+  // name: `ops` is a declaration, and an agent that has just read `callAs`
+  // naming it is exactly the reader this sentence exists for.
+  return (
+    `${objectHalf} ` +
+    'An array- or matrix-valued parameter IS its positional slot too: pass the array itself as ONE element of ' +
+    'args at that slot\'s own index (args[0] for the first parameter, args[1] for the second, and so on) — the ' +
+    'bare array, never an object wrapping it and never a {key: …} envelope named after the parameter. A slot listed ' +
+    'in wire.args with type "array" or "matrix" is filled with the array itself; wire.args[i].index tells you which ' +
+    'args[i] it is. If your host cannot send a nested value at all, a long payload can travel as a JSON file instead ' +
+    '(see opsFile on the generated tool, or _opsFile on figpea_call).'
   );
 }
 
@@ -110,6 +135,49 @@ function isSchema(value: unknown): value is { type: string; required: boolean; s
 function declaredContents(schema: { shape?: Record<string, unknown> }): string[] | undefined {
   if (schema.shape === undefined || schema.shape === null || typeof schema.shape !== 'object') return undefined;
   return Object.keys(schema.shape);
+}
+
+const ARRAY_LIKE_TYPES = new Set(['array', 'matrix']);
+
+/** Is this slot's declared type one whose positional slot holds the value
+ *  itself? Shared by the note's predicate, the per-slot fields and full mode's
+ *  line, so the three cannot disagree about which slots the rule covers. */
+function isArrayLike(type: string): boolean {
+  return ARRAY_LIKE_TYPES.has(type);
+}
+
+/**
+ * The worked payload for one array slot: an array literal rendered from THAT
+ * slot's own declared `of` shape, so the example cannot describe an element
+ * shape the manifest does not declare (and is right for free when the element
+ * gains a field).
+ *
+ * `…` marks a placeholder for the agent to fill; a schema this module cannot
+ * read degrades to a bare `[…]`, which still says "the array itself".
+ */
+function renderArrayPayload(schema: { of?: { shape?: Record<string, unknown> } } | undefined): string {
+  const shape = schema?.of?.shape;
+  if (!shape || typeof shape !== 'object') return '[…]';
+  const inner = Object.entries(shape)
+    .slice(0, 4)
+    .map(([key, sub]) => {
+      const type = (sub as { type?: unknown })?.type;
+      // A nested object/array renders as `…`: the claim being made is about the
+      // slot being the array, not about the depth of its elements.
+      if (type === 'object' || type === 'array' || type === 'matrix') return `"${key}": …`;
+      if (type === 'string') return `"${key}": "…"`;
+      if (type === 'number') return `"${key}": 0`;
+      if (type === 'boolean') return `"${key}": false`;
+      return `"${key}": …`;
+    })
+    .join(', ');
+  return `[{ ${inner} }]`;
+}
+
+/** The array half of `callNames`: the parameter name suffixed, because the bare
+ *  declared name is the thing that reads like a keyword argument. */
+function arrayCallName(name: string): string {
+  return `${name}Array`;
 }
 
 /**
@@ -139,6 +207,7 @@ export function wireEncoding(
 
   const args: WireArg[] = [];
   const callNames: string[] = [];
+  let hasArraySlot = false;
   for (const [index, [name, raw]] of entries.entries()) {
     if (!isSchema(raw)) {
       // A partially-structured map: the positional ORDER is still known from
@@ -165,6 +234,13 @@ export function wireEncoding(
         args.push(arg);
         continue;
       }
+    } else if (isArrayLike(raw.type)) {
+      hasArraySlot = true;
+      arg.payload = renderArrayPayload(raw as { of?: { shape?: Record<string, unknown> } });
+      arg.notThisArray = `{ ${JSON.stringify(name)}: ${arg.payload} }`;
+      callNames.push(arrayCallName(name));
+      args.push(arg);
+      continue;
     }
     callNames.push(name);
     args.push(arg);
@@ -173,7 +249,7 @@ export function wireEncoding(
   return {
     encoding: 'positional',
     callAs: label ? `${label}(${callNames.join(', ')})` : `(${callNames.join(', ')})`,
-    note: perMethodNote(),
+    note: perMethodNote(hasArraySlot),
     args,
   };
 }
@@ -210,5 +286,40 @@ export function namedKeyEncodingLine(descriptor: { params?: unknown } | undefine
   return (
     'Encoding: parameters are NAMED here — pass them as this tool\'s own keys, and an object-valued ' +
     `parameter takes its CONTENTS under its key: ${correct} — never a second copy of the key: ${doubled}.`
+  );
+}
+
+/**
+ * REQ-1498 — the ARRAY half of the same lesson, for the lane that has no
+ * `figpea_describe` to ask, derived from the SAME `wireEncoding` walk the
+ * compact lane's `wire` key is rendered from.
+ *
+ * ⚠️ LOAD-BEARING, and structurally so: `namedKeyEncodingLine` above returns
+ * `undefined` whenever no slot declares an object `shape`, which is EVERY
+ * array/matrix slot — so `layer.batch` got nothing from it and would still get
+ * nothing after a `wireShape`-only change, leaving the defect alive in the very
+ * lane that is the AC-2 calling convention. This function is the other half, and
+ * `tools.ts` pushes it BESIDE `namedKeyEncodingLine`, so one derivation feeds
+ * both lanes and a method with both an object and an array slot gets both lines.
+ *
+ * Emitted only for a method declaring at least one array/matrix parameter: for
+ * a method of scalars and objects the existing line already says everything, and
+ * a blank line in every generated description is noise.
+ *
+ * The sentence is the compact lane's `note` VERBATIM — asserted by
+ * `req1498DescribeEncoding.test.ts` — so an agent that learned the rule from
+ * `figpea_describe` and an agent that learned it from `tools/list` read one
+ * wording, not two that can drift.
+ */
+export function arraySlotEncodingLine(descriptor: { params?: unknown } | undefined): string | undefined {
+  const wire = wireEncoding(descriptor);
+  if (!wire) return undefined;
+  const arrayArg = wire.args.find((arg) => arg.payload !== undefined);
+  if (!arrayArg) return undefined;
+  return (
+    `${wire.note} ` +
+    `In this tool's own keys, ${arrayArg.name} takes the array itself: { ${JSON.stringify(arrayArg.name)}: ${arrayArg.payload} } — ` +
+    `never a second copy of the key: { ${JSON.stringify(arrayArg.name)}: { ${JSON.stringify(arrayArg.name)}: … } }. ` +
+    'To keep a long payload out of the call entirely, pass opsFile instead: the absolute path of a JSON file whose content is that array.'
   );
 }

@@ -1214,19 +1214,30 @@ describe('REQ-1280 — the flag composes with the rest of the compact path', () 
     }
   });
 
-  it('a NON-JSON string at the same positions is still forwarded, and no TypeError escapes the handler', async () => {
-    // The `in`-operator hazard is still LIVE for a value the escape hatch
-    // cannot parse — a plain string does not look like JSON, so REQ-1318's
-    // narrow guard leaves it alone and it reaches the tab as the string it is.
-    // This row is where the original hardening claim actually has to hold, and
-    // it is kept verbatim in substance: the handler must not throw, and the
-    // tab's own answer must come back as a normal envelope (compact relays it
-    // with REQ-1268's shape-hint suffix appended).
+  it('a NON-JSON string at the same positions is still forwarded where this server has no opinion — and no TypeError escapes the handler', async () => {
+    // DELIBERATE RE-PIN, REQ-1498. This row used to assert that a bare,
+    // non-JSON-looking string at a declared `object` position "is still
+    // forwarded". REQ-1498 changes exactly that: where the manifest DECLARES a
+    // `filePath` key in that object's shape, a bare string is now refused
+    // pre-flight, naming the key it wanted and spending zero round trips. That
+    // is the requirement (AC-6 — a bare path must not come back `ok:true`), and
+    // it is not a regression of the editor's own answer: `validateArgs.ts:166`
+    // refuses a string at a declared object position too, so the call was never
+    // going to be accepted. It now fails free instead of after a round trip.
+    //
+    // ⛔ THE CLAIM THAT MATTERS IS UNCHANGED AND STILL PINNED FIRST: the
+    // `in`-operator hazard. The `in` operator REJECTS a primitive, so any string
+    // that reaches these blocks with an object slot due must not throw. With a
+    // manifest in hand REQ-1498's rule now intercepts the bare string before
+    // the guard — so the route that still exercises it is the no-manifest one,
+    // where this server takes no opinion at all and the value is forwarded
+    // exactly as it always was. That is the same branch AC-1's relay row above
+    // already uses, and it is the honest place for the hardening claim to live.
     for (const call of [
       { group: 'session', method: 'openFile', args: ['plain string'], message: 'input must be object (got string)' },
       { group: 'layer', method: 'create', args: ['image', 'plain string'], message: 'props must be object (got string)' },
     ]) {
-      const { stub, captured } = makeStub();
+      const { stub, captured } = makeStub({ deliverManifest: undefined });
       const client = await connect(stub, 'compact');
       const result = await callToolJson(client, 'figpea_call', { group: call.group, method: call.method, args: call.args });
       expect(captured, call.method).toHaveLength(1);
@@ -1236,6 +1247,37 @@ describe('REQ-1280 — the flag composes with the rest of the compact path', () 
       // envelope, so asserting the real editor message also asserts no throw.
       expect(result.code, call.method).not.toBe('non_envelope');
       expect(result.message, call.method).toContain(call.message);
+    }
+
+    // And the re-pinned half, where the manifest IS in hand. Two arms, because
+    // the rule reports the VALUE and the site picks the answer: a string that
+    // names a file that IS there gets the wrong-shape refusal naming the key it
+    // wanted, and a string that is not a file at all gets the site's own
+    // missing-file answer. Both spend zero round trips.
+    for (const [group, method, args, code] of [
+      ['session', 'openFile', ['plain string'], 'open_failed'],
+      ['layer', 'create', ['image', 'plain string'], 'invalid_image_source'],
+    ] as Array<[string, string, unknown[], string]>) {
+      const { stub, captured } = makeStub();
+      const client = await connect(stub, 'compact');
+      const result = await callToolJson(client, 'figpea_call', { group, method, args });
+      expect(result.ok, method).toBe(false);
+      expect(result.code, method).toBe(code);
+      expect(result.message, method).toBe(`file not found or not readable: ${String(args[args.length - 1])}`);
+      expect(captured, method).toHaveLength(0);
+    }
+    for (const [group, method, args, real] of [
+      ['session', 'openFile', ['REPLACE'], tempImageFile()],
+      ['layer', 'create', ['image', 'REPLACE'], tempImageFile()],
+    ] as Array<[string, string, unknown[], string]>) {
+      const resolved = args.map((a) => (a === 'REPLACE' ? real : a));
+      const { stub, captured } = makeStub();
+      const client = await connect(stub, 'compact');
+      const result = await callToolJson(client, 'figpea_call', { group, method, args: resolved });
+      expect(result.ok, method).toBe(false);
+      expect(result.code, method).toBe('invalid_params');
+      expect(result.message, method).toContain('filePath');
+      expect(captured, method).toHaveLength(0);
     }
   });
 

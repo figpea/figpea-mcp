@@ -31,6 +31,12 @@ const REAL_CONTRACT_TOOL_EXAMPLES = [
   // all real v3 contract tools (export group's layer/artboard methods).
   'export_layer',
   'export_artboard',
+  // REQ-1498: the generated `layer.batch` tool, named in the README's new
+  // `opsFile` section as the full-mode lane that takes the payload-from-file
+  // key. A real v3 contract tool — driven live by
+  // src/req1498BatchOpsFile.test.ts's full-mode rows, which would fail if the
+  // name were not registered.
+  'layer_batch',
 ];
 // REQ-772 AC-5 — the known-slow methods whose raised defaults the README's
 // "Call timeouts" section documents. All six are real contract tools.

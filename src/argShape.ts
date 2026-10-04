@@ -622,6 +622,102 @@ export function findFilePathEnvelopeMismatch(
 }
 
 /* ------------------------------------------------------------------ *
+ * REQ-1498 — the SINGULAR wrong-shape family: a bare local path where an
+ * OBJECT was due.
+ *
+ * The incident (card REQ-1498): `figpea_call({group:'session',
+ * method:'openFile', args:['/abs/path/x.fp']})` reported success while
+ * opening nothing. Walked through this server, EVERY pre-flight above
+ * declines a string at an object slot — `applyStructuredStringJson` skips it
+ * (not JSON-looking), `findFilePathEnvelopeMismatch` needs a plain object
+ * (see the `positionalLength !== 1` / `isPlainObject` guards above), and
+ * Rule C fires only on a JSON-LOOKING string — so the path was forwarded
+ * verbatim and the `ok:true` was the TAB's answer relayed back.
+ *
+ * ⛔ THE DECLINE SET IS THE RULE. Every guard below is the conservative
+ * direction, because a false rejection of a call the editor accepts is the
+ * expensive mistake (the standing rule at the top of this module):
+ *
+ *  1. **A declared `filePath` to have a name to give.** Fires only where a
+ *     TOP-LEVEL `object` param's declared `shape` contains `filePath`. That
+ *     is derived from the manifest, so `session.openFile`, `layer.create`'s
+ *     `props`, `layer.setImageFill`'s `source` and any future method
+ *     published that way are covered with no edit here — and a method whose
+ *     object has no `filePath` has nothing this rule could say, so it is
+ *     declined rather than answered about the wrong thing.
+ *  2. **A plain STRING**, non-blank, and not JSON-looking. REQ-1318's Rule C
+ *     owns the JSON-looking case above and must stay the single answer to
+ *     it; `null`/`undefined` and every non-string decline outright.
+ *
+ * `valueAt` is a lookup rather than a positional array because the two lanes
+ * name a parameter's value differently — `args[i]` in compact mode, the
+ * parameter's own key in full mode — and this rule must not have to know
+ * which one it is in.
+ * ------------------------------------------------------------------ */
+
+/**
+ * The explanation for a bare path sent where an object was due. ⛔ IT NEVER
+ * QUOTES A FETCH FAILURE and never claims a file was opened, for the same
+ * reason `filePathEnvelopeHint` above does: nothing was fetched, because
+ * nothing was translated.
+ */
+function singularFilePathHint(path: string): string {
+  return (
+    `A bare string arrived where ${path}'s object belongs, and it reads as a local file path — this method's own ` +
+    `declaration lists "${FILE_PATH_KEY}" among that object's keys. This server reads "${FILE_PATH_KEY}" straight out ` +
+    `of the object, so a bare string leaves nothing to translate and the path reaches the editor where it expects a ` +
+    `URL. Retrying this shape fails identically — the argument is what has to change, not the error. ` +
+    `Send the object with "${FILE_PATH_KEY}" among its keys, e.g. {"${FILE_PATH_KEY}": "<absolute path>"}.`
+  );
+}
+
+/**
+ * Finds a bare local path sitting where a `filePath`-bearing object was due, or
+ * `undefined` when this call has no opinion — which includes every call the
+ * editor accepts.
+ *
+ * It reports `offendingValue` (the path the caller sent) so the ONE site that
+ * already does I/O can answer the truthful thing in each case: the site's own
+ * missing-file code when the file is not there, and this server's
+ * `invalid_params` when it is. See `ArgShapeMismatch.offendingValue` for why
+ * that verdict cannot live in here.
+ *
+ * @param paramSchemas the call's declared param schemas, keyed by param name
+ * @param valueAt      reads the value sent for a param, in whichever naming
+ *                     this lane uses
+ * @param pathFor      renders a param name as the path this lane names it
+ *                     (`args[0]` in compact mode, the bare name in full mode)
+ */
+export function findSingularFilePathMismatch(
+  paramSchemas: Record<string, ParamSchemaLike> | undefined,
+  valueAt: (paramName: string) => unknown,
+  pathFor: (paramName: string) => string,
+  budget: Budget = { nodes: 0 },
+): ArgShapeMismatch | undefined {
+  if (!paramSchemas) return undefined;
+  for (const [paramName, schema] of Object.entries(paramSchemas)) {
+    if (budget.nodes++ > MAX_NODES) return undefined;
+    // (1) a declared object param whose own shape has a `filePath` to name.
+    if (schema?.type !== 'object') continue;
+    if (!Object.prototype.hasOwnProperty.call(schema.shape ?? {}, FILE_PATH_KEY)) continue;
+    // (2) a plain, non-blank, non-JSON-looking string.
+    const value = valueAt(paramName);
+    if (typeof value !== 'string') continue;
+    if (value.trim() === '') continue;
+    if (looksLikeJsonLiteral(value)) continue;
+    const path = pathFor(paramName);
+    return {
+      path,
+      expected: `the object itself at this position, with "${FILE_PATH_KEY}" as one of its own keys`,
+      got: describeValue(value),
+      hint: singularFilePathHint(path),
+      offendingValue: value,
+    };
+  }
+  return undefined;
+}
+
+/* ------------------------------------------------------------------ *
  * The create()-prop derivation, for the RELAY-SIDE half (REQ-1444 AC-4).
  *
  * `layer.create` accepts a `style` PROP — geometry and appearance nested one
