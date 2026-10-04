@@ -1,6 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "fs";
-import { resolve } from "path";
+// `node:`-prefixed, like every other file in `src/`. REQ-1394 AC-6's stand-alone
+// scan exempts Node builtins by that prefix only, so a bare `fs`/`path` reads as an
+// undeclared dependency and reds the guard for a specifier that is not one (fixed
+// by the 2026-10-04 janitor mcp_vitest batch, not by loosening the guard).
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 /**
  * REQ-1396 AC-1 — `figpea-mcp/README.md` must not claim a mandatory manual

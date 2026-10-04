@@ -75,8 +75,28 @@ describe('REQ-1457 — the status example shows the build identity the server ac
     // Every key the example shows is one this REQ or a shipped REQ really
     // publishes. A typo here would teach a reader to read for a field that
     // never arrives, which is the whole failure this file exists to prevent.
+    //
+    // REQ-1492 (c919286) added `bridgeSlots`, `activeConnectionId`, `tab` and
+    // `connections` to the payload AND to this example in the same change, so the
+    // declared set grows here exactly as it does in
+    // `req1457BuildStatus.test.ts`. It stays exact — the example dropping a
+    // shipped field, or naming one the server never returns, still fails.
     expect(Object.keys(example).sort()).toEqual(
-      ['build', 'buildStale', 'connection', 'contractVersion', 'port', 'tabConnected', 'token', 'toolCount', 'url'].sort(),
+      [
+        'build',
+        'buildStale',
+        'connection',
+        'contractVersion',
+        'port',
+        'tabConnected',
+        'token',
+        'toolCount',
+        'url',
+        'bridgeSlots',
+        'activeConnectionId',
+        'tab',
+        'connections',
+      ].sort(),
     );
   });
 

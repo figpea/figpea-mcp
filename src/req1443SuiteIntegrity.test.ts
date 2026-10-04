@@ -116,6 +116,23 @@ const BASELINE_TEST_FILES = [
   'req1457BuildStatus.test.ts',
   'req1457ReadmeBuild.test.ts',
   'req1457TimeoutBuildStamp.test.ts',
+  // REQ-1396's suite, added to this baseline by the same rule the note above
+  // states (2026-10-04, janitor mcp_vitest): a new suite must EXTEND the
+  // baseline, never bypass it. REQ-1396 landed it (5433a45) without touching
+  // this file, so AC-3's "adds no suite beyond the baseline" gate went red on a
+  // correct addition. Measured at this tip: 15 declarations, 0 skip/only
+  // constructs, so it changes no other pin here.
+  'req1396ReadmePairingCopy.test.ts',
+  // REQ-1492's four suites, added to this baseline by the same rule the note
+  // above states (2026-10-04, janitor mcp_vitest) and for the same reason: a new
+  // suite must EXTEND the baseline, never bypass it. REQ-1492 landed them
+  // (c919286) without touching this file, so the gate went red on a correct
+  // addition. Measured at this tip: 14 + 12 + 14 + 13 = 53 declarations, 0
+  // skip/only constructs across all four, so they change no other pin here.
+  'req1492BridgeSlots.test.ts',
+  'req1492BridgeSlotsCli.test.ts',
+  'req1492ReadmeSlots.test.ts',
+  'req1492Status.test.ts',
   'req870.test.ts',
   'skillFetch.test.ts',
   'skillProvenance.test.ts',

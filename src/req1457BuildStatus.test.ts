@@ -195,14 +195,32 @@ describe('REQ-1457 AC-7 — a build that is not the one recorded reads stale', (
 
 describe('REQ-1457 AC-5 — the six pre-existing fields keep their names and meanings', () => {
   for (const toolMode of TOOL_MODES) {
-    it(`the key set in ${toolMode} mode is the old six plus connection, build and buildStale`, async () => {
+    it(`the key set in ${toolMode} mode is the old six plus every field a shipped REQ declared`, async () => {
       const client = await connectedClient(stubBridge(), { toolMode });
       const s = await statusOf(client);
       // EXACT, not `toContain`: the point of this assertion is that a key
       // nobody declared still fails. The collection grows on purpose here, and
-      // it grows by exactly two named fields.
+      // it grows by exactly the named fields below.
+      //
+      // This REQ added `connection` (REQ-1394) and `build`/`buildStale`.
+      // REQ-1492 (c919286) added `bridgeSlots`, `activeConnectionId`, `tab` and
+      // `connections` — four more additive keys, each documented in the tool
+      // description and each already re-pinned in REQ-1394's own copy of this
+      // exact assertion (`req1394StatusDiagnosis.test.ts`), which goes green with
+      // them. Declaring them here keeps this row the mechanical net it was
+      // written to be; it stays exact, so a future removal, a rename, or a key
+      // nobody declared still fails. Do not loosen it to `toContain`.
       expect(Object.keys(s).sort(), `status key set in ${toolMode} mode`).toEqual(
-        [...OLD_KEYS, 'connection', 'build', 'buildStale'].sort(),
+        [
+          ...OLD_KEYS,
+          'connection',
+          'build',
+          'buildStale',
+          'bridgeSlots',
+          'activeConnectionId',
+          'tab',
+          'connections',
+        ].sort(),
       );
     });
   }
