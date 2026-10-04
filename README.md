@@ -47,9 +47,15 @@ Optional: the `FIGPEA_EDITOR_URL` env var and `--port=<n>` flag override the edi
 
 ## How pairing works
 
-The server binds a bridge on `127.0.0.1:<port>` — loopback only, never a public interface — and the editor tab connects back over that localhost WebSocket carrying the token (`?agent=1&bridgePort=…&bridgeToken=…`). One connected tab at a time: the newest connection always wins over a stale one.
+The server binds a bridge on `127.0.0.1:<port>` — loopback only, never a public interface — and the editor tab connects back over that localhost WebSocket carrying the token (`?agent=1&bridgePort=…&bridgeToken=…`). By default the bridge serves **one tab**: a second connection is **refused by name**, with the close reason saying which tab holds the slot, and the tab already paired keeps its socket and keeps serving. Nothing is displaced.
 
 Two different hosts, on purpose. The **bind** is `127.0.0.1` and stays that way: it is a security property, and the listener is IPv4-only. The **host in the URLs the bridge emits** (and in the `bridge listening on …` line it prints) is `localhost`, which is the host your editor tab is itself served from. Matching it puts the tab and the bridge in the same address space, so a `localhost` page talking to a `127.0.0.1` URL — a *cross-hostname* request, and so outside the Local Network Access localhost exemption, preflighted and permission-gated — no longer happens. That matters most for headless and automated browsers, which cannot answer an LNA prompt. The bind is deliberately not widened to `::1` to match: `localhost` resolves to `::1` first, and IPv4 clients still reach it through connection racing.
+
+### Running two tabs at once
+
+Start the bridge with `--bridge-slots=multi` (or `FIGPEA_BRIDGE_SLOTS=multi`) and each tab takes its own **slot** — its own document, its own socket, its own `connectionId`. `status` lists them all, and the `select_tab` tool (registered **only** in this mode) chooses which one subsequent calls address.
+
+These are **several editor tabs, each with its own document**, on one machine, over loopback — not collaborative editing, and nothing shared: a call addressed to one tab never reaches another, and design files still never leave your machine.
 
 ## Mid-session pairing — copy the connection string
 
@@ -76,13 +82,14 @@ Honors `FIGPEA_EDITOR_URL` (default `https://editor.figpea.com`, override for lo
 | Tool | Always present | What it does |
 |------|-----------------|---------------|
 | `open_editor` | yes | Opens/points at an editor tab wired to this bridge. Returns `{port, token, url}`. |
-| `status` | yes | Reports the bridge's port, token and pairing URL (`port`, `token`, `url`), whether a tab is connected, the connected tab's contract version, the live tool count, a `connection` block naming why a tab is not connected (see [Diagnosing a connection](#diagnosing-a-connection)), and WHICH BUILD is answering — a `build` block (`version`, `buildId`, `builtAt`, `servedAt`, `root`) plus a top-level `buildStale` flag (see [Which build is this server running?](#which-build-is-this-server-running)). |
+| `status` | yes | Reports the bridge's port, token and pairing URL (`port`, `token`, `url`), whether a tab is connected, the connected tab's contract version, the live tool count, WHICH TAB it is attached to — a `tab` block (`connectionId`, `origin`, `originSource`, `contractVersion`, `pairedAt`) plus `connections[]` listing every paired tab with its own id, origin, contract version and `active` flag, and `activeConnectionId` — a `connection` block naming why a tab is not connected (see [Diagnosing a connection](#diagnosing-a-connection)), and WHICH BUILD is answering: a `build` block (`version`, `buildId`, `builtAt`, `servedAt`, `root`) plus a top-level `buildStale` flag (see [Which build is this server running?](#which-build-is-this-server-running)). Also `bridgeSlots` (`single` or `multi`) — how this bridge serves tabs. Read `tab.origin` and `tab.contractVersion` before a destructive write: they let you assert you are on the document you expect. |
+| `select_tab` | multi-slot mode only | Chooses which paired tab subsequent calls address: `select_tab({connectionId})`, with the ids `status` lists. Registered **only** when the bridge runs with `--bridge-slots=multi` / `FIGPEA_BRIDGE_SLOTS=multi`, and **absent from `tools/list` on the default single-slot bridge**, where there is nothing to select — a second tab is refused by name instead. Selecting a tab also re-publishes that tab's own contract manifest, so the tools you were given describe the document your next call reaches. |
 | `figpea_skill` | yes | Returns Figpea's agent skill reference (the craft guidance for using `window.figpea` well), sourced from the editor origin's `/agent/skill.md` at startup — works even with no tab paired. The answer names the URL it fetched from: the body is that origin's own build, so when a tab is paired from a different origin or a different build, get *the tab's* skill instead with `figpea.SKILL()` in the tab or `GET <the tab's origin>/agent/skill.md` (the answer says so when a tab is connected). Degrades to a structured `{ok:false, code:"skill_unavailable", message}` (never throws) if the fetch failed or was disabled. |
 | `figpea_call` | compact only | Universal dispatcher — `figpea_call({ group, method, args, _timeoutMs })` calls any `group.method` on the paired tab (see below). |
 | `figpea_describe` | compact only | Returns the contract surface for a group or method — the same `doc`/`params`/`result` the editor's own `describe()` returns, from the manifest this server already holds in memory (no tab round trip). `figpea_describe()` → group index, `{group}` → that group's methods, `{group, method}` → one method's wire shape. Degrades to `{ok:false, code:"describe_unavailable"}` (never throws) when the manifest was never fetched. |
 | `group_method` (e.g. `layer_setPosition`, `canvas_screenshot`, `export_project`) | full mode only | One MCP tool per method in the connected tab's `figpea.describe()` manifest. |
 
-In **compact mode (default)** the server advertises only `open_editor`, `status`, `figpea_skill`, `figpea_call` and `figpea_describe` — 5 tools, ~600 tokens vs ~9,500 tokens, a ~90–95% reduction. In **full mode** (`--mode=full` or `FIGPEA_TOOL_MODE=full`) it advertises `open_editor`, `status`, `figpea_skill` plus every `group_method` contract tool. See [Tool modes & `figpea_call` dispatcher](#tool-modes--figpea_call-dispatcher) below.
+In **compact mode (default)** the server advertises only `open_editor`, `status`, `figpea_skill`, `figpea_call` and `figpea_describe` — 5 tools, ~600 tokens vs ~9,500 tokens, a ~90–95% reduction. In **full mode** (`--mode=full` or `FIGPEA_TOOL_MODE=full`) it advertises `open_editor`, `status`, `figpea_skill` plus every `group_method` contract tool. In **multi-slot mode** (`--bridge-slots=multi`) it advertises one more, `select_tab`, and only then. See [Tool modes & `figpea_call` dispatcher](#tool-modes--figpea_call-dispatcher) below.
 
 Generated tools (full mode) advertise structured parameter types (string / number / boolean / object / array) derived from the connected tab's contract manifest, so type-respecting MCP clients pass objects and arrays through intact.
 
@@ -102,6 +109,10 @@ Every call returns `{ok: true, value}` or `{ok: false, code, message}`. Image-sh
   "tabConnected": false,
   "contractVersion": null,
   "toolCount": 0,
+  "bridgeSlots": "single",
+  "activeConnectionId": null,
+  "tab": null,
+  "connections": [],
   "connection": {
     "lastEvent": "hello_rejected",
     "nextStep": "the pairing token was rejected — re-read token from this status call and open a freshly minted pairing URL; a token from an earlier server run is always stale",
@@ -134,12 +145,38 @@ Read `connection.lastEvent`. `connection.nextStep` is the action that token impl
 | `hello_timeout` | The handshake completed but no `hello` frame arrived within 5 seconds. | the WebSocket handshake completed but no hello frame arrived within 5s — reload the editor tab, and check nothing (a proxy, an extension) is holding the connection open |
 | `hello_rejected` | The pairing token did not match. A token minted by an earlier server run is the usual reason, and this bridge restarts whenever the MCP server restarts. | the pairing token was rejected — re-read token from this status call and open a freshly minted pairing URL; a token from an earlier server run is always stale |
 | `hello_accepted` | A tab completed the handshake. Paired. | a tab is paired — proceed; read tabConnected for live truth |
-| `tab_superseded` | A newer tab completed the handshake and took the connection over. Still paired — this is a healthy state, not a fault. | a newer tab took over the connection — paired, proceed; if you expected the older tab, close the newer one |
+| `slot_refused` | A second tab asked for this bridge's single slot while another held it. The tab already paired is untouched and still serving — nothing was displaced. | another tab already holds this bridge's single slot and is still serving — to pair this one too, close that tab, or restart the bridge with --bridge-slots=multi (or FIGPEA_BRIDGE_SLOTS=multi) |
+| `tab_superseded` | A newer tab completed the handshake and took the connection over. Still paired — this is a healthy state, not a fault. Only reachable when an **older** `figpea-mcp` build is the bridge; a current build refuses instead. | a newer tab took over the connection — paired, proceed; if you expected the older tab, close the newer one |
 | `disconnected` | The paired tab went away after pairing. | the paired tab has gone away — open a fresh pairing URL from this status call to pair again |
 
 That table is authoritative **in both directions**, the same way the per-method timeout table above is: `connection.nextStep` is read from the same map this table is written from, and the package's own test fails if the two ever disagree.
 
-The counters (`tcpConnections`, `upgrades`, `helloAccepted`, `helloRejected`, `supersededCount`) are **per-process**: they cover this MCP server process only, they begin at zero every time it starts, and they are not a historical record — they say nothing about any previous run and are never persisted. `connection.startedAt` is the ISO-8601 instant this run started, and it is how you tell this run's numbers from an earlier one's.
+The counters (`tcpConnections`, `upgrades`, `helloAccepted`, `helloRejected`, `supersededCount`) are **per-process**: they cover this MCP server process only, they begin at zero every time it starts, and they are not a historical record — they say nothing about any previous run and are never persisted. `connection.startedAt` is the ISO-8601 instant this run started, and it is how you tell this run's numbers from an earlier one's. `supersededCount` counts **connections that asked for the serving slot and did not get it** — refused by a current build (`slot_refused`), or displaced by an older one (`tab_superseded`). Pairing a second tab in multi-slot mode is not a supersession and does not touch it.
+
+### Which tab am I talking to
+
+`tabConnected` is one bit, so it cannot say *which* tab answered — and with two tabs paired, "which tab" and "which document" stop being the same question. `status` therefore names the tab it is attached to in a `tab` block and lists every paired tab in `connections[]`:
+
+```json
+{
+  "activeConnectionId": "c1",
+  "tab": {
+    "connectionId": "c1",
+    "origin": "https://editor.figpea.com",
+    "originSource": "handshake",
+    "contractVersion": "2.59.1",
+    "pairedAt": "2026-10-04T11:02:33.114Z"
+  },
+  "connections": [
+    { "connectionId": "c1", "origin": "https://editor.figpea.com", "originSource": "handshake", "contractVersion": "2.59.1", "pairedAt": "2026-10-04T11:02:33.114Z", "active": true },
+    { "connectionId": "c2", "origin": "http://localhost:8080", "originSource": "handshake", "contractVersion": "2.50.0", "pairedAt": "2026-10-04T11:05:12.008Z", "active": false }
+  ]
+}
+```
+
+`tab` is the tab a call is answered for; `activeConnectionId` names it in `connections[]`. Each tab has its own contract version, so two tabs can legitimately differ — which is why `select_tab` re-publishes the *selected* tab's manifest when it moves the pointer, so the tools you hold describe the document your next call reaches. **Assert `tab.origin` and `tab.contractVersion` before a destructive write** rather than assuming which document you are in.
+
+`origin` is the `Origin` header of that tab's WebSocket handshake and **nothing else**. It is never reconstructed from the pairing URL or from `Host`, because a fabricated origin is worse than a missing one when the point is that you can assert it. `originSource` is therefore always present and says which of the two states you have: `handshake` when the browser sent the header, `absent` when it did not. So one payload distinguishes a known origin (`"origin": "https://editor.figpea.com"`), an origin the browser declined to send (`"origin": null, "originSource": "absent"`), and a build too old to publish the field at all (the key is simply absent).
 
 **A wrong port is the one case no token can name, and this is why.** The card's fifth state — a pairing URL pointing at an address nothing is listening on — is defined relative to an address that is *not* the bridge answering your question, so from inside, "no tab was ever opened" and "you used the wrong port" are the same silence. What separates them is the identity published beside the diagnosis: compare the `bridgePort` and `bridgeToken` in the URL you are holding against the `port` and `token` this call returned. If they do not match, you are talking to a run that no longer exists — open a URL minted by a live `status` call.
 
@@ -300,8 +337,12 @@ Do not hardcode today's number: the editor owns the threshold and publishes it, 
 |----------------|--------|---------|------------|
 | `--mode=compact\|full` | `compact` or `full` | `compact` | CLI wins over env |
 | `FIGPEA_TOOL_MODE=compact\|full` | `compact` or `full` (case-insensitive) | `compact` | fallback if no CLI flag |
+| `--bridge-slots=single\|multi` | `single` or `multi` | `single` | CLI wins over env |
+| `FIGPEA_BRIDGE_SLOTS=single\|multi` | `single` or `multi` (case-insensitive) | `single` | fallback if no CLI flag |
 
 Invalid values are ignored (not rejected) with a `stderr` hint — a typo never crashes the stdio channel.
+
+`--bridge-slots` decides how many tabs one bridge serves. `single` is the default and the safe one: a second tab is refused by name and the tab already paired keeps serving. `multi` gives each tab its own slot and its own document, adds the `select_tab` tool, and caps out at 8 paired tabs.
 
 ### When to use full mode
 
@@ -361,7 +402,8 @@ If a value *looks* like JSON but cannot be parsed, and the parameter is declared
 
 - The bridge binds **localhost only** (`127.0.0.1`) — never a public interface. The listener is IPv4-only and stays that way; the `localhost` host in emitted URLs and in the printed banner line is a separate decision, described under *How pairing works*.
 - A **per-run pairing token** is regenerated on every start; a connection without the correct token is closed without ever being relayed.
-- **Single active session** — the newest valid connection always supersedes the previous one.
+- A **single active session by default** — a second valid connection is REFUSED by name rather than displacing the tab already paired, so no session can be silently evicted mid-task. `--bridge-slots=multi` opts into several paired tabs, each with its own slot and document.
+- **One token, several slots, one machine** — a paired connection needs the same per-run token as any other, and multi-slot mode changes which documents are addressable, never who may connect: it is a correctness guard, not an authentication or transport change.
 - At startup, the server performs two GET requests to the editor origin — `/agent/contract.json` (tool definitions) and `/agent/skill.md` (the agent skill reference, backing the `figpea_skill` tool) — to prefetch both before any tab pairs. This reveals only your client IP and startup timing to the editor origin; no usage telemetry is shipped. You can disable both fetches by setting `FIGPEA_DISABLE_CONTRACT_FETCH=1`.
 - The server holds no credentials.
 - Your design files are opened in your own browser tab and **never leave your machine**.
@@ -373,6 +415,8 @@ If a value *looks* like JSON but cannot be parsed, and the parameter is declared
 - `--port=<n>` — binds the bridge server to a specific port.
 - `--mode=compact|full` — selects the tool surface mode (default `compact`; `full` restores all `group_method` tools). See [Tool modes & `figpea_call` dispatcher](#tool-modes--figpea_call-dispatcher).
 - `FIGPEA_TOOL_MODE=compact|full` — environment-variable fallback for `--mode` (same values, case-insensitive). CLI wins over env, both default to `compact`.
+- `--bridge-slots=single|multi` — how many editor tabs this bridge serves (default `single`: a second tab is refused by name and the first keeps serving; `multi` gives each tab its own slot and document, and registers `select_tab`). See [Running two tabs at once](#running-two-tabs-at-once).
+- `FIGPEA_BRIDGE_SLOTS=single|multi` — environment-variable fallback for `--bridge-slots` (same values, case-insensitive). CLI wins over env, both default to `single`.
 
 ## Entitlement boundary
 

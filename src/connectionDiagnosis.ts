@@ -54,6 +54,7 @@ export type ConnectionEvent =
   | 'hello_timeout'
   | 'hello_rejected'
   | 'hello_accepted'
+  | 'slot_refused'
   | 'tab_superseded'
   | 'disconnected';
 
@@ -64,6 +65,7 @@ export const CONNECTION_EVENTS: readonly ConnectionEvent[] = [
   'hello_timeout',
   'hello_rejected',
   'hello_accepted',
+  'slot_refused',
   'tab_superseded',
   'disconnected',
 ] as const;
@@ -96,6 +98,8 @@ export const NEXT_STEP: Readonly<Record<ConnectionEvent, string>> = {
     'the pairing token was rejected — re-read token from this status call and open a freshly minted pairing URL; a token from an earlier server run is always stale',
   hello_accepted:
     'a tab is paired — proceed; read tabConnected for live truth',
+  slot_refused:
+    'another tab already holds this bridge\'s single slot and is still serving — to pair this one too, close that tab, or restart the bridge with --bridge-slots=multi (or FIGPEA_BRIDGE_SLOTS=multi)',
   tab_superseded:
     'a newer tab took over the connection — paired, proceed; if you expected the older tab, close the newer one',
   disconnected:
@@ -225,6 +229,20 @@ export function createConnectionLedger(options?: { startedAt?: string | null }):
           state.helloAccepted++;
           break;
 
+        // REQ-1492 AC-7 — a second connection that asked for this bridge's one
+        // slot and did not get it. It shares `supersededCount` with
+        // `tab_superseded` on purpose, because that counter's published meaning
+        // is now *connections that asked for the serving slot and did not get
+        // it*: refused here, and displaced by an OLDER build of this package,
+        // which is a real and still-reachable outcome in the wild (an old
+        // `figpea-mcp` process plus a current editor tab). Redefining the
+        // counter under its existing name would have been the stealth edit this
+        // file exists to prevent; `tab_superseded` keeps its own meaning and its
+        // byte-identical sentence.
+        case 'slot_refused':
+          state.supersededCount++;
+          break;
+
         case 'tab_superseded':
           state.supersededCount++;
           break;
@@ -286,4 +304,40 @@ export function legacyDiagnosis(tabConnected: boolean): ConnectionDiagnosis {
   // (a superseded-then-closed tab leaves it false).
   if (tabConnected) state.lastEvent = 'hello_accepted';
   return deriveDiagnosis(state);
+}
+
+/**
+ * REQ-1492 — the same fallback for the `connections` block: a bridge that
+ * cannot report its slots gets ONE synthetic entry describing the single tab it
+ * says is connected, rather than a payload with the key missing.
+ *
+ * Every value is the honest one, not the convenient one: `origin: null` with
+ * `originSource: 'absent'` because such a bridge genuinely cannot tell where its
+ * tab came from (never a fabricated one), `contractVersion` whatever the bridge
+ * itself reports — it did report one, so withholding it would be a second lie —
+ * and `pairedAt: null`, because "when did this tab pair" is a fact this bridge
+ * does not have.
+ */
+export function legacyConnections(
+  tabConnected: boolean,
+  contractVersion: string | null = null,
+): Array<{
+  connectionId: string;
+  origin: string | null;
+  originSource: 'handshake' | 'absent';
+  contractVersion: string | null;
+  pairedAt: string | null;
+  active: boolean;
+}> {
+  if (!tabConnected) return [];
+  return [
+    {
+      connectionId: 'c1',
+      origin: null,
+      originSource: 'absent',
+      contractVersion,
+      pairedAt: null,
+      active: true,
+    },
+  ];
 }

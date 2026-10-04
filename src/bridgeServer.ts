@@ -26,11 +26,40 @@ import type { CallFrame, DescribeFrame } from './protocol';
 import { drillManifest, type DescribeFn, type DescribeResultPayload } from './describeDrill';
 import { sessionDirFor, removeSessionDir } from './returnPath';
 
-/** Distinct WebSocket close codes for the two server-initiated close paths
+/** Distinct WebSocket close codes for the server-initiated close paths
  * (AC-3, OQ-3) — both >=4000 (RFC 6455 private-use range), unambiguously
  * distinct from normal/protocol closes (1000-2999). */
 export const CLOSE_CODE_BAD_TOKEN = 4001;
 export const CLOSE_CODE_SUPERSEDED = 4002;
+
+/** REQ-1492 — how many editor tabs one bridge can hold at once in multi-slot
+ * mode. A bound on per-tab sockets, pending calls and one `describe` drill each,
+ * not an AC and not a policy: past it a connection is refused exactly as a
+ * single-slot bridge refuses a second one, with the cap named in the reason. */
+export const MAX_SLOTS = 8;
+
+/** REQ-1492 — how many tabs a bridge serves. `single` (the default) is the
+ * pre-existing one-tab flow, now with a REFUSAL where it used to have a
+ * silent takeover; `multi` gives each tab its own slot and its own document. */
+export type BridgeSlotMode = 'single' | 'multi';
+
+/** REQ-1492 — one paired tab, as `status` publishes it (AC-6).
+ *
+ * `origin` is the WebSocket upgrade request's `Origin` header and NOTHING else:
+ * the bridge never reconstructs an origin from the pairing URL or `Host`,
+ * because a fabricated origin is worse than a missing one when the whole point
+ * is that a caller can *assert* it. `originSource` is therefore always present
+ * and says which of the two states the value carries — a caller distinguishes
+ * "the browser sent it", "the browser declined to send it", and "this build
+ * does not publish the field at all" from one payload. */
+export interface BridgeConnection {
+  connectionId: string;
+  origin: string | null;
+  originSource: 'handshake' | 'absent';
+  contractVersion: string | null;
+  pairedAt: string;
+  active: boolean;
+}
 
 /** How long a freshly connected socket has to send its `hello` frame before
  * being closed for inactivity — generous, since every real client sends
@@ -53,6 +82,10 @@ export interface StartBridgeServerOptions {
   /** Bind port; omit (or 0) for an OS-assigned ephemeral port (the normal,
    * parallel-run-safe case — plan §3). */
   port?: number;
+  /** REQ-1492: `single` (default) serves one tab and REFUSES a second with a
+   * named reason; `multi` gives each tab its own slot. Resolved upstream by
+   * `cli.ts`'s `resolveBridgeSlots`, so an invalid value can never reach here. */
+  slots?: BridgeSlotMode;
 }
 
 export interface BridgeServerHandle {
@@ -64,6 +97,19 @@ export interface BridgeServerHandle {
   readonly token: string;
   /** Whether a tab is currently connected and past the token gate. */
   isTabConnected(): boolean;
+  /** REQ-1492: which slot mode this bridge is serving — `single` (the
+   * default) or `multi`. Read by `status` and by the mode gate on
+   * `select_tab`; the value cannot change without a restart. */
+  getSlotMode(): BridgeSlotMode;
+  /** REQ-1492: every paired tab, in pair order, each with its own id, origin
+   * (`null` when the browser sent no `Origin` header, with `originSource`
+   * saying so), contract version and whether it is the active one. */
+  getConnections(): BridgeConnection[];
+  /** REQ-1492: moves the active pointer to a paired tab AND re-publishes THAT
+   * tab's cached manifest, so the registered tool surface describes the tab
+   * calls are about to reach (AC-4). Rejects by name for an unknown id, naming
+   * the live ones — silent fallback to the active tab is the defect class. */
+  selectConnection(connectionId: string): Promise<void>;
   /**
    * REQ-1394: what this bridge observed about the pairing attempt, as an
    * actionable token plus the counters behind it. Per-process — it says
@@ -80,10 +126,14 @@ export interface BridgeServerHandle {
   /** The connected tab's most recently reported `figpea.version`, or `null`
    * if no tab has ever reported one. */
   getContractVersion(): string | null;
-  /** Relays a call to the connected tab, resolving with its structured
+  /** Relays a call to the paired tab, resolving with its structured
    * `{ok,...}` result, correlated by a server-assigned id. Rejects if no tab
-   * is connected, or once `timeoutMs` elapses with no matching result. */
-  callTab(group: string, method: string, args: unknown[], timeoutMs?: number): Promise<unknown>;
+   * is connected, or once `timeoutMs` elapses with no matching result.
+   *
+   *  REQ-1492: `connectionId` addresses a specific paired tab; omitting it is
+   *  the active one. An unknown or closed id REJECTS naming the live ids — it
+   *  never falls back to the active tab. */
+  callTab(group: string, method: string, args: unknown[], timeoutMs?: number, connectionId?: string): Promise<unknown>;
   /** Shuts down the listener and rejects any still-pending calls. */
   close(): Promise<void>;
   /** REQ-1017: returns a loopback URL for the given absolute filePath (primary endpoint). */
@@ -96,6 +146,33 @@ interface PendingCall {
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
   timer: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * REQ-1492 — one paired editor tab, and everything that is true only of IT.
+ *
+ * `contractVersion`, `pendingDescribe` and the pending-call map used to be
+ * module-scoped, which is safe for exactly one tab and silently wrong for two:
+ * a second tab overwrote the first's reported contract version and stole its
+ * in-flight `describe` reply. Per-slot state is the whole fix, and it is why
+ * "which tab am I addressing" and "whose schema am I holding" can move together.
+ */
+interface Slot {
+  /** `c1`, `c2`, … assigned in pair order and stable for the connection's life. */
+  id: string;
+  socket: WebSocket;
+  origin: string | null;
+  originSource: 'handshake' | 'absent';
+  contractVersion: string | null;
+  pairedAt: string;
+  /** Pair order, so promotion on close picks the LONGEST-paired survivor. */
+  pairedSeq: number;
+  /** This tab's drilled manifest, cached so selecting it needs no round trip. */
+  manifest: unknown;
+  pendingDescribe: ((payload: DescribeResultPayload) => void) | undefined;
+  pending: Map<string, PendingCall>;
+  /** The in-flight drill, so a mid-drill `selectConnection` waits for it. */
+  drillPromise: Promise<unknown> | undefined;
 }
 
 /** Starts the localhost-only bridge WebSocket + HTTP file server (plan §3, REQ-1017). */
@@ -271,83 +348,153 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
   }
   const port = (address as { port: number }).port;
 
-  let activeSocket: WebSocket | undefined;
-  let contractVersion: string | null = null;
+  // REQ-1492 — the slot registry. One `Slot` per paired tab, each carrying
+  // everything that used to be process-scoped and therefore could not survive
+  // two tabs honestly: the socket, the contract version it reported, its own
+  // `describe` reply slot, its own pending calls, and the manifest it drilled.
+  // Before this, `contractVersion` and `pendingDescribe` were per-PROCESS, so a
+  // second tab would overwrite the first's reported contract version and steal
+  // the other tab's in-flight `describe` reply (replies carry no correlation
+  // id and are matched by order only — `protocol.ts`).
+  const slots = new Map<string, Slot>();
+  /** Which slot unaddressed calls go to, and whose manifest is published.
+   * The first tab to pair takes it; a later tab never steals it (AC-3). */
+  let activeSlotId: string | undefined;
+  let nextSlotId = 1;
   let nextCallId = 1;
-  const pending = new Map<string, PendingCall>();
   const describeHandlers: Array<(manifest: unknown) => void> = [];
+  const slotMode: BridgeSlotMode = options?.slots === 'multi' ? 'multi' : 'single';
 
-  /** Resolver for the single in-flight `describe` request, if any.
+  function activeSlot(): Slot | undefined {
+    return activeSlotId === undefined ? undefined : slots.get(activeSlotId);
+  }
+
+  function isLive(slot: Slot | undefined): slot is Slot {
+    return slot !== undefined && slot.socket.readyState === WebSocket.OPEN;
+  }
+
+  /** The live slots in pair order — what a refusal reason and a bad-id
+   * rejection both name, so neither can leave a caller guessing. */
+  function liveIds(): string[] {
+    return [...slots.values()].filter(isLive).map((s) => s.id);
+  }
+
+  /** The longest-paired live slot — the successor when the active one leaves. */
+  function longestPaired(): Slot | undefined {
+    let best: Slot | undefined;
+    for (const slot of slots.values()) {
+      if (!isLive(slot)) continue;
+      if (best === undefined || slot.pairedSeq < best.pairedSeq) best = slot;
+    }
+    return best;
+  }
+
+  function publishManifest(manifest: unknown): void {
+    for (const handler of describeHandlers) handler(manifest);
+  }
+
+  /** How a slot is named inside a refusal reason: its origin when the browser
+   * sent one, and the honest "no Origin header" wording when it did not — never
+   * a reconstructed origin in a message a reader will act on. */
+  function describeOrigin(slot: Slot): string {
+    return slot.origin ?? 'no Origin header';
+  }
+
+  /** Socket → its slot, so the `close` handler can find the bookkeeping this
+   * socket created. A socket that was refused or rejected never appears here,
+   * which is what keeps its close from recording a second, wrong event. */
+  const slotForSocket = new Map<WebSocket, Slot>();
+
+  /** REQ-1492 AC-7 — refuses one connection, by name, displacing nothing.
    *
-   * One slot, not a map: `describe_result` frames carry no correlation id and
-   * no selector echo (see `protocol.ts`), so a reply can only be matched to
-   * its request by ordering. The drill awaits each frame before sending the
-   * next, which keeps this slot occupied by at most one request at a time. */
-  let pendingDescribe: ((payload: DescribeResultPayload) => void) | undefined;
+   * `4002` is reused deliberately: it is the code the editor already renders as
+   * a terminal "another tab holds this" state, and a NEW code with no editor
+   * branch would land on the wrong-cause "This one needs you" card with a
+   * Connect button that re-dials into the same refusal. The reason string is
+   * truncated to the RFC 6455 123-byte payload limit so a long origin cannot
+   * turn the close into a protocol error. */
+  function refuseSocket(socket: WebSocket, reason: string): void {
+    const trimmed = reason.length > 120 ? `${reason.slice(0, 117)}...` : reason;
+    ledger.record('slot_refused', { closeCode: CLOSE_CODE_SUPERSEDED, closeReason: trimmed });
+    socket.close(CLOSE_CODE_SUPERSEDED, trimmed);
+  }
 
-  function rejectAllPending(reason: unknown): void {
-    for (const entry of pending.values()) {
+  function rejectSlotPending(slot: Slot, reason: unknown): void {
+    for (const entry of slot.pending.values()) {
       clearTimeout(entry.timer);
       entry.reject(reason);
     }
-    pending.clear();
+    slot.pending.clear();
+  }
+
+  function rejectAllPending(reason: unknown): void {
+    for (const slot of slots.values()) rejectSlotPending(slot, reason);
   }
 
   function sendFrame(socket: WebSocket, frame: unknown): void {
     socket.send(JSON.stringify(frame));
   }
 
-  function handleTabFrame(data: WebSocket.RawData): void {
-    let frame: any;
-    try {
-      frame = JSON.parse(data.toString());
-    } catch {
-      return; // Malformed frame from an already-authenticated tab: drop it, never crash the relay.
-    }
-
-    if (frame?.type === 'describe_result') {
-      contractVersion = typeof frame.version === 'string' ? frame.version : null;
-      const resolve = pendingDescribe;
-      pendingDescribe = undefined;
-      // `manifest` is absent (not null) when the selector missed, so presence
-      // is tested on the parsed frame rather than inferred from the value.
-      resolve?.({
-        hasManifest: Object.prototype.hasOwnProperty.call(frame, 'manifest'),
-        manifest: frame.manifest,
-        version: contractVersion,
-      });
-      return;
-    }
-
-    if (frame?.type === 'result' && typeof frame.id === 'string') {
-      const entry = pending.get(frame.id);
-      if (!entry) return; // Stale/unknown id (e.g. already timed out) -- ignore.
-      pending.delete(frame.id);
-      clearTimeout(entry.timer);
-      if (frame.ok) {
-        entry.resolve({ ok: true, value: frame.value });
-      } else {
-        entry.resolve({ ok: false, code: frame.code, message: frame.message });
+  /** Per-slot frame handler: a `describe_result` and a `result` are only ever
+   * matched against THIS socket's own pending work, which is what lets two tabs
+   * answer simultaneously without either stealing the other's reply. */
+  function makeTabFrameHandler(slot: Slot): (data: WebSocket.RawData) => void {
+    return (data: WebSocket.RawData): void => {
+      let frame: any;
+      try {
+        frame = JSON.parse(data.toString());
+      } catch {
+        return; // Malformed frame from an already-authenticated tab: drop it, never crash the relay.
       }
-    }
+
+      if (frame?.type === 'describe_result') {
+        slot.contractVersion = typeof frame.version === 'string' ? frame.version : null;
+        const resolve = slot.pendingDescribe;
+        slot.pendingDescribe = undefined;
+        // `manifest` is absent (not null) when the selector missed, so presence
+        // is tested on the parsed frame rather than inferred from the value.
+        resolve?.({
+          hasManifest: Object.prototype.hasOwnProperty.call(frame, 'manifest'),
+          manifest: frame.manifest,
+          version: slot.contractVersion,
+        });
+        return;
+      }
+
+      if (frame?.type === 'result' && typeof frame.id === 'string') {
+        const entry = slot.pending.get(frame.id);
+        if (!entry) return; // Stale/unknown id (e.g. already timed out) -- ignore.
+        slot.pending.delete(frame.id);
+        clearTimeout(entry.timer);
+        if (frame.ok) {
+          entry.resolve({ ok: true, value: frame.value });
+        } else {
+          entry.resolve({ ok: false, code: frame.code, message: frame.message });
+        }
+      }
+    };
   }
 
-  /** Issues one `describe` frame on `socket` and resolves with its reply.
+  /** Issues one `describe` frame on a slot's socket and resolves with its
+   * reply.
    *
-   * Rejects on timeout, and on takeover — if `socket` is no longer the active
-   * one, a superseding tab's drill now owns `pendingDescribe`, and answering
-   * a dead drill would let the two interleave and cross-assign each other's
-   * replies (they are matched only by order). */
-  function describeOnce(socket: WebSocket): DescribeFn {
+   * Rejects on timeout, and on the tab's departure. The resolver lives ON THE
+   * SLOT (REQ-1492), not on the process: one per slot is enough because
+   * `describe_result` frames carry no correlation id and no selector echo (see
+   * `protocol.ts`), so a reply can only be matched to its request by ordering —
+   * and two tabs each holding their own resolver is what stops one tab's drill
+   * from consuming the other's reply. The drill awaits each frame before
+   * sending the next, which keeps each slot occupied by at most one request. */
+  function describeOnce(slot: Slot): DescribeFn {
     return (selector?: string) =>
       new Promise<DescribeResultPayload>((resolve, reject) => {
-        if (activeSocket !== socket || socket.readyState !== WebSocket.OPEN) {
+        if (!isLive(slot) || slots.get(slot.id) !== slot) {
           reject(new Error('figpea-mcp bridgeServer: tab disconnected before describe completed'));
           return;
         }
 
         const timer = setTimeout(() => {
-          if (pendingDescribe === settle) pendingDescribe = undefined;
+          if (slot.pendingDescribe === settle) slot.pendingDescribe = undefined;
           reject(
             new Error(
               // REQ-1457 AC-4 — APPENDED after the existing text, never
@@ -367,28 +514,51 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
           resolve(payload);
         };
 
-        pendingDescribe = settle;
+        slot.pendingDescribe = settle;
         // `selector` is omitted entirely for the bare index call, keeping
         // that frame byte-identical to the pre-REQ-181 one.
         const frame: DescribeFrame = selector === undefined ? { type: 'describe' } : { type: 'describe', selector };
-        sendFrame(socket, frame);
+        sendFrame(slot.socket, frame);
       });
   }
 
-  /** Drills the connected tab's full manifest and publishes it to
-   * `onDescribe` subscribers exactly once per connect (REQ-188). */
-  async function runDescribeDrill(socket: WebSocket): Promise<void> {
-    const manifest = await drillManifest(describeOnce(socket), (message) => console.error(message));
-
-    // A tab that was superseded mid-drill must not publish its stale result
-    // over the newer tab's.
-    if (activeSocket !== socket) return;
-    if (manifest === undefined) return;
-
-    for (const handler of describeHandlers) handler(manifest);
+  /**
+   * Drills one tab's full manifest, caches it ON THE SLOT, and publishes it to
+   * `onDescribe` subscribers — but only when that tab is the one calls are
+   * addressed to (REQ-188's once-per-connect contract, REQ-1492's per-slot one).
+   *
+   * Caching every tab and publishing only the active one is the invariant that
+   * lets `selectConnection` hand subscribers the SELECTED tab's descriptions
+   * without re-drilling: the manifest is already there, keyed on its own slot,
+   * so two tabs on different contract versions can never cross-assign.
+   */
+  async function runDescribeDrill(slot: Slot): Promise<unknown> {
+    const manifest = await drillManifest(describeOnce(slot), (message) => console.error(message));
+    if (manifest === undefined) return undefined;
+    slot.manifest = manifest;
+    // A tab that stopped being the addressed one must not publish its manifest
+    // over the tab that is.
+    if (activeSlotId !== slot.id) return manifest;
+    publishManifest(manifest);
+    return manifest;
   }
 
-  wss.on('connection', (socket: WebSocket) => {
+  /** Runs the drill once per slot and remembers the in-flight promise, so a
+   * `selectConnection` arriving mid-drill waits for THAT drill instead of
+   * starting a second one that would fight it for the slot's single
+   * `describe` resolver. */
+  function startDescribeDrill(slot: Slot): Promise<unknown> {
+    if (slot.drillPromise) return slot.drillPromise;
+    const promise = runDescribeDrill(slot).finally(() => {
+      if (slot.drillPromise === promise) slot.drillPromise = undefined;
+    });
+    slot.drillPromise = promise;
+    return promise;
+  }
+
+  // REQ-1492 — the upgrade request, captured once here: it is the only honest
+  // source of a tab's origin (AC-6) and of nothing else.
+  wss.on('connection', (socket: WebSocket, request: http.IncomingMessage) => {
     socket.on('error', () => {
       // A transport-level error on an individual socket must never crash the
       // bridge or leave an unhandled 'error' rejection; 'close' still fires
@@ -449,54 +619,121 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
       }
 
       sawHello = true;
+
+      // REQ-1492 — the refusal REPLACED the newest-wins takeover (OQ-3). The
+      // takeover closed the incumbent and left `status` reporting
+      // `tabConnected: true`, so the evicted session's next write landed in the
+      // other session's document with nothing saying so. A refusal displaces
+      // nothing: the incumbent keeps its socket, keeps serving, and the refusal
+      // is a named state (`slot_refused`) with the action to take.
+      const holder = longestPaired();
+      if (slotMode === 'single' && holder) {
+        refuseSocket(socket, `slot held by ${holder.id} (${describeOrigin(holder)}) — this bridge serves one tab`);
+        return;
+      }
+      if (slotMode === 'multi' && slots.size >= MAX_SLOTS) {
+        refuseSocket(socket, `all ${MAX_SLOTS} bridge slots are taken (${liveIds().join(', ')}) — close a tab, or restart the bridge`);
+        return;
+      }
+
       ledger.record('hello_accepted');
 
-      // Newest-wins takeover (OQ-3): a second valid-token connection
-      // supersedes the first, which is closed with a distinct code and
-      // logged on this (bridge) side; the client side (T4) flips its own
-      // "agent connected" indicator on receiving this close code.
-      if (activeSocket && activeSocket !== socket && activeSocket.readyState === WebSocket.OPEN) {
-        console.error('[figpea-mcp] bridge: a new tab connection superseded the previous one');
-        // REQ-1394: recorded in the branch that performs the takeover, and it
-        // carries the 4002 the displaced tab is about to be closed with. The
-        // displaced socket's own `close` handler below does NOT record
-        // `disconnected`, because it is no longer the active socket by the
-        // time that fires — so the takeover survives instead of being erased
-        // by the close of the tab it displaced.
-        ledger.record('tab_superseded', {
-          closeCode: CLOSE_CODE_SUPERSEDED,
-          closeReason: 'superseded by a newer tab connection',
-        });
-        activeSocket.close(CLOSE_CODE_SUPERSEDED, 'superseded by a newer tab connection');
-      }
-      activeSocket = socket;
+      const rawOrigin = typeof request.headers.origin === 'string' ? request.headers.origin.trim() : '';
+      const slot: Slot = {
+        id: `c${nextSlotId++}`,
+        socket,
+        // AC-6: the origin is the upgrade request's header and nothing else —
+        // never reconstructed from the pairing URL or `Host`, because a
+        // fabricated origin is worse than a missing one.
+        origin: rawOrigin === '' ? null : rawOrigin,
+        originSource: rawOrigin === '' ? 'absent' : 'handshake',
+        contractVersion: null,
+        pairedAt: new Date().toISOString(),
+        pairedSeq: nextSlotId,
+        manifest: undefined,
+        pendingDescribe: undefined,
+        pending: new Map(),
+        drillPromise: undefined,
+      };
+      slots.set(slot.id, slot);
+      slotForSocket.set(socket, slot);
+      // The first tab to pair is the one calls are addressed to, and a later tab
+      // never steals it (AC-3) — in either mode.
+      if (activeSlotId === undefined) activeSlotId = slot.id;
 
-      socket.on('message', handleTabFrame);
-      void runDescribeDrill(socket);
+      socket.on('message', makeTabFrameHandler(slot));
+      void startDescribeDrill(slot);
     };
 
     socket.on('message', onHelloFrame);
 
     // REQ-1394: the listener finally TAKES the close code, which it previously
-    // discarded at the signature. It records `disconnected` only for the
-    // socket that IS the active one — every server-initiated close (bad token,
-    // hello timeout, takeover) recorded its own token and its own code at the
-    // branch that performed it, so a superseded or rejected socket must not
-    // overwrite that with a generic "disconnected" a few milliseconds later.
+    // discarded at the signature. It records `disconnected` only for the socket
+    // that IS the active one — every server-initiated close (bad token, hello
+    // timeout, refusal) recorded its own token and its own code at the branch
+    // that performed it, so a rejected socket must not overwrite that with a
+    // generic "disconnected" a few milliseconds later.
     socket.on('close', (code: number, reason: Buffer) => {
       clearTimeout(helloTimer);
-      if (activeSocket === socket) {
-        activeSocket = undefined;
-        ledger.record('disconnected', { closeCode: code, closeReason: reason.toString() });
-      }
+      // A socket refused or rejected before pairing never became a slot.
+      const slot = slotForSocket.get(socket);
+      if (!slot) return;
+      slotForSocket.delete(socket);
+      slots.delete(slot.id);
+      // This tab's own in-flight calls are rejected NOW, naming it, rather than
+      // left to time out against a socket that is already gone.
+      rejectSlotPending(slot, new Error(`figpea-mcp bridgeServer: tab ${slot.id} disconnected`));
+
+      if (activeSlotId !== slot.id) return;
+      activeSlotId = undefined;
+      ledger.record('disconnected', { closeCode: code, closeReason: reason.toString() });
+
+      // REQ-1492 — the addressed tab left. Promote the longest-paired survivor
+      // and re-publish ITS cached manifest, so the registered tool surface
+      // describes the tab calls now reach instead of the one that just closed.
+      const successor = longestPaired();
+      if (successor === undefined) return;
+      activeSlotId = successor.id;
+      if (successor.manifest !== undefined) publishManifest(successor.manifest);
     });
   });
 
   return {
     port,
     token,
+    getSlotMode(): BridgeSlotMode {
+      return slotMode;
+    },
+    getConnections(): BridgeConnection[] {
+      return [...slots.values()].map((slot) => ({
+        connectionId: slot.id,
+        origin: slot.origin,
+        originSource: slot.originSource,
+        contractVersion: slot.contractVersion,
+        pairedAt: slot.pairedAt,
+        active: slot.id === activeSlotId,
+      }));
+    },
+    async selectConnection(connectionId: string): Promise<void> {
+      const slot = slots.get(connectionId);
+      if (!isLive(slot)) {
+        // Naming the live ids is the point: silent fallback to the active tab is
+        // the defect class this requirement exists to close.
+        throw new Error(
+          `figpea-mcp bridgeServer: no paired tab ${connectionId} — live connections: ${liveIds().join(', ') || 'none'}`,
+        );
+      }
+      activeSlotId = slot.id;
+      // Moving the pointer alone would leave full-mode tools describing the
+      // PREVIOUSLY active tab while its calls went here — reachable, and exactly
+      // the incident's shape, because its two tabs ran contract 2.59.1 and
+      // 2.50.0. The manifest is keyed on THIS slot, so the two can never
+      // cross-assign.
+      if (slot.manifest === undefined) await startDescribeDrill(slot);
+      if (slot.manifest !== undefined) publishManifest(slot.manifest);
+    },
     isTabConnected(): boolean {
-      return activeSocket !== undefined && activeSocket.readyState === WebSocket.OPEN;
+      return isLive(activeSlot());
     },
     // REQ-1394: a snapshot derived through the one shared derivation, so the
     // token an agent reads is the same token the README documents.
@@ -507,18 +744,34 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
       describeHandlers.push(handler);
     },
     getContractVersion(): string | null {
-      return contractVersion;
+      // The ACTIVE tab's version — identical to the pre-REQ-1492 value whenever
+      // one tab is paired (AC-8), and the meaning AC-6 asks for when two are.
+      return activeSlot()?.contractVersion ?? null;
     },
-    callTab(group: string, method: string, args: unknown[], timeoutMs = DEFAULT_CALL_TIMEOUT_MS): Promise<unknown> {
-      const socket = activeSocket;
-      if (!socket || socket.readyState !== WebSocket.OPEN) {
+    callTab(
+      group: string,
+      method: string,
+      args: unknown[],
+      timeoutMs = DEFAULT_CALL_TIMEOUT_MS,
+      connectionId?: string,
+    ): Promise<unknown> {
+      const slot = connectionId === undefined ? activeSlot() : slots.get(connectionId);
+      if (!isLive(slot)) {
+        if (connectionId !== undefined) {
+          return Promise.reject(
+            new Error(
+              `figpea-mcp bridgeServer: no paired tab ${connectionId} — live connections: ${liveIds().join(', ') || 'none'}`,
+            ),
+          );
+        }
         return Promise.reject(new Error('figpea-mcp bridgeServer: no tab is connected'));
       }
+      const target = slot;
       const id = String(nextCallId++);
       const frame: CallFrame = { type: 'call', id, group, method, args };
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
-          pending.delete(id);
+          target.pending.delete(id);
           // REQ-772 AC-3: a relay timeout is NOT proof the tab failed — the
           // tab keeps executing and the effect (e.g. layer.create) may land
           // anyway. The rejection must say so, so callers check state before
@@ -543,8 +796,8 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
             ),
           );
         }, timeoutMs);
-        pending.set(id, { resolve, reject, timer });
-        sendFrame(socket, frame);
+        target.pending.set(id, { resolve, reject, timer });
+        sendFrame(target.socket, frame);
       });
     },
     getFileUrl(filePath: string): string {

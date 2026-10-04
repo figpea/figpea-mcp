@@ -9,6 +9,10 @@ import WebSocket from 'ws';
 import { startBridgeServer } from './bridgeServer';
 import { createMcpServer } from './mcpServer';
 import { resultToContent, type McpTextContentLike } from './tools';
+// REQ-1492 — the ledger and its pure derivation, driven directly for the one
+// state a current build can no longer produce through the wire (see the state-4
+// re-pin below).
+import { createConnectionLedger, deriveDiagnosis } from './connectionDiagnosis';
 
 /**
  * REQ-1394 T3 — the published payload, driven the way a consumer drives it
@@ -220,6 +224,15 @@ describe('REQ-1394 AC-1 — the five pairing states report pairwise-distinct val
     );
 
     // --- state 4: a newer tab superseded the first one ---
+    // REQ-1492 (deliberate re-pin): on the DEFAULT single-slot bridge a second
+    // tab is now REFUSED rather than taking the slot, so this state is reached
+    // through the one real route that still produces a displacement — a bridge
+    // running an OLDER build of this package, which is exactly why
+    // `tab_superseded` and its sentence stay in the vocabulary. Since that older
+    // build cannot be instantiated here, the token is driven the way the ledger
+    // is meant to be driven (through `record`, which is what `bridgeServer.ts`
+    // calls), and the refusal — the token a caller sees today — is asserted
+    // beside it by `req1492BridgeSlots.test.ts` and `req1492Status.test.ts`.
     const bridgeSuperseded = await liveBridge();
     const supersededClient = await connectedClient(bridgeSuperseded, { toolMode: 'compact' });
     const firstTab = await connectTab(bridgeSuperseded);
@@ -231,12 +244,32 @@ describe('REQ-1394 AC-1 — the five pairing states report pairwise-distinct val
       },
       'the first tab is accepted',
     );
-    await connectTab(bridgeSuperseded);
-    await expect(waitForClose(firstTab), 'the older tab is closed as superseded').resolves.toMatchObject({
+    const newcomer = await connectTab(bridgeSuperseded);
+    await expect(waitForClose(newcomer), 'the second tab is refused instead of taking the slot').resolves.toMatchObject({
       code: 4002,
     });
-    const state4 = await statusOf(supersededClient);
-    expect(state4.connection.lastEvent).toBe('tab_superseded');
+    expect(firstTab.readyState, 'and the tab that was already paired keeps its socket').toBe(WebSocket.OPEN);
+    const refused = await eventually(
+      async () => {
+        const s = await statusOf(supersededClient);
+        expect(s.connection.lastEvent).toBe('slot_refused');
+        return s;
+      },
+      'the refusal is reported under its own name',
+    );
+    // The displacement state this row is really about, driven through the ledger
+    // the bridge records into, so the token stays reachable and documented.
+    const legacyBridge = createConnectionLedger();
+    legacyBridge.recordUpgrade();
+    legacyBridge.record('hello_accepted');
+    legacyBridge.recordUpgrade();
+    legacyBridge.record('tab_superseded', { closeCode: 4002, closeReason: 'superseded by a newer tab connection' });
+    const state4 = deriveDiagnosis(legacyBridge.snapshot());
+    expect(state4.lastEvent).toBe('tab_superseded');
+    expect(state4.nextStep.length, 'and it still ships an action').toBeGreaterThan(0);
+    // The refusal and the displacement stay distinguishable — same close code,
+    // different remedy, so the token has to tell them apart.
+    expect(refused.connection.lastEvent, 'a refusal is not reported as a displacement').not.toBe(state4.lastEvent);
 
     // --- state 5 (compound): the agent was pointed at the wrong address ---
     // A second REAL bridge stands in for the address the tab was actually
@@ -350,9 +383,21 @@ describe('REQ-1394 AC-2 — nothing that `status` means today changed', () => {
       // — a deliberate re-pin of a collection this requirement is approved to
       // grow. It stays EXACT: a future removal, or a key nobody declared, still
       // fails here. Do not loosen it to `toContain`.
+      //
+      // REQ-1492 grows it by five more — `bridgeSlots`, `activeConnectionId`,
+      // `tab`, `connections` — a second deliberate re-pin for the same reason and
+      // in the same spirit: additive keys an agent can ignore, every pre-existing
+      // key keeping its name, type and meaning (its own AC-8 compat row is the
+      // REQ-owned assertion; this row is the mechanical net).
       expect(Object.keys(s).sort(), `status key set in ${toolMode} mode`).toEqual(
-        [...OLD_KEYS, 'connection', 'build', 'buildStale'].sort(),
+        [...OLD_KEYS, 'connection', 'build', 'buildStale', 'bridgeSlots', 'activeConnectionId', 'tab', 'connections'].sort(),
       );
+      // …and with NO tab paired the new block is honestly empty rather than
+      // populated with placeholders: `connections` is a list, `tab` is null, and
+      // `activeConnectionId` has nothing to name.
+      expect(s.connections, 'no tab paired means no connection to list').toEqual([]);
+      expect(s.tab, 'and no tab to describe').toBeNull();
+      expect(s.activeConnectionId).toBeNull();
     });
   }
 

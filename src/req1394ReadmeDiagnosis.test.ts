@@ -155,3 +155,51 @@ describe('REQ-1394 AC-5 — the counter semantics are stated, not implied', () =
     expect(readme.toLowerCase()).not.toMatch(/diagnose your connection problems/);
   });
 });
+/**
+ * REQ-1492 T6 — the `slot_refused` row, which this file's own stated invariant
+ * already demands: the README `lastEvent` table is authoritative in BOTH
+ * directions, so a token the payload can report and the table cannot is a defect
+ * this file exists to catch.
+ *
+ * The two refusals and the displacement all close with 4002, and they need
+ * DIFFERENT remedies — close the other tab, or opt into a second slot. So these
+ * cases pin that the table tells them apart and says which remedy applies, and
+ * that neither row describes a takeover the current build performs.
+ */
+describe('REQ-1492 AC-7 — the README documents the refusal, and does not describe a takeover this build performs', () => {
+  it('has a `slot_refused` row whose action is the shipped NEXT_STEP sentence', () => {
+    // The generic parity assertions above already cover equality; this states
+    // the requirement that produced the token, so the row's existence is
+    // attributed rather than merely enumerated.
+    expect(rowFor('slot_refused'), 'the diagnosis table documents `slot_refused`').not.toBeNull();
+    expect(actionCell('slot_refused')).toBe(NEXT_STEP.slot_refused);
+  });
+
+  it('says the tab already paired keeps serving — a refusal displaces nothing', () => {
+    const meaning = rowFor('slot_refused')!.trim().replace(/^\|/, '').replace(/\|$/, '').split('|')[1] ?? '';
+    expect(meaning, 'the meaning cell states the incumbent is untouched').toMatch(/still|keeps?|unchanged|not displaced/i);
+  });
+
+  it('names the opt-in, so the refusal is the discovery path for the second slot', () => {
+    const row = rowFor('slot_refused');
+    expect(row, 'the diagnosis table documents `slot_refused`').not.toBeNull();
+    expect(row, 'the row names the flag').toContain('--bridge-slots=multi');
+    expect(row, 'and the environment variable').toContain('FIGPEA_BRIDGE_SLOTS');
+  });
+
+  it('does not tell the reader that a second tab took over — this build refuses it', () => {
+    // `tab_superseded` keeps its row (an OLDER build is still reachable), so the
+    // refusal row must not be the one carrying the takeover story.
+    const row = rowFor('slot_refused');
+    expect(row, 'the diagnosis table documents `slot_refused`').not.toBeNull();
+    const refusal = row!.toLowerCase();
+    expect(refusal, 'the refusal row does not claim a takeover happened').not.toMatch(/took over|superseded|taken over/);
+  });
+
+  it('keeps the superseded row, scoped to the case that is still real', () => {
+    // Not deleted: an old `figpea-mcp` process plus a current editor tab is a
+    // real, reachable combination, and a reader seeing it needs the row.
+    expect(rowFor('tab_superseded'), 'the displacement row is still documented').not.toBeNull();
+    expect(rowFor('tab_superseded')).toMatch(/newer tab/i);
+  });
+});

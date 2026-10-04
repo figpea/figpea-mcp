@@ -82,6 +82,9 @@ describe('REQ-1394 — every observed event lands on its own named state (AC-1)'
     { event: 'hello_timeout', drive: (l) => { l.recordUpgrade(); l.record('hello_timeout', { closeCode: 4001 }); } },
     { event: 'hello_rejected', drive: (l) => { l.recordUpgrade(); l.record('hello_rejected', { closeCode: 4001 }); } },
     { event: 'hello_accepted', drive: (l) => { l.recordUpgrade(); l.record('hello_accepted'); } },
+    // REQ-1492 (deliberate re-pin, not a regression): tab A pairs, tab B asks
+    // for the single slot and is refused with 4002 — nothing is displaced.
+    { event: 'slot_refused', drive: (l) => { l.recordUpgrade(); l.record('hello_accepted'); l.recordUpgrade(); l.record('slot_refused', { closeCode: 4002 }); } },
     { event: 'tab_superseded', drive: (l) => { l.recordUpgrade(); l.record('hello_accepted'); l.recordUpgrade(); l.record('tab_superseded', { closeCode: 4002 }); } },
     { event: 'disconnected', drive: (l) => { l.recordUpgrade(); l.record('hello_accepted'); l.record('disconnected', { closeCode: 1000, closeReason: 'bye' }); } },
   ];
@@ -233,5 +236,64 @@ describe('REQ-1394 — the fallback for a bridge that cannot report anything (AC
     // Honest, not useful: it is one bit of evidence rendered as the vocabulary,
     // and the counters stay zero because the process never counted anything.
     expect(d.upgrades).toBe(0);
+  });
+});
+/**
+ * REQ-1492 T3 — `slot_refused` joins the vocabulary (AC-7), and it joins
+ * WITHOUT redefining an existing token by stealth.
+ *
+ * `supersededCount` is a name a caller already reads. Under REQ-1492 it counts
+ * *connections that asked for the serving slot and did not get it* — refused by
+ * this build, or displaced by an OLDER build of this package, which is a real
+ * and still-reachable outcome in the wild (an old `figpea-mcp` process plus a
+ * current editor tab). `tab_superseded` therefore stays in the vocabulary with
+ * its own meaning and its byte-identical sentence; these cases pin that the two
+ * share the counter and do not share the token, so the shared counter can never
+ * be mistaken for a renamed one.
+ */
+describe('REQ-1492 AC-7 — a refused second connection is a named state, and the counter keeps its meaning', () => {
+  it('a refusal increments supersededCount and names itself, leaving the incumbent paired', () => {
+    const ledger = createConnectionLedger();
+    ledger.recordUpgrade();
+    ledger.record('hello_accepted'); // tab A pairs
+    ledger.recordUpgrade();
+    ledger.record('slot_refused', { closeCode: 4002, closeReason: 'slot held by c1 — this bridge serves one tab' });
+
+    const d = diagnose(ledger);
+    expect(d.lastEvent, 'the refusal is its own state, not "still connected"').toBe('slot_refused');
+    expect(d.supersededCount, 'a connection that did not get the slot is counted').toBe(1);
+    expect(d.helloAccepted, 'the incumbent pairing is not erased by the refusal').toBe(1);
+    expect(d.lastCloseCode).toBe(4002);
+    expect(d.lastCloseReason, 'the reason the refused tab was given is retained verbatim').toContain('slot held by c1');
+  });
+
+  it('the refusal ships an action that names the tab holding the bridge and the way to opt into a second one', () => {
+    const d = deriveDiagnosis({ ...createConnectionLedger().snapshot(), lastEvent: 'slot_refused' });
+    expect(d.nextStep.length, 'an agent is given something to do, not just a token').toBeGreaterThan(0);
+    expect(d.nextStep, 'the action names the tab that holds the bridge').toMatch(/another tab/i);
+    expect(d.nextStep, 'and the knob that lets a second tab pair, so the refusal is the discovery path').toContain(
+      '--bridge-slots=multi',
+    );
+    expect(d.nextStep, 'with the environment-variable spelling as well').toContain('FIGPEA_BRIDGE_SLOTS');
+  });
+
+  it('the refusal and the displacement share the counter but never share a token', () => {
+    const refused = createConnectionLedger();
+    refused.record('slot_refused', { closeCode: 4002 });
+    const displaced = createConnectionLedger();
+    displaced.record('tab_superseded', { closeCode: 4002 });
+
+    // One counter, two causes — which is the honest merge: both are "asked for
+    // the serving slot and did not get it".
+    expect(diagnose(refused).supersededCount).toBe(diagnose(displaced).supersededCount);
+    // …and the tokens still tell an agent which happened, because the remedy
+    // differs: nothing to undo for a refusal, a tab to close for a takeover.
+    expect(diagnose(refused).lastEvent).not.toBe(diagnose(displaced).lastEvent);
+    expect(NEXT_STEP.slot_refused).not.toBe(NEXT_STEP.tab_superseded);
+    // `tab_superseded`'s sentence is pinned byte-for-byte by its own REQ-1394
+    // test; restated here so the merge above can never quietly rewrite it.
+    expect(NEXT_STEP.tab_superseded).toBe(
+      'a newer tab took over the connection — paired, proceed; if you expected the older tab, close the newer one',
+    );
   });
 });

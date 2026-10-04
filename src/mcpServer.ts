@@ -49,7 +49,7 @@ import { resolveTimeoutMs } from './callTimeout';
 // stub bridge keep compiling untouched; when it is absent, `legacyDiagnosis`
 // derives an honest fallback from the legacy boolean rather than omitting the
 // field.
-import { legacyDiagnosis, type ConnectionDiagnosis } from './connectionDiagnosis';
+import { legacyConnections, legacyDiagnosis, type ConnectionDiagnosis } from './connectionDiagnosis';
 // REQ-1283 — the single extension-preserving name resolver, called by BOTH
 // relay paths (compact `figpea_call` and full mode's `session_openFile`) for
 // the same reason as `_rawJson` above: one rule, two call sites, no drift.
@@ -89,6 +89,33 @@ export interface BridgeServerHandleLike {
    *  files satisfy with their own stub, and making it required would edit all
    *  of them for no behavioural gain. Absent ⇒ the legacy fallback. */
   getConnectionDiagnosis?(): ConnectionDiagnosis;
+  /** REQ-1492: `single` (the default) or `multi`. Optional for the same reason
+   *  `getConnectionDiagnosis` is — this interface is a structural stand-in that
+   *  ~45 test files satisfy with their own stub, and a required member would edit
+   *  all of them. Absent ⇒ treated as `single`, and `select_tab` is not
+   *  registered (there is nothing to select on a one-slot bridge). */
+  getSlotMode?(): 'single' | 'multi';
+  /** REQ-1492: every paired tab, in pair order. Absent ⇒ the legacy
+   *  single-connection shape from `legacyConnections`. */
+  getConnections?(): BridgeConnectionLike[];
+  /** REQ-1492: moves the active pointer and re-publishes that tab's cached
+   *  manifest. Absent on a stub ⇒ `select_tab` is simply not registered. */
+  selectConnection?(connectionId: string): Promise<void>;
+}
+
+/** REQ-1492 — the published shape of one paired tab (AC-6). Mirrors
+ *  `bridgeServer.ts`'s `BridgeConnection` structurally, the way
+ *  `BridgeServerHandleLike` mirrors its handle: the two modules must not import
+ *  each other, so the seam is the shape, not the type. */
+export interface BridgeConnectionLike {
+  connectionId: string;
+  origin: string | null;
+  originSource: 'handshake' | 'absent';
+  contractVersion: string | null;
+  /** `null` only on a bridge that cannot report its slots at all — see
+   *  `legacyConnections`, where "when did this tab pair" is not a fact it has. */
+  pairedAt: string | null;
+  active: boolean;
 }
 
 export interface CreateMcpServerOptions {
@@ -666,6 +693,34 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       : legacyDiagnosis(bridge.isTabConnected());
   }
 
+  /** REQ-1492 — which slot mode this bridge serves. Read once per call, beside
+   * `connectionDiagnosis`, so `status.bridgeSlots` and whether `select_tab` was
+   * registered can never disagree. */
+  function slotMode(): 'single' | 'multi' {
+    return bridge.getSlotMode ? bridge.getSlotMode() : 'single';
+  }
+
+  /**
+   * REQ-1492 — the paired tabs, as `status` publishes them (AC-6).
+   *
+   * A bridge that cannot report them (a stub in a test, or any caller passing a
+   * handle without `getConnections`) gets the LEGACY shape rather than a missing
+   * key: the one bit such a bridge has, rendered in the same vocabulary, with
+   * `origin: null` + `originSource: "absent"` because such a bridge genuinely
+   * cannot tell where its tab came from. Same reasoning as `legacyDiagnosis`
+   * beside it — an agent reading a payload with no `connections` key cannot
+   * distinguish "nothing paired" from "this build does not report it".
+   */
+  function connections(): BridgeConnectionLike[] {
+    if (bridge.getConnections) return bridge.getConnections();
+    return legacyConnections(bridge.isTabConnected(), bridge.getContractVersion ? bridge.getContractVersion() : null);
+  }
+
+  /** The tab `status` answers for: the active one, or `null` when none is. */
+  function activeConnection(): BridgeConnectionLike | null {
+    return connections().find((c) => c.active) ?? null;
+  }
+
   /**
    * REQ-1457 — which build is answering, and is it still the one on disk.
    *
@@ -713,23 +768,89 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     'status',
     {
       description:
-        "Reports the bridge's port, whether an editor tab is connected, the connected tab's contract version (null if none), and how many contract tools are currently registered. Also returns token and url so an LLM can construct the paste-ready pairing string without re-launching (REQ-1035). Returns a `connection` block naming WHY a tab is not connected — `lastEvent` (no_attempt, transport_only, hello_timeout, hello_rejected, hello_accepted, tab_superseded, disconnected) with the `nextStep` it implies, plus per-process counters and the run's `startedAt`; read it instead of re-trying a pairing blindly. Also returns WHICH BUILD is answering: a `build` block (`version`, `buildId`, `builtAt`, `servedAt`, `root`) and a top-level `buildStale` boolean. Read `buildStale` BEFORE spending time on a call that fails in a way the current source would not — your MCP host owns this process and does not restart it when a newer build lands on disk, so a stale process answers with code from before the fix and the failure reads as a bug in the design file. `buildStale: true` means restart the MCP server; when it is false, `build.buildId` is provably the build this process loaded, so match it against the commit you are reading the source of. It says nothing about the connected editor tab's build (REQ-1457).",
+        "Reports the bridge's port, whether an editor tab is connected, the connected tab's contract version (null if none), and how many contract tools are currently registered. Also returns token and url so an LLM can construct the paste-ready pairing string without re-launching (REQ-1035). Returns a `connection` block naming WHY a tab is not connected — `lastEvent` (no_attempt, transport_only, hello_timeout, hello_rejected, hello_accepted, slot_refused, tab_superseded, disconnected) with the `nextStep` it implies, plus per-process counters and the run's `startedAt`; read it instead of re-trying a pairing blindly. `slot_refused` means a second tab asked for this bridge's single slot and did not get it — the tab already paired is untouched and still serving; open it with --bridge-slots=multi (or FIGPEA_BRIDGE_SLOTS=multi) to pair both at once. Also returns WHICH BUILD is answering: a `build` block (`version`, `buildId`, `builtAt`, `servedAt`, `root`) and a top-level `buildStale` boolean. Read `buildStale` BEFORE spending time on a call that fails in a way the current source would not — your MCP host owns this process and does not restart it when a newer build lands on disk, so a stale process answers with code from before the fix and the failure reads as a bug in the design file. `buildStale: true` means restart the MCP server; when it is false, `build.buildId` is provably the build this process loaded, so match it against the commit you are reading the source of. It says nothing about the connected editor tab's build (REQ-1457). REQ-1492 adds WHICH TAB it is attached to: a `tab` block (`connectionId`, `origin`, `originSource`, `contractVersion`, `pairedAt`) naming the tab this call is answered for, a `connections[]` list of every paired tab with its own id/origin/contract version and `active` flag, `activeConnectionId`, and `bridgeSlots` ('single' or 'multi' — how this bridge serves tabs). Read `tab.origin` and `tab.contractVersion` BEFORE a destructive write: assert you are on the document you expect. `originSource` is 'handshake' when the tab's connection carried an Origin header and 'absent' when it did not, so origin null means the browser declined to send one, never a value this server guessed.",
     },
     async () => {
       const { build, stale } = buildFacts();
+      const paired = connections();
+      const active = paired.find((c) => c.active) ?? null;
       return jsonTextResult({
         port: bridge.port,
         token: bridge.token,
         url: buildConnectUrl(undefined, undefined),
         tabConnected: bridge.isTabConnected(),
+        // Unchanged key, unchanged type: with one tab paired this is the same
+        // value it has always been (AC-8); with two it is the ACTIVE tab's,
+        // which is the meaning AC-6 asks for.
         contractVersion: bridge.getContractVersion ? bridge.getContractVersion() : null,
         toolCount,
+        // --- REQ-1492, all additive ---
+        bridgeSlots: slotMode(),
+        activeConnectionId: active?.connectionId ?? null,
+        tab: active,
+        connections: paired,
         connection: connectionDiagnosis(),
         build,
         buildStale: stale,
       });
     },
   );
+
+  /**
+   * REQ-1492 — `select_tab`, registered ONLY when the bridge runs in multi-slot
+   * mode.
+   *
+   * The gate is the honest shape (in single-slot mode there is nothing to
+   * select: the second tab is refused by name instead) and a free regression net:
+   * six exact tool-list assertions across `cli.test.ts`, `mcpServer.test.ts`,
+   * `packedArtifact.test.ts` and `req1018.test.ts` all use a default
+   * single-slot bridge and stay green untouched. If any of them ever moves, the
+   * mode leaked.
+   *
+   * Its own description states the condition, because an agent that reads only
+   * `tools/list` must not be told the tool is unconditional.
+   */
+  if (slotMode() === 'multi' && bridge.selectConnection) {
+    server.registerTool(
+      'select_tab',
+      {
+        description:
+          'Chooses which paired editor tab subsequent figpea_call / contract-tool calls address, in a bridge running multi-slot mode (registered only when this bridge was started with --bridge-slots=multi or FIGPEA_BRIDGE_SLOTS=multi; a default single-slot bridge serves one tab and does not register this tool). Read status first: `connections[]` lists every paired tab with its own connectionId, origin and contract version, and `activeConnectionId` names the one calls currently reach. Selecting a tab moves that pointer AND re-publishes that tab\'s own contract manifest, so the tools you were given describe the document your next call reaches — two tabs can run different contract versions. Each tab keeps its own document: calls addressed here never reach another tab.',
+        inputSchema: {
+          connectionId: z.string().describe('The connectionId to address, exactly as status lists it (e.g. "c2").'),
+        },
+      },
+      async (rawArgs) => {
+        const wanted = (rawArgs as { connectionId?: unknown }).connectionId;
+        if (typeof wanted !== 'string' || wanted === '') {
+          return jsonTextResult({
+            ok: false,
+            code: 'invalid_connection_id',
+            message:
+              'connectionId is required. Read status first — `connections[]` lists every paired tab with its own connectionId.',
+          });
+        }
+        try {
+          await bridge.selectConnection!(wanted);
+          const active = activeConnection();
+          return jsonTextResult({
+            ok: true,
+            connectionId: wanted,
+            activeConnectionId: active?.connectionId ?? null,
+            origin: active?.origin ?? null,
+            originSource: active?.originSource ?? 'absent',
+            contractVersion: active?.contractVersion ?? null,
+          });
+        } catch (e) {
+          return jsonTextResult({
+            ok: false,
+            code: 'unknown_connection',
+            message: e instanceof Error ? e.message : String(e),
+          });
+        }
+      },
+    );
+  }
 
   // REQ-705 — `figpea_skill`: always-registered (mirrors `open_editor`/
   // `status`, not manifest-derived), no input schema (mirrors `status`'s

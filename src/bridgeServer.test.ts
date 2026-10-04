@@ -42,6 +42,19 @@ interface BridgeServerHandle {
   getContractVersion(): string | null;
   callTab(group: string, method: string, args: unknown[], timeoutMs?: number): Promise<unknown>;
   close(): Promise<void>;
+  /** REQ-1492 — the slot mode this bridge was started in, and the paired tabs.
+   * Added to this file's local stand-in because the multi-tab cases below
+   * cannot be written without them; `startBridgeServer`'s real handle is the
+   * source of truth (see its `BridgeServerHandle`). */
+  getSlotMode(): 'single' | 'multi';
+  getConnections(): Array<{
+    connectionId: string;
+    origin: string | null;
+    originSource: 'handshake' | 'absent';
+    contractVersion: string | null;
+    pairedAt: string;
+    active: boolean;
+  }>;
 }
 
 import { startBridgeServer, CLOSE_CODE_BAD_TOKEN, CLOSE_CODE_SUPERSEDED } from './bridgeServer';
@@ -197,8 +210,26 @@ describe('startBridgeServer — request/response id correlation + timeout (plan 
   });
 });
 
-describe('startBridgeServer — single active session, newest-wins takeover (plan §3 OQ-3)', () => {
-  it('a second valid-token connection supersedes the first; the old socket is closed with a distinct code', async () => {
+/**
+ * REQ-1492 T3 — DELIBERATE RE-PIN, not a regression.
+ *
+ * These two cases used to pin "newest-wins takeover": a second valid-token
+ * connection CLOSED the incumbent with 4002, and `status` kept reporting
+ * `tabConnected: true` throughout. That is the behaviour the incident was filed
+ * from — the evicted session's next write landed in the other session's
+ * document with nothing in either payload saying so — so the pin is inverted
+ * rather than deleted:
+ *
+ *  - in the DEFAULT single-slot mode, the newcomer is refused by name and the
+ *    incumbent keeps serving (AC-7), and
+ *  - in multi-slot mode, both sockets stay paired (AC-2..AC-5).
+ *
+ * The bridge-level contract for both modes is pinned at greater length in
+ * `req1492BridgeSlots.test.ts`, which is the REQ's own file; these two stay here
+ * because they live in this file's established `startBridgeServer` harness.
+ */
+describe('REQ-1492 — single active session: a second connection is refused, not served (plan §3 OQ-3)', () => {
+  it('a second valid-token connection is refused with a distinct code; the first socket is never closed', async () => {
     const bridge = trackHandle(await startBridgeServer());
 
     const ws1 = new WebSocket(`ws://127.0.0.1:${bridge.port}`);
@@ -212,13 +243,18 @@ describe('startBridgeServer — single active session, newest-wins takeover (pla
     await waitForOpen(ws2);
     ws2.send(JSON.stringify({ type: 'hello', token: bridge.token }));
 
-    const { code } = await waitForClose(ws1);
+    // The NEWCOMER is closed, naming the tab that holds the slot…
+    const { code, reason } = await waitForClose(ws2);
     expect(code).toBe(CLOSE_CODE_SUPERSEDED);
+    expect(reason, 'the refusal says who holds the slot').toMatch(/c1/);
+    // …and the incumbent keeps its socket and keeps being reported connected.
+    expect(ws1.readyState, 'the tab that was already paired was not displaced').toBe(WebSocket.OPEN);
     await expect.poll(() => bridge.isTabConnected(), { timeout: 3000 }).toBe(true);
+    expect(bridge.getConnections().map((c) => c.connectionId), 'only one slot is occupied').toEqual(['c1']);
   });
 
-  it('after takeover, relayed calls route to the new tab, never the superseded one', async () => {
-    const bridge = trackHandle(await startBridgeServer());
+  it('in multi-slot mode, relayed calls route to the ACTIVE tab and never to the other paired one', async () => {
+    const bridge = trackHandle(await startBridgeServer({ slots: 'multi' }));
 
     const ws1 = new WebSocket(`ws://127.0.0.1:${bridge.port}`);
     openSockets.push(ws1);
@@ -230,18 +266,34 @@ describe('startBridgeServer — single active session, newest-wins takeover (pla
     openSockets.push(ws2);
     await waitForOpen(ws2);
     ws2.send(JSON.stringify({ type: 'hello', token: bridge.token }));
-    await waitForClose(ws1);
+    await expect.poll(() => bridge.getConnections().length, { timeout: 3000 }).toBe(2);
 
-    let ws1GotCall = false;
-    ws1.on('message', () => {
-      ws1GotCall = true;
+    // Neither socket is closed: a second pairing is not a supersession.
+    expect(ws1.readyState).toBe(WebSocket.OPEN);
+    expect(ws2.readyState).toBe(WebSocket.OPEN);
+    expect(bridge.getSlotMode(), 'the mode that decided this is published, not implicit').toBe('multi');
+
+    // ws2's own drill frames also land on its `message` listener, so the
+    // assertion is made on the frame TYPE (`call`), never on "any frame".
+    let ws2GotCall = false;
+    ws2.on('message', (data: WebSocket.RawData) => {
+      if (JSON.parse(data.toString())?.type === 'call') ws2GotCall = true;
+    });
+
+    // ws1's own `describe` drill frames also land on its `message` listener, so
+    // the assertion is made on the frame TYPE (`call`), never on "any frame".
+    const ws1CallFrames: any[] = [];
+    ws1.on('message', (data: WebSocket.RawData) => {
+      const frame = JSON.parse(data.toString());
+      if (frame?.type === 'call') ws1CallFrames.push(frame);
     });
 
     const callPromise = bridge.callTab('session', 'layerTree', []);
-    const callFrame = await waitForMessage(ws2);
-    ws2.send(JSON.stringify({ type: 'result', id: callFrame.id, ok: true, value: { id: 'root' } }));
+    const callFrame = await waitForMessage(ws1);
+    ws1.send(JSON.stringify({ type: 'result', id: callFrame.id, ok: true, value: { id: 'root' } }));
     await expect(callPromise).resolves.toEqual({ ok: true, value: { id: 'root' } });
-    expect(ws1GotCall).toBe(false);
+    expect(ws1CallFrames, 'the call reached the active tab').toHaveLength(1);
+    expect(ws2GotCall, 'the second, non-active tab received nothing').toBe(false);
   });
 });
 
@@ -428,8 +480,16 @@ describe('startBridgeServer — progressive describe drilling (REQ-188)', () => 
     const received: unknown[] = [];
     bridge.onDescribe((manifest) => received.push(manifest));
 
-    await connectDrillingTab(bridge);
+    const first = await connectDrillingTab(bridge);
     await expect.poll(() => received.length, { timeout: 3000 }).toBe(1);
+
+    // REQ-1492 (deliberate re-pin): in the default single-slot mode a second tab
+    // is REFUSED while the first holds the slot, so a *reconnect* now means the
+    // first tab has gone. Connecting a replacement without closing the first is
+    // no longer the same event — it is the refusal, pinned in this file's
+    // REQ-1492 describe block above.
+    first.ws.close();
+    await expect.poll(() => bridge.isTabConnected(), { timeout: 3000 }).toBe(false);
 
     await connectDrillingTab(bridge);
     await expect.poll(() => received.length, { timeout: 3000 }).toBe(2);

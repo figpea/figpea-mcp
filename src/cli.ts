@@ -80,6 +80,47 @@ export function resolveToolMode(argv: string[], env: NodeJS.ProcessEnv = process
   return 'compact';
 }
 
+/** REQ-1492 — parses `--bridge-slots=single|multi` (last flag wins, case-insensitive, invalid ignored). */
+export function parseBridgeSlotsArg(argv: string[]): string | undefined {
+  let found: string | undefined;
+  for (const arg of argv) {
+    const match = /^--bridge-slots=(.+)$/.exec(arg);
+    if (match) {
+      const raw = match[1].trim().toLowerCase();
+      if (raw === 'single' || raw === 'multi') {
+        found = raw;
+      } else {
+        console.error(`[figpea-mcp] ignoring invalid --bridge-slots value "${match[1]}" — expected single or multi`);
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * REQ-1492 — resolves how many editor tabs this bridge serves: CLI flag >
+ * `FIGPEA_BRIDGE_SLOTS` env > `single`.
+ *
+ * Exactly `resolveToolMode`'s shape and precedence, on purpose: a second knob
+ * with its own rules is a second thing to get wrong, and a user who mistypes it
+ * must get the same never-crash-the-stdio-channel treatment. The default is
+ * `single` — AC-7 names the current default as the default — so the flow every
+ * existing consumer has is the one that keeps working, now safe instead of
+ * silently evicting. Exported for unit tests (same pattern as the resolvers above).
+ */
+export function resolveBridgeSlots(argv: string[], env: NodeJS.ProcessEnv = process.env): 'single' | 'multi' {
+  const cliMode = parseBridgeSlotsArg(argv);
+  if (cliMode === 'single' || cliMode === 'multi') return cliMode;
+  const envRaw = typeof env.FIGPEA_BRIDGE_SLOTS === 'string' ? env.FIGPEA_BRIDGE_SLOTS.trim().toLowerCase() : undefined;
+  if (envRaw === 'single' || envRaw === 'multi') return envRaw as 'single' | 'multi';
+  if (envRaw !== undefined && envRaw !== '') {
+    console.error(
+      `[figpea-mcp] ignoring invalid FIGPEA_BRIDGE_SLOTS="${env.FIGPEA_BRIDGE_SLOTS}" — expected single or multi`,
+    );
+  }
+  return 'single';
+}
+
 function defaultConnectUrl(port: number, token: string): string {
   const base = process.env.FIGPEA_EDITOR_URL ?? 'https://editor.figpea.com';
   const url = new URL(base);
@@ -93,7 +134,8 @@ async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const port = resolveBridgePort(argv);
   const toolMode = resolveToolMode(argv);
-  const bridge = await startBridgeServer(port !== undefined ? { port } : undefined);
+  const slots = resolveBridgeSlots(argv);
+  const bridge = await startBridgeServer({ ...(port !== undefined ? { port } : {}), slots });
 
   // REQ-1301: this line is not decoration — it is the anchor of the documented
   // two-line paste (README "Mid-session pairing"), which the editor's
@@ -106,6 +148,13 @@ async function main(): Promise<void> {
   console.error('[figpea-mcp] open this URL in a browser to connect an editor tab:');
   console.error(`[figpea-mcp]   ${defaultConnectUrl(bridge.port, bridge.token)}`);
   console.error('[figpea-mcp] (or call the open_editor tool from the connected MCP client)');
+  // REQ-1492: printed because it is the one thing that changes a refusal into
+  // an action — a second tab refused by name cannot discover the knob from the
+  // refusal itself unless the refusal says it (it does, in `nextStep`), but the
+  // startup banner is where a user looks before opening a second tab.
+  if (slots === 'multi') {
+    console.error('[figpea-mcp] bridge slots: multi (several tabs may pair; use select_tab to choose which one calls reach)');
+  }
 
   let prefetchedManifest: any | undefined;
   let prefetchedSkillBody: string | undefined;
