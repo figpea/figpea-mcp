@@ -210,6 +210,13 @@ describe('REQ-1457 AC-5 — the six pre-existing fields keep their names and mea
       // them. Declaring them here keeps this row the mechanical net it was
       // written to be; it stays exact, so a future removal, a rename, or a key
       // nobody declared still fails. Do not loosen it to `toContain`.
+      //
+      // REQ-1503 (2026-10-04) added `liveness` — one more additive key, also
+      // re-pinned in REQ-1394's copy of this assertion. This row's own subject
+      // is the six PRE-EXISTING fields keeping their names and meanings, and
+      // that is what it still checks: `liveness` is declared here purely so the
+      // collection stays exact, and `req1503Liveness.test.ts` owns what the new
+      // block contains.
       expect(Object.keys(s).sort(), `status key set in ${toolMode} mode`).toEqual(
         [
           ...OLD_KEYS,
@@ -220,6 +227,7 @@ describe('REQ-1457 AC-5 — the six pre-existing fields keep their names and mea
           'activeConnectionId',
           'tab',
           'connections',
+          'liveness',
         ].sort(),
       );
     });

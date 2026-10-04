@@ -15,13 +15,23 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import WebSocket, { WebSocketServer } from 'ws';
 import { BRIDGE_BIND_HOST, BRIDGE_URL_HOST } from './bridgeHost';
-import { DEFAULT_CALL_TIMEOUT_MS, stateCheckHint } from './callTimeout';
+import { DEFAULT_CALL_TIMEOUT_MS, resolveTimeoutMs, stateCheckHint } from './callTimeout';
+// REQ-1503 — the bridge-info file, so an agent that has lost its MCP channel can
+// still find this bridge's port and token. Best-effort and never fatal; see the
+// module's docblock for why it lives outside the per-token session dir.
+import { bridgeInfoPath, removeBridgeInfo, writeBridgeInfo } from './bridgeInfo';
 import { createConnectionLedger, deriveDiagnosis, type ConnectionDiagnosis } from './connectionDiagnosis';
 // REQ-1457 — the ONE build-identity ledger, a zero-import leaf. It lives in
 // its own module precisely so this file and `mcpServer.ts` can both read it
 // without either importing the other: `SERVER_VERSION` moved there for the same
 // reason, and this is the other half of that reason.
 import { servingBuildStamp } from './buildIdentity';
+// REQ-1503 — the ONE tab-liveness ledger, a zero-import leaf like the two above.
+// It lives in its own module so this file can record into it and `mcpServer.ts`
+// can read it without either importing the other, which is the same reason
+// `buildIdentity` exists. This file never derives a token; it records each fact
+// where it already exists and the leaf turns counters into a published block.
+import { createTabLivenessLedger, deriveLiveness, recoveryHint, type TabLiveness, type TabLivenessLedger } from './tabLiveness';
 import type { CallFrame, DescribeFrame } from './protocol';
 import { drillManifest, type DescribeFn, type DescribeResultPayload } from './describeDrill';
 import { sessionDirFor, removeSessionDir } from './returnPath';
@@ -78,6 +88,18 @@ const HELLO_TIMEOUT_MS = 5000;
  * settles and wedges the connection's drill forever. */
 const DESCRIBE_TIMEOUT_MS = 10_000;
 
+/**
+ * REQ-1503 — the ceiling on one `POST /call` request body.
+ *
+ * A cap, not a policy: a relayed call is a JSON payload of arguments, and even
+ * one carrying base64 image bytes lands well inside 32 MB. It exists because this
+ * listener now accepts WRITES — uncapped, a request body is an unbounded local
+ * allocation reachable by anything on the machine, and the loopback bind is the
+ * only thing narrowing who can ask. `/file` guards its reads at 50 MB for the
+ * same reason and lands above this one.
+ */
+const MAX_CALL_BODY_BYTES = 32 * 1024 * 1024;
+
 export interface StartBridgeServerOptions {
   /** Bind port; omit (or 0) for an OS-assigned ephemeral port (the normal,
    * parallel-run-safe case — plan §3). */
@@ -119,6 +141,18 @@ export interface BridgeServerHandle {
    * authoritative for whether a tab is live RIGHT NOW.
    */
   getConnectionDiagnosis(): ConnectionDiagnosis;
+  /**
+   * REQ-1503: what THIS bridge observed about whether the tab calls are
+   * addressed to is ANSWERING, as an actionable token plus the counters behind
+   * it. A separate axis from `isTabConnected()`, which stays exactly what it has
+   * always been — whether the socket is open — because a wedged tab holds its
+   * socket open forever and that bit cannot see it.
+   *
+   * Not a verdict: `unresponsive` is what was observed, never proof the tab
+   * failed (REQ-772 AC-3 — a timed-out call may still land). `unpaired` is the
+   * no-tab state, and it needs no observation.
+   */
+  getLiveness(): TabLiveness;
   /** Registers a handler invoked with the connected tab's live
    * `figpea.describe()` manifest, each time one is received (initial connect
    * and every reconnect/takeover). */
@@ -173,6 +207,14 @@ interface Slot {
   pending: Map<string, PendingCall>;
   /** The in-flight drill, so a mid-drill `selectConnection` waits for it. */
   drillPromise: Promise<unknown> | undefined;
+  /**
+   * REQ-1503 — this tab's own answer/timeout ledger, beside the `pending` map
+   * that already tracks its in-flight calls. Per-slot for the same reason
+   * everything else here is: with two tabs paired, "is a tab answering" is a
+   * question with one answer per tab, and blending two of them into one bit is
+   * the confusion REQ-1492's per-slot split exists to prevent.
+   */
+  liveness: TabLivenessLedger;
 }
 
 /** Starts the localhost-only bridge WebSocket + HTTP file server (plan §3, REQ-1017). */
@@ -261,6 +303,240 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
     stream.pipe(res);
   }
 
+  // ---------------------------------------------------------------------------
+  // REQ-1503 — the recovery surface: two token-gated routes on this listener.
+  //
+  // Locality is already guaranteed by the IPv4 loopback bind above, so there is
+  // no remote-address check to add and none is implied. What IS new here is a
+  // WRITE-capable route, so the gate is the per-run pairing token — the same
+  // secret that guards the WebSocket, compared in constant time. `/file` and
+  // `/blob` are pre-existing ungated reads, unchanged and out of scope; they
+  // keep their own model because they are a different requirement's finding.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The token gate, on the HEADER only.
+   *
+   * `timingSafeEqual` over equal-length buffers, and the length check comes
+   * first because the function throws on a mismatch — an unequal-length secret
+   * must be a refusal, not an exception on the request path. The token is read
+   * from `x-figpea-token` and never from a query string: a query string lands in
+   * the URL, in any pasted shell history and in any access log, and this token
+   * grants the ability to drive the user's open document.
+   */
+  function tokenMatches(req: http.IncomingMessage): boolean {
+    const presented = req.headers['x-figpea-token'];
+    if (typeof presented !== 'string' || presented === '') return false;
+    const a = Buffer.from(presented, 'utf8');
+    const b = Buffer.from(token, 'utf8');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  }
+
+  /**
+   * The package's own failure shape on every non-200 response — `{ok:false,
+   * code, message}` — never a bare status line, so a caller has one envelope to
+   * read across MCP, the relay and this listener.
+   *
+   * `onFlushed` exists for one caller: `POST /call` answers 413 and then drops a
+   * request body it has stopped reading, and the destroy has to happen AFTER the
+   * response bytes are out or the client would see a reset instead of the 413.
+   */
+  function sendJson(
+    res: http.ServerResponse,
+    status: number,
+    payload: unknown,
+    onFlushed?: () => void,
+  ): void {
+    // NO `setCorsHeaders` here, and that omission is the security property: see
+    // the comment at the dispatch site above.
+    res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(payload), onFlushed);
+  }
+
+  function sendUnauthorized(res: http.ServerResponse): void {
+    sendJson(res, 401, {
+      ok: false,
+      code: 'unauthorized',
+      message:
+        'this route requires the per-run pairing token in the x-figpea-token header — read it from ' +
+        `${bridgeInfoPath(port)}, which is what the README's recovery procedure does.`,
+    });
+  }
+
+  /**
+   * `GET /state` — the read-only probe a recovery procedure runs BEFORE it
+   * mutates anything.
+   *
+   * Zero tab round trips: it reads ledgers this process already holds. That is
+   * the property that makes it usable at all — a probe that had to ask the tab
+   * would be useless exactly when the tab is the thing in question, which is the
+   * only time this route is called. It never returns the token: a probe that
+   * hands the secret to anything that can reach the port is a downgrade of the
+   * gate to "can reach the port".
+   */
+  function handleStateRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+    if (!tokenMatches(req)) {
+      sendUnauthorized(res);
+      return;
+    }
+    sendJson(res, 200, {
+      port,
+      tabConnected: isLive(activeSlot()),
+      liveness: currentLiveness(),
+      connection: deriveDiagnosis(ledger.snapshot()),
+    });
+  }
+
+  /**
+   * Reads one JSON request body under `MAX_CALL_BODY_BYTES`.
+   *
+   * The cap exists because this listener now accepts WRITES: uncapped, a request
+   * body is an unbounded local allocation reachable by anything on the machine.
+   * It is a ceiling rather than a policy — one relayed call, even one carrying
+   * base64 image bytes, is orders of magnitude smaller.
+   */
+  function readJsonBody(
+    req: http.IncomingMessage,
+  ): Promise<
+    | { ok: true; value: unknown }
+    | { ok: false; status: number; code: string; message: string; dropRequest: boolean }
+  > {
+    return new Promise((resolve) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      let settled = false;
+      const finish = (
+        result:
+          | { ok: true; value: unknown }
+          | { ok: false; status: number; code: string; message: string; dropRequest: boolean },
+      ): void => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
+      const refuse = (status: number, code: string, message: string): void =>
+        finish({ ok: false, status, code, message, dropRequest: status === 413 });
+
+      req.on('data', (chunk: Buffer) => {
+        if (settled) return;
+        size += chunk.length;
+        if (size > MAX_CALL_BODY_BYTES) {
+          refuse(413, 'too_large', `request body exceeds the ${MAX_CALL_BODY_BYTES}-byte cap for POST /call`);
+          return;
+        }
+        chunks.push(chunk);
+      });
+      req.on('end', () => {
+        let value: unknown;
+        try {
+          value = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        } catch {
+          refuse(400, 'invalid_body', 'the request body is not valid JSON');
+          return;
+        }
+        finish({ ok: true, value });
+      });
+      req.on('error', () => {
+        refuse(400, 'invalid_body', 'the request body could not be read');
+      });
+    });
+  }
+
+  /**
+   * `POST /call` — the route that lets a run be finished with no MCP channel.
+   *
+   * It relays through the SAME `relayCall` the MCP tools use, so the package
+   * keeps exactly one relay and exactly one timeout ladder (`resolveTimeoutMs`,
+   * cap included). Two implementations of "send a call to the tab" would drift
+   * on the ladder, and the ladder is precisely what an agent reads out of the
+   * resulting envelope.
+   *
+   * Status codes, and each one is a fact rather than a category:
+   *  - 200 — the call was ANSWERED. The body is the call's own envelope verbatim,
+   *    including the tab's own `{ok:false}`: a refusal the editor made is a
+   *    successful relay of a failed call, and flattening it into a 5xx would
+   *    lose the editor's code, which is the whole reason the caller asked.
+   *  - 400 — the body cannot be addressed (`invalid_body`). Nothing is relayed.
+   *  - 401 — the token gate.
+   *  - 409 — no tab is paired, so there is nothing to relay to.
+   *  - 413 — past the body cap.
+   *  - 504 — the relay deadline expired; the body is the relay's own envelope,
+   *    so the state check and the recovery clause reach this caller too.
+   *  - 502 — the relay failed for a reason that is not a deadline (the tab left
+   *    mid-call), carrying the relay's message.
+   */
+  async function handleCallRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    if (!tokenMatches(req)) {
+      sendUnauthorized(res);
+      return;
+    }
+
+    const parsed = await readJsonBody(req);
+    if (!parsed.ok) {
+      sendJson(res, parsed.status, { ok: false, code: parsed.code, message: parsed.message }, () => {
+        if (parsed.dropRequest) req.destroy();
+      });
+      return;
+    }
+
+    const body = (parsed.value ?? {}) as Record<string, unknown>;
+    const group = typeof body.group === 'string' && body.group !== '' ? body.group : null;
+    const method = typeof body.method === 'string' && body.method !== '' ? body.method : null;
+    if (group === null || method === null) {
+      sendJson(res, 400, {
+        ok: false,
+        code: 'invalid_body',
+        message: 'the body must name a non-empty string `group` and `method`, e.g. {"group":"layer","method":"create"}',
+      });
+      return;
+    }
+    if (body.args !== undefined && !Array.isArray(body.args)) {
+      sendJson(res, 400, {
+        ok: false,
+        code: 'invalid_body',
+        message: '`args` must be an array when present — the tab\'s positional argument list, not an object',
+      });
+      return;
+    }
+    const args = (body.args as unknown[] | undefined) ?? [];
+
+    // Checked before the relay rather than caught from it, so the "nothing to
+    // relay to" case carries its own code instead of arriving as a 502 with a
+    // relay message a caller would have to parse.
+    if (!isLive(activeSlot())) {
+      sendJson(res, 409, {
+        ok: false,
+        code: 'no_tab',
+        message:
+          'no editor tab is paired to this bridge, so there is nothing to relay to — open the pairing URL ' +
+          'recorded in the bridge-info file (port + token) in a browser to pair one',
+      });
+      return;
+    }
+
+    // The SAME resolver the `_timeoutMs` knob uses, keyed by the tool name, so a
+    // `session.openFile` gets its documented 120s here exactly as it does over
+    // MCP — and an absurd override is clamped instead of holding the listener
+    // open indefinitely.
+    const timeoutMs = resolveTimeoutMs(`${group}_${method}`, body.timeoutMs);
+    try {
+      const value = await relayCall(group, method, args, timeoutMs);
+      sendJson(res, 200, value);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // The relay's own envelope, passed through rather than replaced: this route
+      // IS the recovery surface, so a timeout here must not be the one place an
+      // agent is handed a bare "timed out" with nothing to act on.
+      const timedOut = /timed out after \d+ms/.test(message);
+      sendJson(res, timedOut ? 504 : 502, {
+        ok: false,
+        code: timedOut ? 'relay_timeout' : 'relay_failed',
+        message,
+      });
+    }
+  }
+
   function requestHandler(req: http.IncomingMessage, res: http.ServerResponse): void {
     // Always handle CORS preflight
     if (req.method === 'OPTIONS') {
@@ -273,6 +549,23 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
     // always present, so the fallback is unreachable in normal traffic; it is
     // the URL host constant only so this file cannot disagree with itself.
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? BRIDGE_URL_HOST}`);
+
+    // --- REQ-1503: the two recovery routes, BEFORE the catch-all 404 and with
+    // NO CORS headers. Deliberately not CORS-reachable: the intended caller is a
+    // local process, the tab already has its own WebSocket, and `POST /call`
+    // drives the user's open document — a page on any origin must not be able to
+    // reach it. With no ACAO on the response and `Access-Control-Allow-Methods`
+    // still `GET, OPTIONS` above, a browser can neither read either route nor
+    // preflight the POST. ---
+    if (req.method === 'POST' && url.pathname === '/call') {
+      void handleCallRequest(req, res);
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/state') {
+      handleStateRequest(req, res);
+      return;
+    }
+
     if (req.method === 'GET' && url.pathname === '/file') {
       const fp = url.searchParams.get('path');
       if (!fp) {
@@ -348,6 +641,18 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
   }
   const port = (address as { port: number }).port;
 
+  // REQ-1503: publish where this bridge is reachable, so an agent that has lost
+  // its MCP channel — and with it every way of asking — can find the port and
+  // token anyway. Best-effort by design (`writeBridgeInfo` never throws): the
+  // routes stay reachable from the tools when this file could not be written, so
+  // failing to start would trade a real capability for a documented one.
+  const bridgeInfoFile = writeBridgeInfo({
+    port,
+    token,
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+  });
+
   // REQ-1492 — the slot registry. One `Slot` per paired tab, each carrying
   // everything that used to be process-scoped and therefore could not survive
   // two tabs honestly: the socket, the contract version it reported, its own
@@ -367,6 +672,14 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
 
   function activeSlot(): Slot | undefined {
     return activeSlotId === undefined ? undefined : slots.get(activeSlotId);
+  }
+
+  /**
+   * REQ-1503 — the ACTIVE tab's liveness, through the one shared derivation.
+   * `null`-tab is `unpaired`, the one state that needs no observation.
+   */
+  function currentLiveness(): TabLiveness {
+    return deriveLiveness(activeSlot()?.liveness.snapshot() ?? null, Date.now());
   }
 
   function isLive(slot: Slot | undefined): slot is Slot {
@@ -422,6 +735,12 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
   function rejectSlotPending(slot: Slot, reason: unknown): void {
     for (const entry of slot.pending.values()) {
       clearTimeout(entry.timer);
+      // REQ-1503: this is the third `pending` removal site, and it is the one
+      // that is easy to miss — a departing tab would otherwise leave its ledger
+      // claiming calls are still in flight. Settled, but NOT an answer and NOT a
+      // timeout: a tab that went away is `unpaired` on the next read, and this
+      // axis reports nothing about a tab that is no longer there.
+      slot.liveness.noteSettled();
       entry.reject(reason);
     }
     slot.pending.clear();
@@ -466,6 +785,14 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
         if (!entry) return; // Stale/unknown id (e.g. already timed out) -- ignore.
         slot.pending.delete(frame.id);
         clearTimeout(entry.timer);
+        // REQ-1503: the answer is recorded HERE, where the fact already exists
+        // and where the `pending.delete` above already settles the in-flight
+        // count. Both branches below count as an answer — `{ok:false}` is the
+        // tab REPLYING, which is exactly the fact this axis is about, and
+        // treating a tab's own error as silence is how a working tab would read
+        // as wedged.
+        slot.liveness.noteSettled();
+        slot.liveness.noteAnswered();
         if (frame.ok) {
           entry.resolve({ ok: true, value: frame.value });
         } else {
@@ -639,8 +966,12 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
       ledger.record('hello_accepted');
 
       const rawOrigin = typeof request.headers.origin === 'string' ? request.headers.origin.trim() : '';
+      // REQ-1503: bound to a local so the ledger can be created with the id it
+      // will report — `connectionId` is how a reader of `status.liveness` tells
+      // WHICH tab the block is about.
+      const slotId = `c${nextSlotId++}`;
       const slot: Slot = {
-        id: `c${nextSlotId++}`,
+        id: slotId,
         socket,
         // AC-6: the origin is the upgrade request's header and nothing else —
         // never reconstructed from the pairing URL or `Host`, because a
@@ -654,6 +985,7 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
         pendingDescribe: undefined,
         pending: new Map(),
         drillPromise: undefined,
+        liveness: createTabLivenessLedger(slotId),
       };
       slots.set(slot.id, slot);
       slotForSocket.set(socket, slot);
@@ -698,6 +1030,90 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
     });
   });
 
+  /**
+   * The ONE relay in this package: send a call frame to a paired tab, correlate
+   * the reply, and enforce the deadline.
+   *
+   * Extracted so `POST /call` reaches it too (REQ-1503). Two implementations of
+   * "send a call to the tab" would drift on the timeout envelope and on the
+   * liveness recording, and the envelope is precisely what a caller reads when a
+   * call goes wrong — so the recovery route must produce the same words the MCP
+   * tools do, from the same code, not a lookalike.
+   */
+  function relayCall(
+    group: string,
+    method: string,
+    args: unknown[],
+    timeoutMs = DEFAULT_CALL_TIMEOUT_MS,
+    connectionId?: string,
+  ): Promise<unknown> {
+    const slot = connectionId === undefined ? activeSlot() : slots.get(connectionId);
+    if (!isLive(slot)) {
+      if (connectionId !== undefined) {
+        return Promise.reject(
+          new Error(
+            `figpea-mcp bridgeServer: no paired tab ${connectionId} — live connections: ${liveIds().join(', ') || 'none'}`,
+          ),
+        );
+      }
+      return Promise.reject(new Error('figpea-mcp bridgeServer: no tab is connected'));
+    }
+    const target = slot;
+    const id = String(nextCallId++);
+    const frame: CallFrame = { type: 'call', id, group, method, args };
+    // REQ-1503: in-flight is recorded where the call is actually dispatched,
+    // beside the `pending.set` that makes the work real. While a call sits here
+    // `liveness.inFlight`/`oldestInFlightMs` say so, which is the honest answer
+    // for a legitimately slow call — published as data, never as the token,
+    // because 120 s of `session.openFile` and 120 s of a wedge are one
+    // observation.
+    target.liveness.noteDispatched();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        target.pending.delete(id);
+        // …and the timeout is recorded HERE, in the timer that already decided
+        // the call is unanswered. Paired with the settle so the in-flight count
+        // cannot leak on the path that most needs it.
+        target.liveness.noteSettled();
+        target.liveness.noteTimedOut();
+        // REQ-772 AC-3: a relay timeout is NOT proof the tab failed — the
+        // tab keeps executing and the effect (e.g. layer.create) may land
+        // anyway. The rejection must say so, so callers check state before
+        // blindly retrying non-idempotent mutations.
+        //
+        // REQ-1282 AC-3: "check state before retrying" is advice with no
+        // route attached, and both reactions to it are expensive — trust it
+        // and abandon a layer that was created, or retry a `create` and
+        // silently duplicate it. So the clause now NAMES the call to run.
+        // Everything above the `;` is the REQ-772 wording, kept byte-for-
+        // byte because tests pin those three substrings literally; the
+        // state check is appended, never substituted for them.
+        //
+        // REQ-1457 AC-4: the serving build is APPENDED at the very end, for
+        // the same reason and one more — a caller who re-issues a call
+        // against a process that has been running since before the fix needs
+        // to know that before it retries, and the stamp is the only thing in
+        // the message that says which code answered.
+        //
+        // REQ-1503: the recovery clause goes BETWEEN the state check and the
+        // stamp — appended, never substituted, so the two requirements' pins
+        // stay green untouched — and the ORDER is load-bearing twice over. It
+        // must follow the state check, because it is the advice for when that
+        // check cannot be run (the MCP channel it would run through is gone);
+        // and it must precede the stamp, because REQ-1457's guarantee is that
+        // the message ENDS with the build identity and a caller takes that
+        // tail as the stamp.
+        reject(
+          new Error(
+            `figpea-mcp bridgeServer: call ${group}.${method} timed out after ${timeoutMs}ms; the editor may still be executing this call — check state before retrying; ${stateCheckHint(group, method, args)}; ${recoveryHint(group, method)}; ${servingBuildStamp()}`,
+          ),
+        );
+      }, timeoutMs);
+      target.pending.set(id, { resolve, reject, timer });
+      sendFrame(target.socket, frame);
+    });
+  }
+
   return {
     port,
     token,
@@ -740,6 +1156,14 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
     getConnectionDiagnosis(): ConnectionDiagnosis {
       return deriveDiagnosis(ledger.snapshot());
     },
+    // REQ-1503: a snapshot of the ACTIVE slot's ledger through the one shared
+    // derivation, so the token an agent reads is the token the README documents.
+    // `null`-tab is `unpaired` — the one state that needs no observation — which
+    // is why this returns a block rather than null: a missing key could not be
+    // told apart from a build that does not report one.
+    getLiveness(): TabLiveness {
+      return currentLiveness();
+    },
     onDescribe(handler: (manifest: unknown) => void): void {
       describeHandlers.push(handler);
     },
@@ -748,6 +1172,7 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
       // one tab is paired (AC-8), and the meaning AC-6 asks for when two are.
       return activeSlot()?.contractVersion ?? null;
     },
+    // REQ-1503: delegates to the ONE `relayCall`, which `POST /call` uses too.
     callTab(
       group: string,
       method: string,
@@ -755,50 +1180,7 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
       timeoutMs = DEFAULT_CALL_TIMEOUT_MS,
       connectionId?: string,
     ): Promise<unknown> {
-      const slot = connectionId === undefined ? activeSlot() : slots.get(connectionId);
-      if (!isLive(slot)) {
-        if (connectionId !== undefined) {
-          return Promise.reject(
-            new Error(
-              `figpea-mcp bridgeServer: no paired tab ${connectionId} — live connections: ${liveIds().join(', ') || 'none'}`,
-            ),
-          );
-        }
-        return Promise.reject(new Error('figpea-mcp bridgeServer: no tab is connected'));
-      }
-      const target = slot;
-      const id = String(nextCallId++);
-      const frame: CallFrame = { type: 'call', id, group, method, args };
-      return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          target.pending.delete(id);
-          // REQ-772 AC-3: a relay timeout is NOT proof the tab failed — the
-          // tab keeps executing and the effect (e.g. layer.create) may land
-          // anyway. The rejection must say so, so callers check state before
-          // blindly retrying non-idempotent mutations.
-          //
-          // REQ-1282 AC-3: "check state before retrying" is advice with no
-          // route attached, and both reactions to it are expensive — trust it
-          // and abandon a layer that was created, or retry a `create` and
-          // silently duplicate it. So the clause now NAMES the call to run.
-          // Everything above the `;` is the REQ-772 wording, kept byte-for-
-          // byte because tests pin those three substrings literally; the
-          // state check is appended, never substituted for them.
-          //
-          // REQ-1457 AC-4: the serving build is APPENDED at the very end, for
-          // the same reason and one more — a caller who re-issues a call
-          // against a process that has been running since before the fix needs
-          // to know that before it retries, and the stamp is the only thing in
-          // the message that says which code answered.
-          reject(
-            new Error(
-              `figpea-mcp bridgeServer: call ${group}.${method} timed out after ${timeoutMs}ms; the editor may still be executing this call — check state before retrying; ${stateCheckHint(group, method, args)}; ${servingBuildStamp()}`,
-            ),
-          );
-        }, timeoutMs);
-        target.pending.set(id, { resolve, reject, timer });
-        sendFrame(target.socket, frame);
-      });
+      return relayCall(group, method, args, timeoutMs, connectionId);
     },
     getFileUrl(filePath: string): string {
       return `http://${BRIDGE_URL_HOST}:${port}/file?path=${encodeURIComponent(filePath)}`;
@@ -818,6 +1200,13 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
       await new Promise<void>((resolve) => wss.close(() => resolve()));
       // REQ-1020 D5 (AC-5): the session's temp dir goes with the session.
       removeSessionDir(sessionDir);
+      // REQ-1503: and so does the bridge-info file. It names a token that no
+      // longer gates anything once this process is gone, so leaving it behind
+      // would put a credential-looking file on disk for no benefit. Removal is
+      // best-effort and runs last, after the listener has actually closed — a
+      // file removed while the port is still bound would be a lie in the other
+      // direction.
+      if (bridgeInfoFile !== null) removeBridgeInfo(bridgeInfoFile);
     },
   };
 }

@@ -81,6 +81,15 @@ describe('REQ-1457 — the status example shows the build identity the server ac
     // declared set grows here exactly as it does in
     // `req1457BuildStatus.test.ts`. It stays exact — the example dropping a
     // shipped field, or naming one the server never returns, still fails.
+    //
+    // REQ-1503 (2026-10-04) added `liveness` to the payload AND to this example,
+    // on the same rule REQ-1492 established: an example that omits a field the
+    // server now returns teaches a reader to look for a key that is not there,
+    // and the reader here is a program. The example's value is `unpaired`,
+    // which is the honest reading of the example's own `tabConnected: false` /
+    // `tab: null` / `connections: []` — so it teaches the calibration for free
+    // instead of adding a plausible-looking `unresponsive` to a bridge nobody
+    // paired to.
     expect(Object.keys(example).sort()).toEqual(
       [
         'build',
@@ -96,6 +105,7 @@ describe('REQ-1457 — the status example shows the build identity the server ac
         'activeConnectionId',
         'tab',
         'connections',
+        'liveness',
       ].sort(),
     );
   });
@@ -108,6 +118,21 @@ describe('REQ-1457 — the status example shows the build identity the server ac
     );
     expect(String(example.build.builtAt), 'both instants are ISO-8601, as shipped').toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(String(example.build.servedAt)).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it('shows a liveness value consistent with the rest of the example', async () => {
+    const example = JSON.parse(statusExample()) as Record<string, any>;
+    const { NEXT_STEP } = await import('./tabLiveness');
+    // The example is a coherent payload, not a bag of keys. This one says no tab
+    // is connected, no tab is described and no tab is listed, so the honest
+    // liveness is `unpaired` — and an example that read `responsive` there would
+    // teach the one value this payload cannot support.
+    expect(example.liveness.state, 'consistent with tabConnected: false / tab: null / connections: []').toBe('unpaired');
+    expect(example.liveness.nextStep, 'carrying the same action the payload would carry').toBe(NEXT_STEP.unpaired);
+    // …and the count fields are present and empty rather than invented.
+    expect(example.liveness.inFlight).toBe(0);
+    expect(example.liveness.oldestInFlightMs).toBeNull();
+    expect(example.liveness.connectionId, 'no tab to name').toBeNull();
   });
 });
 

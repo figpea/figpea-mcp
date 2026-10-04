@@ -82,7 +82,7 @@ Honors `FIGPEA_EDITOR_URL` (default `https://editor.figpea.com`, override for lo
 | Tool | Always present | What it does |
 |------|-----------------|---------------|
 | `open_editor` | yes | Opens/points at an editor tab wired to this bridge. Returns `{port, token, url}`. |
-| `status` | yes | Reports the bridge's port, token and pairing URL (`port`, `token`, `url`), whether a tab is connected, the connected tab's contract version, the live tool count, WHICH TAB it is attached to — a `tab` block (`connectionId`, `origin`, `originSource`, `contractVersion`, `pairedAt`) plus `connections[]` listing every paired tab with its own id, origin, contract version and `active` flag, and `activeConnectionId` — a `connection` block naming why a tab is not connected (see [Diagnosing a connection](#diagnosing-a-connection)), and WHICH BUILD is answering: a `build` block (`version`, `buildId`, `builtAt`, `servedAt`, `root`) plus a top-level `buildStale` flag (see [Which build is this server running?](#which-build-is-this-server-running)). Also `bridgeSlots` (`single` or `multi`) — how this bridge serves tabs. Read `tab.origin` and `tab.contractVersion` before a destructive write: they let you assert you are on the document you expect. |
+| `status` | yes | Reports the bridge's port, token and pairing URL (`port`, `token`, `url`), whether a tab is connected, the connected tab's contract version, the live tool count, WHICH TAB it is attached to — a `tab` block (`connectionId`, `origin`, `originSource`, `contractVersion`, `pairedAt`) plus `connections[]` listing every paired tab with its own id, origin, contract version and `active` flag, and `activeConnectionId` — a `connection` block naming why a tab is not connected (see [Diagnosing a connection](#diagnosing-a-connection)) — and a separate `liveness` block naming whether the tab is *answering* (`state`, plus the `inFlight`/`oldestInFlightMs`/`consecutiveTimeouts`/`lastAnswerAt`/`lastTimeoutAt` counters behind it and its own `nextStep`), because a socket can be open to a tab that answers nothing (see [Recovering a lost session](#recovering-a-lost-session)), and WHICH BUILD is answering: a `build` block (`version`, `buildId`, `builtAt`, `servedAt`, `root`) plus a top-level `buildStale` flag (see [Which build is this server running?](#which-build-is-this-server-running)). Also `bridgeSlots` (`single` or `multi`) — how this bridge serves tabs. Read `tab.origin` and `tab.contractVersion` before a destructive write: they let you assert you are on the document you expect. |
 | `select_tab` | multi-slot mode only | Chooses which paired tab subsequent calls address: `select_tab({connectionId})`, with the ids `status` lists. Registered **only** when the bridge runs with `--bridge-slots=multi` / `FIGPEA_BRIDGE_SLOTS=multi`, and **absent from `tools/list` on the default single-slot bridge**, where there is nothing to select — a second tab is refused by name instead. Selecting a tab also re-publishes that tab's own contract manifest, so the tools you were given describe the document your next call reaches. |
 | `figpea_skill` | yes | Returns Figpea's agent skill reference (the craft guidance for using `window.figpea` well), sourced from the editor origin's `/agent/skill.md` at startup — works even with no tab paired. The answer names the URL it fetched from: the body is that origin's own build, so when a tab is paired from a different origin or a different build, get *the tab's* skill instead with `figpea.SKILL()` in the tab or `GET <the tab's origin>/agent/skill.md` (the answer says so when a tab is connected). Degrades to a structured `{ok:false, code:"skill_unavailable", message}` (never throws) if the fetch failed or was disabled. |
 | `figpea_call` | compact only | Universal dispatcher — `figpea_call({ group, method, args, _timeoutMs, _opsFile })` calls any `group.method` on the paired tab (see below). `_opsFile` names a JSON file whose content is a method's top-level array argument, read by this server instead of that array. |
@@ -113,6 +113,16 @@ Every call returns `{ok: true, value}` or `{ok: false, code, message}`. Image-sh
   "activeConnectionId": null,
   "tab": null,
   "connections": [],
+  "liveness": {
+    "connectionId": null,
+    "state": "unpaired",
+    "inFlight": 0,
+    "oldestInFlightMs": null,
+    "consecutiveTimeouts": 0,
+    "lastAnswerAt": null,
+    "lastTimeoutAt": null,
+    "nextStep": "no tab is paired to this bridge — open the pairing URL this status call prints in a browser to pair one; there is no tab to answer a call until then"
+  },
   "connection": {
     "lastEvent": "hello_rejected",
     "nextStep": "the pairing token was rejected — re-read token from this status call and open a freshly minted pairing URL; a token from an earlier server run is always stale",
@@ -135,6 +145,8 @@ Every call returns `{ok: true, value}` or `{ok: false, code, message}`. Image-sh
   "buildStale": true
 }
 ```
+
+The `liveness` block in that example asks a **different question** from `connection`, and the difference is the whole point: every one of those eight tokens describes the WebSocket transport, and a live socket to a wedged tab reads `hello_accepted` — correctly, and uselessly. `liveness` asks whether the tab is *answering*. Its vocabulary, what each value does and does not prove, and the procedure for finishing a run whose MCP channel is gone are in [Recovering a lost session](#recovering-a-lost-session).
 
 Read `connection.lastEvent`. `connection.nextStep` is the action that token implies, shipped in the same payload, so nothing has to be mapped by hand:
 
@@ -452,6 +464,136 @@ It is **opt-in**, and deliberately so. Where this build's manifest does declare 
 
 If a value *looks* like JSON but cannot be parsed, and the parameter is declared an `object`, `array` or `matrix`, the call is refused up front with `invalid_params` naming `_rawJson` and the parameter, instead of being silently forwarded — so the flag never lies about having been honoured. The server also coerces string numerics inside objects/arrays to numbers defensively (harness stringification tolerance) without requiring `_rawJson`.
 
+## Recovering a lost session
+
+Two different things can go, and they look identical from the outside — your agent stops making progress, calls stop coming back — so they are kept apart here:
+
+| What is gone | What still answers | What to do |
+|--------------|--------------------|------------|
+| **The MCP channel** — the host stopped driving the stdio server, or dropped it | **The bridge process.** It binds loopback, holds a token-gated relay to the tab, and keeps serving with no MCP server in the picture | The numbered procedure below |
+| **The bridge process itself** | Nothing | Nothing in this package can help — start a fresh `figpea-mcp` and pair a tab again. See *When the process is gone* |
+
+The bridge is started **inside** the stdio process and closed with it, so the second row is a real limit and not a hedge: nothing here outlives its own process.
+
+### 1. Read the bridge-info file
+
+Each run publishes how to reach itself while it runs, so an agent holding nothing but a shell can still find it. It is written at start and removed when the process exits:
+
+```bash
+ls "$TMPDIR"/figpea-mcp/bridge-*.json
+cat "$TMPDIR"/figpea-mcp/bridge-*.json
+```
+
+```json
+{
+  "port": 49394,
+  "token": "7406b5f5-d4d7-4934-a70a-63b925556623",
+  "pid": 23508,
+  "startedAt": "2026-10-04T20:59:44.772Z"
+}
+```
+
+The path is `<os.tmpdir()>/figpea-mcp/bridge-<port>.json`, mode `0600` (owner-only), holding `{port, token, pid, startedAt}`. It sits beside the per-token session directories rather than inside one, because every entry in a token directory is charged against that session's return-bytes cap.
+
+More than one file means more than one bridge is running; `pid` and `startedAt` tell them apart. A file left by a dead run is inert — the token it names matches no live bridge.
+
+### 2. Ask whether the tab is answering — `GET /state`
+
+`GET /state` is a read-only probe that answers from ledgers the bridge already holds, so it costs **zero tab round trips** — which is what makes it usable at all, since a probe that had to ask the tab would be useless exactly when the tab is the thing in question. It never returns the token.
+
+```bash
+curl -s -H "x-figpea-token: $TOKEN" "http://127.0.0.1:$PORT/state"
+```
+
+A real response, pretty-printed (it arrives as one line on the wire):
+
+```json
+{
+  "port": 49394,
+  "tabConnected": true,
+  "liveness": {
+    "connectionId": "c1",
+    "state": "responsive",
+    "inFlight": 0,
+    "oldestInFlightMs": null,
+    "consecutiveTimeouts": 0,
+    "lastAnswerAt": "2026-10-04T20:59:45.610Z",
+    "lastTimeoutAt": null,
+    "nextStep": "the last call this bridge sent this tab was answered — proceed; a call still in flight is published as inFlight/oldestInFlightMs, and on a large project that is usually a render still settling rather than a failure"
+  },
+  "connection": {
+    "lastEvent": "hello_accepted",
+    "nextStep": "a tab is paired — proceed; read tabConnected for live truth",
+    "tcpConnections": 3,
+    "upgrades": 1,
+    "helloAccepted": 1,
+    "helloRejected": 0,
+    "supersededCount": 0,
+    "lastCloseCode": null,
+    "lastCloseReason": null,
+    "startedAt": "2026-10-04T20:59:44.772Z"
+  }
+}
+```
+
+The same `liveness` block is on the `status` payload, so this is a second door to one field rather than a second field. Read **`liveness.state`** here, not `connection.lastEvent`: both routes open a TCP socket on the shared listener, so a request to either one before any tab pairs leaves `lastEvent` reading `transport_only` — exactly as a `/file` fetch already does. That state is honest (a socket did reach the port and never handshook) and its `nextStep` points at reloading a tab, which is the wrong advice for a reader who has just proved they are on the right port.
+
+### 3. Drive the tab — `POST /call`
+
+`POST /call` relays one call through **the same relay and the same timeout ladder** the MCP tools use, so the envelope you get back is the envelope the tools produce, not a lookalike. Body: `{group, method, args?, timeoutMs?}`.
+
+```bash
+curl -s -X POST "http://127.0.0.1:$PORT/call" \
+  -H "x-figpea-token: $TOKEN" -H 'content-type: application/json' \
+  -d '{"group":"layer","method":"create","args":["rect",{"name":"RecoveredCard"}]}'
+```
+
+```json
+{"ok": true, "value": {"id": "12:9", "name": "RecoveredCard"}}
+```
+
+A refusal the editor made is a **successful relay of a failed call**, so it arrives as HTTP 200 carrying the tab's own envelope — the code you need to branch on, not flattened into a 5xx:
+
+```json
+{"ok": false, "code": "not_found", "message": "no layer named \"RecoveredCard\""}
+```
+
+The status codes are facts rather than categories: `200` answered (including the tab's own `{ok:false}`), `400` a body that cannot be addressed (nothing is relayed), `401` the token gate, `409` no tab is paired, `413` past the 32 MB body cap, `504` the relay deadline — carrying the relay's own envelope, so the state check and the recovery clause below reach this caller too — and `502` a relay failure that is not a deadline. Every non-200 body is `{ok: false, code, message}`, the package's one failure shape.
+
+Both routes require the per-run pairing token in the **`x-figpea-token` header** — never a query string, because a query string lands in a URL, in a pasted shell history and in an access log. Neither route is reachable from a browser page: no CORS headers are sent on either and `Access-Control-Allow-Methods` stays `GET, OPTIONS`, so a browser can neither read them nor preflight the POST. Call them with `curl`, `node`, or any local process.
+
+### What the timeout envelope already told you
+
+A timed-out call has always named the state check to run ([Call timeouts](#call-timeouts)). It now also names the two routes that survive a lost channel, appended after the state-check hint and before the serving-build stamp. Quoted verbatim from `recoveryHint()` in `src/tabLiveness.ts` — the same string the relay emits, not a paraphrase:
+
+> if your next call to this tab also times out, this tab is not answering — layer.create timed out unanswered, and it is the streak that separates a busy tab from a wedged one. Read `status.liveness`, then drive the tab through the bridge's own `POST /call` route (README → Recovering a lost session); the bridge keeps serving without the MCP channel.
+
+The clause is **conditional on the streak** because one unanswered call is not evidence: the tab keeps executing after the relay gives up and the effect may land anyway.
+
+### The `liveness` vocabulary
+
+`status.liveness` (and `GET /state`) report **what this bridge observed**, and never why. A non-answer is a real answer, not a failure — a large project mid-render and a frozen tab look identical from out here, so the honest report is the ambiguity and **no value is proof the tab is dead**. A caller that reads "dead" on a merely-busy tab abandons live work.
+
+| Liveness | What this bridge observed | What to do — the payload's own `nextStep`, quoted from `NEXT_STEP` in `src/tabLiveness.ts` | What it does NOT prove |
+|----------|--------------------------|------------------------------------------------------------------------|------------------------|
+| `unpaired` | no tab | no tab is paired to this bridge — open the pairing URL this status call prints in a browser to pair one; there is no tab to answer a call until then | that a tab is broken; it may simply never have paired |
+| `unknown` | a tab paired, with no answered call and no timeout yet | a tab is paired but nothing has been observed on it yet — this bridge has seen no answered call and no timeout, which is not the same as healthy: make one call and read this block again | that the tab is healthy: nothing has been proven |
+| `responsive` | the last call sent was answered | the last call this bridge sent this tab was answered — proceed; a call still in flight is published as inFlight/oldestInFlightMs, and on a large project that is usually a render still settling rather than a failure | that the bridge *process* is alive — a different process, with a different failure mode |
+| `unresponsive` | two calls in a row went unanswered (or one, on a tab that had never answered) | two calls in a row went unanswered on this tab (or one, on a tab that had never answered) — that is what this bridge observed, not why: a large project mid-render and a frozen tab look identical from here, so it is not proof the tab failed. Look at the editor tab — if it is still working, wait for it; if it is not, the tab is what needs attention. With the MCP channel gone, drive the tab through the bridge's own call route (README → Recovering a lost session). | that the tab failed; a mid-render project looks the same from here |
+
+The third column is quoted from the same map (`NEXT_STEP` in `src/tabLiveness.ts`) the server sends, so the sentence you read here is the sentence the agent gets — the table is a *reader* of that map, not a fourth copy of it. `unresponsive` needs **two** consecutive unanswered calls — or one on a tab that has never answered — because a single timeout after a successful answer is explicitly not that.
+
+Two limits worth knowing before you read a field: `liveness` describes **the tab your calls are addressed to**, so in `--bridge-slots=multi` it follows `select_tab`; and the counters are per bridge, not persisted — a fresh run starts from zero.
+
+### When the process is gone
+
+If no bridge-info file answers, or the `pid` in it is gone, the bridge process died with the channel and **nothing in this package can reach your tab** — the routes are doors into that process, not a resurrection. What to do instead:
+
+1. Start a fresh `figpea-mcp`, and open the pairing URL it prints to pair a tab again.
+2. **Re-open your last export or checkpoint.** A fresh pair cannot re-adopt a tab that was paired to the dead bridge, so work that lived only in that tab's document is not reachable from the new one.
+
+Re-pairing is the way out of a dead process, not a step inside the procedure above — the two are not interchangeable, and this section does not claim the procedure covers them.
+
 ## Security model
 
 - The bridge binds **localhost only** (`127.0.0.1`) — never a public interface. The listener is IPv4-only and stays that way; the `localhost` host in emitted URLs and in the printed banner line is a separate decision, described under *How pairing works*.
@@ -459,7 +601,8 @@ If a value *looks* like JSON but cannot be parsed, and the parameter is declared
 - A **single active session by default** — a second valid connection is REFUSED by name rather than displacing the tab already paired, so no session can be silently evicted mid-task. `--bridge-slots=multi` opts into several paired tabs, each with its own slot and document.
 - **One token, several slots, one machine** — a paired connection needs the same per-run token as any other, and multi-slot mode changes which documents are addressable, never who may connect: it is a correctness guard, not an authentication or transport change.
 - At startup, the server performs two GET requests to the editor origin — `/agent/contract.json` (tool definitions) and `/agent/skill.md` (the agent skill reference, backing the `figpea_skill` tool) — to prefetch both before any tab pairs. This reveals only your client IP and startup timing to the editor origin; no usage telemetry is shipped. You can disable both fetches by setting `FIGPEA_DISABLE_CONTRACT_FETCH=1`.
-- The server holds no credentials.
+- The server holds **no credentials other than its own per-run pairing token**, which it writes to the bridge-info file (`<tmpdir>/figpea-mcp/bridge-<port>.json`, mode `0600`, owner-only) so an agent that has lost its MCP channel can still reach it — per-run, owner-only, and removed when it exits. A leftover file from a dead run is inert: the token it names matches no live bridge ([Recovering a lost session](#recovering-a-lost-session)).
+- `POST /call` and `GET /state` are gated on that same token, compared in constant time and read from the `x-figpea-token` header only — never a query string. A request without it is refused with `401`. The token is authority to drive the document in your open tab, which is exactly what holding the stdio pipe already allowed: a second door to the same room, not a new capability. Neither route is CORS-reachable — no browser page can read them or preflight the POST.
 - Your design files are opened in your own browser tab and **never leave your machine**.
 
 ## Configuration & Environment Variables
@@ -501,6 +644,8 @@ The remaining suites exercise the server in-process and do not need a build.
 - **`no_tab`** — the refusal carries a `connection` block naming what happened; read `connection.lastEvent` and its `nextStep` before trying again ([Diagnosing a connection](#diagnosing-a-connection)). In the ordinary case it is `no_attempt` and the fix is to open an editor tab, via `open_editor` or by visiting the printed pairing URL. If `lastEvent` is `hello_rejected`, the pairing token is stale — re-read `token` from a fresh `status` call and open the URL that call prints, because a token from an earlier server run never matches. If it is `transport_only` or `hello_timeout`, the handshake never completed: check you are on the `bridgePort` this run reports, then reload the tab.
 - **Nothing prints on stdout** — that's by design. stdio is the MCP JSON-RPC channel; every diagnostic goes to stderr.
 - **`buildStale: true`** — the `figpea-mcp/dist` build on disk is not the one this process loaded, so the code answering you predates a merge. This is what a stale server looks like from the outside: a call the current source handles correctly comes back as a failure, and it reads as a bug in the design file. Restart the MCP server; it cannot restart itself, because your MCP client owns the process. Before you go hunting for a product bug, compare `build.buildId` with your own build — an unchanged `buildId` means the directory was simply rebuilt, not that newer code is waiting ([Which build is this server running?](#which-build-is-this-server-running)). Nothing else on `status` is affected, and it says nothing about the editor tab's build.
+- **The MCP namespace vanished mid-session** — the tools are simply gone from a session that had them a minute ago, because the host stopped driving (or dropped) the stdio server. This package cannot bring that channel back; the host owns the process. What it can still do is finish the run: the bridge is likely still listening, so follow [Recovering a lost session](#recovering-a-lost-session) — read the bridge-info file, `GET /state` to see whether the tab is answering, then `POST /call` for the calls you still owe. If no bridge-info file answers, the process is gone too, and the answer is a fresh `figpea-mcp` plus a re-pair.
+- **Every call times out while `tabConnected` is still `true`** — that bit describes the socket, not the tab, so a wedged tab keeps reading `true` while nothing answers. Read `liveness.state`: `unknown` means nothing has been observed yet, `responsive` means the last call came back, and `unresponsive` means two calls in a row went unanswered — which is what the bridge observed, not proof the tab failed, so look at the editor tab before you abandon work ([Recovering a lost session](#recovering-a-lost-session)).
 - **Port already in use** — pass `--port=<n>` to bind a specific port instead of an OS-assigned one.
 
 ## License

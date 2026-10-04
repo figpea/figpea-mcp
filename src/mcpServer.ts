@@ -50,6 +50,14 @@ import { resolveTimeoutMs } from './callTimeout';
 // derives an honest fallback from the legacy boolean rather than omitting the
 // field.
 import { legacyConnections, legacyDiagnosis, type ConnectionDiagnosis } from './connectionDiagnosis';
+// REQ-1503 — the one tab-liveness vocabulary, imported from the same zero-import
+// leaf the bridge records into. `getLiveness` is OPTIONAL below for exactly the
+// reason `getConnectionDiagnosis` is: this interface is a structural stand-in
+// ~45 test files satisfy with their own stub, and a required member would edit
+// all of them for no behavioural gain. Absent ⇒ `legacyLiveness`, which reports
+// the honest reading of the one bit such a bridge has rather than omitting the
+// key.
+import { legacyLiveness, type TabLiveness } from './tabLiveness';
 // REQ-1283 — the single extension-preserving name resolver, called by BOTH
 // relay paths (compact `figpea_call` and full mode's `session_openFile`) for
 // the same reason as `_rawJson` above: one rule, two call sites, no drift.
@@ -89,6 +97,12 @@ export interface BridgeServerHandleLike {
    *  files satisfy with their own stub, and making it required would edit all
    *  of them for no behavioural gain. Absent ⇒ the legacy fallback. */
   getConnectionDiagnosis?(): ConnectionDiagnosis;
+  /** REQ-1503: what this bridge observed about whether the tab calls are
+   *  addressed to is ANSWERING. Optional for the same reason
+   *  `getConnectionDiagnosis` is — a structural stand-in ~45 test files satisfy
+   *  with their own stub. Absent ⇒ `legacyLiveness`, which reads `tabConnected`
+   *  and reports `unknown` rather than the `responsive` that bit cannot support. */
+  getLiveness?(): TabLiveness;
   /** REQ-1492: `single` (the default) or `multi`. Optional for the same reason
    *  `getConnectionDiagnosis` is — this interface is a structural stand-in that
    *  ~45 test files satisfy with their own stub, and a required member would edit
@@ -920,6 +934,20 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       : legacyDiagnosis(bridge.isTabConnected());
   }
 
+  /**
+   * REQ-1503 — whether the tab is ANSWERING, or the honest fallback.
+   *
+   * Read once per call beside `connectionDiagnosis`, and deliberately a SEPARATE
+   * axis rather than another `connection.lastEvent` token: all eight of those
+   * describe the WebSocket transport, and a live socket to a wedged tab reports
+   * `hello_accepted` — correctly, and uselessly. So `status` publishes this
+   * beside `tabConnected`, which keeps its own old meaning untouched: the socket
+   * is open. An agent needs both, and only one of them can see a frozen tab.
+   */
+  function liveness(): TabLiveness {
+    return bridge.getLiveness ? bridge.getLiveness() : legacyLiveness(bridge.isTabConnected());
+  }
+
   /** REQ-1492 — which slot mode this bridge serves. Read once per call, beside
    * `connectionDiagnosis`, so `status.bridgeSlots` and whether `select_tab` was
    * registered can never disagree. */
@@ -995,7 +1023,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     'status',
     {
       description:
-        "Reports the bridge's port, whether an editor tab is connected, the connected tab's contract version (null if none), and how many contract tools are currently registered. Also returns token and url so an LLM can construct the paste-ready pairing string without re-launching (REQ-1035). Returns a `connection` block naming WHY a tab is not connected — `lastEvent` (no_attempt, transport_only, hello_timeout, hello_rejected, hello_accepted, slot_refused, tab_superseded, disconnected) with the `nextStep` it implies, plus per-process counters and the run's `startedAt`; read it instead of re-trying a pairing blindly. `slot_refused` means a second tab asked for this bridge's single slot and did not get it — the tab already paired is untouched and still serving; open it with --bridge-slots=multi (or FIGPEA_BRIDGE_SLOTS=multi) to pair both at once. Also returns WHICH BUILD is answering: a `build` block (`version`, `buildId`, `builtAt`, `servedAt`, `root`) and a top-level `buildStale` boolean. Read `buildStale` BEFORE spending time on a call that fails in a way the current source would not — your MCP host owns this process and does not restart it when a newer build lands on disk, so a stale process answers with code from before the fix and the failure reads as a bug in the design file. `buildStale: true` means restart the MCP server; when it is false, `build.buildId` is provably the build this process loaded, so match it against the commit you are reading the source of. It says nothing about the connected editor tab's build (REQ-1457). REQ-1492 adds WHICH TAB it is attached to: a `tab` block (`connectionId`, `origin`, `originSource`, `contractVersion`, `pairedAt`) naming the tab this call is answered for, a `connections[]` list of every paired tab with its own id/origin/contract version and `active` flag, `activeConnectionId`, and `bridgeSlots` ('single' or 'multi' — how this bridge serves tabs). Read `tab.origin` and `tab.contractVersion` BEFORE a destructive write: assert you are on the document you expect. `originSource` is 'handshake' when the tab's connection carried an Origin header and 'absent' when it did not, so origin null means the browser declined to send one, never a value this server guessed.",
+        "Reports the bridge's port, whether an editor tab is connected, the connected tab's contract version (null if none), and how many contract tools are currently registered. Also returns token and url so an LLM can construct the paste-ready pairing string without re-launching (REQ-1035). Returns a `connection` block naming WHY a tab is not connected — `lastEvent` (no_attempt, transport_only, hello_timeout, hello_rejected, hello_accepted, slot_refused, tab_superseded, disconnected) with the `nextStep` it implies, plus per-process counters and the run's `startedAt`; read it instead of re-trying a pairing blindly. `slot_refused` means a second tab asked for this bridge's single slot and did not get it — the tab already paired is untouched and still serving; open it with --bridge-slots=multi (or FIGPEA_BRIDGE_SLOTS=multi) to pair both at once. Also returns WHICH BUILD is answering: a `build` block (`version`, `buildId`, `builtAt`, `servedAt`, `root`) and a top-level `buildStale` boolean. Read `buildStale` BEFORE spending time on a call that fails in a way the current source would not — your MCP host owns this process and does not restart it when a newer build lands on disk, so a stale process answers with code from before the fix and the failure reads as a bug in the design file. `buildStale: true` means restart the MCP server; when it is false, `build.buildId` is provably the build this process loaded, so match it against the commit you are reading the source of. It says nothing about the connected editor tab's build (REQ-1457). REQ-1492 adds WHICH TAB it is attached to: a `tab` block (`connectionId`, `origin`, `originSource`, `contractVersion`, `pairedAt`) naming the tab this call is answered for, a `connections[]` list of every paired tab with its own id/origin/contract version and `active` flag, `activeConnectionId`, and `bridgeSlots` ('single' or 'multi' — how this bridge serves tabs). Read `tab.origin` and `tab.contractVersion` BEFORE a destructive write: assert you are on the document you expect. `originSource` is 'handshake' when the tab's connection carried an Origin header and 'absent' when it did not, so origin null means the browser declined to send one, never a value this server guessed. REQ-1503 adds a `liveness` block beside `tabConnected`, naming whether the TAB is ANSWERING: `state` (unpaired, unknown, responsive, unresponsive) with the `nextStep` that token implies, plus `connectionId`, `inFlight`, `oldestInFlightMs`, `consecutiveTimeouts`, `lastAnswerAt` and `lastTimeoutAt`. `tabConnected` keeps its own meaning — the socket is open — and cannot see a wedged tab, because a frozen tab holds its socket open forever while every call times out; read `liveness` BEFORE retrying a timed-out call. It reports what this bridge OBSERVED, never why: `unresponsive` is two calls in a row going unanswered, or one on a tab that had never answered, and it is NOT proof the tab failed — a large project mid-render and a frozen tab look identical from here, and a timed-out call may still land. `unknown` means nothing has been observed yet, not that the tab is healthy; in-flight age is published as `inFlight`/`oldestInFlightMs` rather than folded into the state, because a slow `session.openFile` runs 120000ms by its own documented default. It describes the tab calls are ADDRESSED TO — read `activeConnectionId` to know which one that is, and `select_tab` to change it. With the MCP channel gone, the same facts are readable over the bridge's own `GET /state` and a call can be relayed over its token-gated `POST /call`, so a run can be finished without this server: the bridge keeps serving without the MCP channel (README → Recovering a lost session).",
     },
     async () => {
       const { build, stale } = buildFacts();
@@ -1006,6 +1034,13 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         token: bridge.token,
         url: buildConnectUrl(undefined, undefined),
         tabConnected: bridge.isTabConnected(),
+        // --- REQ-1503, additive and beside `tabConnected`, whose meaning is
+        // UNCHANGED (the socket is open). `liveness` is the other question: is
+        // the tab answering. It reports what this bridge OBSERVED, never why —
+        // `unresponsive` is two calls in a row going unanswered (or one on a tab
+        // that had never answered), which is not proof the tab failed, because a
+        // timed-out call may still land.
+        liveness: liveness(),
         // Unchanged key, unchanged type: with one tab paired this is the same
         // value it has always been (AC-8); with two it is the ACTIVE tab's,
         // which is the meaning AC-6 asks for.

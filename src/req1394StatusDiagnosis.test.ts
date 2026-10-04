@@ -389,8 +389,29 @@ describe('REQ-1394 AC-2 — nothing that `status` means today changed', () => {
       // in the same spirit: additive keys an agent can ignore, every pre-existing
       // key keeping its name, type and meaning (its own AC-8 compat row is the
       // REQ-owned assertion; this row is the mechanical net).
+      //
+      // REQ-1503 (2026-10-04) grows it by exactly one more — `liveness`, beside
+      // `tabConnected` — and for the same declared reason: a new, additive block
+      // an agent can ignore, with no pre-existing key renamed, retyped or
+      // redefined. `tabConnected` keeps its old meaning (is the socket open);
+      // `liveness` is a new AXIS beside it (is the tab answering), which is the
+      // whole point of the change — folding "is the tab answering?" into the
+      // existing bit is the collapse this requirement exists to prevent. The
+      // REQ-owned assertions about the block's contents and its calibration live
+      // in `req1503Liveness.test.ts`; this row stays the mechanical net and
+      // stays EXACT.
       expect(Object.keys(s).sort(), `status key set in ${toolMode} mode`).toEqual(
-        [...OLD_KEYS, 'connection', 'build', 'buildStale', 'bridgeSlots', 'activeConnectionId', 'tab', 'connections'].sort(),
+        [
+          ...OLD_KEYS,
+          'connection',
+          'build',
+          'buildStale',
+          'bridgeSlots',
+          'activeConnectionId',
+          'tab',
+          'connections',
+          'liveness',
+        ].sort(),
       );
       // …and with NO tab paired the new block is honestly empty rather than
       // populated with placeholders: `connections` is a list, `tab` is null, and
