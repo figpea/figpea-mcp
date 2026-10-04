@@ -84,6 +84,13 @@ const BASELINE_TEST_FILES = [
   'req1337RawJsonFilePath.test.ts',
   'req1394ReadmeDiagnosis.test.ts',
   'req1394StatusDiagnosis.test.ts',
+  // REQ-1430's suite, added to this baseline by the same rule the note above
+  // states (2026-10-03, janitor mcp_vitest): a new suite must EXTEND the
+  // baseline, never bypass it. REQ-1430 landed it (51e9f3b) without touching
+  // this file, so AC-3's "adds no suite beyond the baseline" gate went red on
+  // a correct addition — 11 declarations, 0 skip/only constructs, so it changes
+  // no other pin here.
+  'req1430-batch-arg-budget-relay.test.ts',
   // REQ-1432's suite, added to this baseline in its own commit (2026-10-03,
   // janitor mcp_vitest) for the same reason and by the same rule the note
   // above states: a new suite must EXTEND the baseline, never bypass it.
@@ -97,6 +104,18 @@ const BASELINE_TEST_FILES = [
   'req1443SpawnWiring.test.ts',
   'req1443SuiteIntegrity.test.ts',
   'req1444EnvelopeDiagnostics.test.ts',
+  // REQ-1457's five suites, added to this baseline by the same rule the note
+  // above states (2026-10-03, janitor mcp_vitest): a new suite must EXTEND the
+  // baseline, never bypass it. REQ-1457 landed them (f23e5b0) without touching
+  // this file, so AC-3's "adds no suite beyond the baseline" gate went red on
+  // a correct addition. Measured at this tip: 3 + 14 + 12 + 16 + 6 = 51
+  // declarations, 0 skip/only constructs across all five, so they change no
+  // other pin here.
+  'req1457Ac1Repro.test.ts',
+  'req1457BuildIdentity.test.ts',
+  'req1457BuildStatus.test.ts',
+  'req1457ReadmeBuild.test.ts',
+  'req1457TimeoutBuildStamp.test.ts',
   'req870.test.ts',
   'skillFetch.test.ts',
   'skillProvenance.test.ts',
