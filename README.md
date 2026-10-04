@@ -19,7 +19,7 @@ A Model Context Protocol (MCP) server that lets an AI agent open and drive a liv
 > }
 > ```
 > Read `connection.lastEvent` — see [Diagnosing a connection](#diagnosing-a-connection) for every state and what to do about it.
-> Opening that URL opens the editor with an LNA connect notice and explicit **Connect** consent gate button. Chrome may ask permission to reach the local network (accepted once per origin). Once granted, clicking Connect attaches the session safely.
+> Opening that URL starts the connection on its own: the editor dials the bridge as the page loads, and nothing there waits on a click. Chrome may still ask for Local Network Access permission to reach the local network (accepted once per origin). The in-app notice is a status display, not a gate — it names the bridge address and reports the phase (`Connecting…`, `Retrying…`, or failed), so a stuck pairing names its state instead of only failing. The one manual control left is on a `failed` card: a `Try again` button.
 
 ![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)
 ![node](https://img.shields.io/badge/node-%3E%3D18-green.svg)
@@ -382,8 +382,7 @@ Authoring is free — opening, inspecting, and editing a file costs nothing. Exp
 
 Automated or headless browsers cannot answer native Local Network Access permission prompts. To pair in automated test or agent harness environments:
 1. **Grant LNA permission** via CDP (`Browser.grantPermissions`), a pre-granted browser profile, or Chrome's `LocalNetworkAccessAllowedForUrls` enterprise policy.
-2. **Programmatically click Connect** on the editor notice.
-3. **Localhost exemption**: Editors served from `http://localhost` are same-address-space and exempt from LNA entirely.
+2. **Localhost exemption**: Editors served from `http://localhost` are same-address-space and exempt from LNA entirely.
 
 ## Testing
 

@@ -92,13 +92,25 @@ describe('README.md (AC-5)', () => {
     expect(readme).not.toContain('pure localhost relay: it holds no credentials and ships no telemetry');
   });
 
-  it('documents the Connect click and browser permission prompt as expected first-run pairing steps (AC-8)', () => {
-    // Shipped first-run pairing steps: actionable pairing URL, Connect consent gate, and LNA permission explainer
+  it('documents the automatic pairing dial and the browser permission prompt as the first-run pairing facts (REQ-696 AC-8, REQ-1396 AC-1)', () => {
+    // Shipped first-run pairing facts: an actionable pairing URL, the editor's own
+    // dial on load, and the LNA permission explainer. REQ-1396 removed the
+    // "Connect consent gate" claim, which was false — `client.ts:646-666` dials
+    // unconditionally, and on a settled denial the Connect button is removed
+    // outright because no click can clear a browser-level block.
     expect(readme).toContain('Guided Pairing & Local Network Access (LNA)');
     expect(readme).toContain('no_tab');
     expect(readme).toContain('https://editor.figpea.com/?agent=1&bridgePort=');
+    // REQ-1396: `toContain('Connect')` is satisfied by "Connect to Agent…",
+    // "connected" or "Connecting", so on its own it passed a README with no gate
+    // claim AND one with a gate claim — it could not fail either way. The pin is
+    // kept for whatever legitimate `Connect` string survives; the negative pins
+    // are what make it load-bearing.
     expect(readme).toContain('Connect');
     expect(readme).toMatch(/Local Network Access|permission/i);
+    expect(readme).not.toMatch(/consent[- ]gate/i);
+    expect(readme).not.toMatch(/click(?:ing|s|ed)?\s+(?:the\s+)?\*{0,2}Connect\b/i);
+    expect(readme).not.toMatch(/programmatically click Connect/i);
 
     // Assert pre-REQ placeholder sentence is absent
     expect(readme).not.toMatch(/guided connect flow.*is in progress/i);
