@@ -133,6 +133,28 @@ const BASELINE_TEST_FILES = [
   'req1492BridgeSlotsCli.test.ts',
   'req1492ReadmeSlots.test.ts',
   'req1492Status.test.ts',
+  // REQ-1294's, REQ-1498's and REQ-1503's eleven suites, added to this baseline
+  // by the same rule the note above states (2026-10-05, janitor mcp_vitest) and
+  // for the same reason: a new suite must EXTEND the baseline, never bypass it.
+  // All three requirements landed their suites without touching this file (57bc6f9
+  // REQ-1294, 8a40db7 REQ-1498, b8b0259 REQ-1503), so AC-3's "adds no suite
+  // beyond the baseline" gate went red on correct additions. Extending the
+  // baseline is the documented remedy — the alternative, deleting or skipping a
+  // suite, is the thing AC-3 forbids. Measured at this tip with this file's own
+  // DECLARATION/SKIP_OR_ONLY regexes: 157 declarations across the eleven
+  // (17 + 5 + 24 + 7 + 18 + 23 + 1 + 15 + 19 + 21 + 7), and 0 skip/only
+  // constructs across all eleven, so they change no other pin here.
+  'req1294CollapsingHost.test.ts',
+  'req1294MatrixFormRelay.test.ts',
+  'req1498BatchOpsFile.test.ts',
+  'req1498DescribeEncoding.test.ts',
+  'req1498OpenFileRefusal.test.ts',
+  'req1498ReadmeOpsFile.test.ts',
+  'req1503BridgeSurvivesStdoutBreak.test.ts',
+  'req1503Liveness.test.ts',
+  'req1503ReadmeRecovery.test.ts',
+  'req1503RecoveryRoute.test.ts',
+  'req1503TimeoutRecovery.test.ts',
   'req870.test.ts',
   'skillFetch.test.ts',
   'skillProvenance.test.ts',

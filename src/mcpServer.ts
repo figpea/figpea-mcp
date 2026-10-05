@@ -21,6 +21,12 @@ import {
   type ParamSchemaLike,
 } from './tools';
 import { writeImageReturn, sessionDirFor } from './returnPath';
+// REQ-1498's payload-from-file READER, in its own module so this file owns no
+// `JSON.parse` at all — REQ-1280 AC-7's structural guarantee, which pins that
+// the `_rawJson` flag's parse has exactly one home and cannot be forked. The
+// parse that moved is a file's contents, not a call's argument; what stays here
+// is every decision about WHERE a payload lands.
+import { readArrayPayloadFromFile } from './opsFile';
 // REQ-1301 — the one place the loopback host is decided. Imported from a
 // neutral module (not from ./bridgeServer) so this file's structural stub seam
 // stays a stub seam: `cli.ts` always passes the real handle, which defines
@@ -723,19 +729,6 @@ function refusalMessage(
  * error-code vocabulary is therefore unchanged.
  * ------------------------------------------------------------------ */
 
-/**
- * The read ceiling for the payload file, in bytes. A READ guard, not a budget
- * claim: the editor still measures the substituted payload against its own
- * `argsChars` limit and refuses an over-budget array whole, so this number
- * only bounds what is loaded into memory before that happens.
- *
- * Sized so nothing legitimate is refused. The editor refuses above ~22 000
- * serialized characters of the whole `args`, two orders of magnitude below
- * this, so a payload that could ever succeed is far inside the ceiling — which
- * exists to stop a 2 GB path being loaded, not to move a limit.
- */
-const OPS_FILE_MAX_BYTES = 2 * 1024 * 1024;
-
 /** The option's advertised description. One string, declared in BOTH
  *  `.describe()` and `.meta()` — the SDK's zod→JSON-Schema conversion takes the
  *  META description in preference to `.describe()`, so a `.describe()`-only
@@ -747,14 +740,6 @@ const OPS_FILE_ADVICE =
   'argument budget still applies to the array read from the file, unchanged: read the live value at ' +
   'describe().limits.argsChars and chunk as usual. A missing file, unreadable file, unparseable JSON, or content ' +
   'that is not a non-empty array is refused with invalid_params naming the file and the reason.';
-
-/** Human wording for a JSON value's kind, for the not-an-array refusal. */
-function jsonKindOf(value: unknown): string {
-  if (value === null) return 'null';
-  if (Array.isArray(value)) return 'an array';
-  if (typeof value === 'object') return 'an object';
-  return `a ${typeof value}`;
-}
 
 /**
  * The name of this method's TOP-LEVEL `array`/`matrix` parameter, or
@@ -771,79 +756,6 @@ export function topLevelArrayParamName(paramSchemas: Record<string, ParamSchemaL
     .filter(([, schema]) => schema?.type === 'array' || schema?.type === 'matrix')
     .map(([name]) => name);
   return arrayParams.length === 1 ? arrayParams[0] : undefined;
-}
-
-/** How the option's refusal reads once a param name is known — shared by the
- *  value checks, so one bad option produces one grammar. */
-function opsFileValueRefusal(optionKey: string, message: string): { ok: false; code: string; message: string } {
-  return { ok: false, code: 'invalid_params', message: `${optionKey} ${message}` };
-}
-
-/**
- * Reads the JSON file at `raw` and returns the array it holds.
- *
- * ONE reader, called from both lanes, because a rule stated twice is two rules.
- * Every refusal here is pre-flight and zero-round-trip; the caller supplies the
- * key name it advertised (`_opsFile` in compact mode, `opsFile` on full mode's
- * generated tool) so the message names what the caller actually wrote.
- *
- * `paramSchema` is the slot's own declaration, used only to RENDER the element
- * wording in the not-an-array refusal — so the example cannot describe an
- * element shape the manifest does not declare.
- */
-export async function readArrayPayloadFromFile(
-  raw: unknown,
-  optionKey: string,
-  paramName: string,
-  paramSchema: ParamSchemaLike | undefined,
-): Promise<{ ok: true; value: unknown[] } | { ok: false; code: string; message: string }> {
-  if (typeof raw !== 'string') return opsFileValueRefusal(optionKey, 'must be a string');
-  if (raw.trim() === '') return opsFileValueRefusal(optionKey, 'cannot be empty');
-  let size: number;
-  try {
-    const st = await fs.promises.stat(raw);
-    if (!st.isFile()) {
-      // A directory, or anything else that is not a regular file. Byte-identical
-      // wording to the three existing file branches, so the four cannot drift.
-      return { ok: false, code: 'invalid_params', message: `file not found or not readable: ${raw}` };
-    }
-    size = st.size;
-  } catch {
-    return { ok: false, code: 'invalid_params', message: `file not found or not readable: ${raw}` };
-  }
-  // BEFORE the read: the point of the ceiling is that the bytes are never loaded.
-  if (size > OPS_FILE_MAX_BYTES) {
-    return {
-      ok: false,
-      code: 'invalid_params',
-      message: `${optionKey}: ${raw} is ${size} bytes, which exceeds the ${OPS_FILE_MAX_BYTES}-byte read limit. Split the payload across smaller files, or across several calls.`,
-    };
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(await fs.promises.readFile(raw, 'utf8'));
-  } catch (e) {
-    // AC-4: a diagnostic naming the FILE and the PARSE FAILURE — the reader's
-    // own message, quoted, so the caller is not left comparing two guesses.
-    const cause = e instanceof Error ? e.message : String(e);
-    return { ok: false, code: 'invalid_params', message: `${optionKey}: cannot parse ${raw} — ${cause}` };
-  }
-  if (!Array.isArray(parsed)) {
-    const element = paramSchema?.of?.shape ? ' of {method, args} operations' : '';
-    return {
-      ok: false,
-      code: 'invalid_params',
-      message: `${optionKey}: ${raw} must contain a JSON array${element} for "${paramName}", got ${jsonKindOf(parsed)}`,
-    };
-  }
-  if (parsed.length === 0) {
-    return {
-      ok: false,
-      code: 'invalid_params',
-      message: `${optionKey}: ${raw} contains an empty array; "${paramName}" must be a non-empty array`,
-    };
-  }
-  return { ok: true, value: parsed };
 }
 
 /**
