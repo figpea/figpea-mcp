@@ -52,6 +52,31 @@ interface TabClient {
   closed: { code: number; reason: string } | null;
 }
 
+/**
+ * The AGENT-ISSUED frames this tab received — every relayed contract-tool call,
+ * excluding the bridge's own bounded `session.document` probe.
+ *
+ * REQ-1451 added that probe to `status`, which is why this selector exists.
+ * `callFrames[0]` used to mean "the first call this tab saw" and was correct by
+ * accident, because `status` never called the tab at all. It now reads the
+ * probe, so an index-based wait answers the wrong `id` and the awaited
+ * `figpea_call` never resolves. Selecting by the frame a real call carries is
+ * STRICTER than indexing: it asserts WHICH call reached the tab, not merely that
+ * some frame did.
+ *
+ * `session.document` is excluded because it is a READ, and REQ-1451's guard
+ * deliberately never guards reads — the assertions below are about writes and
+ * about which tab they reach, which is what AC-4 and AC-7 are about.
+ */
+function agentCalls(tab: TabClient): any[] {
+  return tab.callFrames.filter((f) => !(f.group === 'session' && f.method === 'document'));
+}
+
+/** True when every frame the tab received is the bridge's own read probe. */
+function onlyDocumentProbes(tab: TabClient): boolean {
+  return tab.callFrames.every((f) => f.group === 'session' && f.method === 'document');
+}
+
 const openBridges: Array<{ close(): Promise<void> }> = [];
 const openSockets: WebSocket[] = [];
 const cleanupFns: Array<() => Promise<void>> = [];
@@ -125,6 +150,9 @@ async function connectTab(
   await waitForOpen(ws);
 
   const tab: TabClient = { ws, callFrames: [], closed: null };
+  // Each stand-in tab answers `session.document` with its OWN identity, keyed on
+  // its origin, so two tabs in one bridge are observably two documents.
+  const documentId = `doc-${options?.origin ?? 'default'}`;
   ws.on('message', (data: WebSocket.RawData) => {
     let frame: any;
     try {
@@ -132,7 +160,26 @@ async function connectTab(
     } catch {
       return;
     }
-    if (frame?.type === 'call') tab.callFrames.push(frame);
+    if (frame?.type === 'call') {
+      tab.callFrames.push(frame);
+      // REQ-1451: `status` now makes ONE bounded tab-side read of its own,
+      // `session.document`, on every call it serves. A real editor answers that
+      // from its live project, so this fake tab answers it too — and it is
+      // recorded in `callFrames` like any other call, because hiding it would
+      // let the routing assertions below pass for the wrong reason: `callFrames[0]`
+      // used to be the first frame a tab saw, and it is now a `status` probe.
+      if (frame.group === 'session' && frame.method === 'document') {
+        ws.send(
+          JSON.stringify({
+            type: 'result',
+            id: frame.id,
+            ok: true,
+            value: { documentId, documentName: 'Untitled design' },
+          }),
+        );
+        return;
+      }
+    }
     if (frame?.type !== 'describe') return;
     // A real editor answers the bare probe with the COMPACT index (a group maps
     // to its one-line doc string) and a selector with THAT group's descriptors
@@ -335,14 +382,21 @@ describe('REQ-1492 AC-4 — select_tab moves the pointer AND re-describes the se
     // different document, and must not receive a write nobody sent it.
     const callPromise = client.callTool({ name: 'figpea_call', arguments: { group: 'layer', method: 'create', args: ['rect'] } });
     const frame = await waitFor(
-      () => second.callFrames[0],
+      () => agentCalls(second)[0],
       (f) => f !== undefined,
       'the call frame reaches the selected tab',
     );
+    expect(frame, 'and it is the layer.create this test issued').toMatchObject({ group: 'layer', method: 'create' });
     second.ws.send(JSON.stringify({ type: 'result', id: frame.id, ok: true, value: { id: 'layer-b' } }));
     const result = await callPromise;
     expect((result as any).content[0].text).toContain('layer-b');
-    expect(first.callFrames, 'tab A received nothing — its document is untouched').toHaveLength(0);
+    // Tab A is not addressed any more, so no AGENT-ISSUED call reaches it — the
+    // write went to the selected tab only. `status`'s own `session.document` READ
+    // may still have reached it (that is what `status` does, and a read is never
+    // guarded), so this asserts the stronger, more specific thing rather than the
+    // old accidental one: nothing tab A received was anything but that read.
+    expect(agentCalls(first), 'tab A received no agent-issued call — its document is untouched').toHaveLength(0);
+    expect(onlyDocumentProbes(first), 'and every frame it did receive was `status`\'s own document read').toBe(true);
 
     // The registered tool surface must describe the tab calls now reach. With two
     // deliberately different contract versions, a stale re-publication is visible.
@@ -394,10 +448,14 @@ describe('REQ-1492 AC-7 — the refusal is published on the same payload as ever
     // The incumbent is still the one being served.
     const callPromise = client.callTool({ name: 'figpea_call', arguments: { group: 'session', method: 'layerTree', args: [] } });
     const frame = await waitFor(
-      () => incumbent.callFrames[0],
+      () => agentCalls(incumbent)[0],
       (f) => f !== undefined,
       'the incumbent still receives relayed calls',
     );
+    expect(frame, 'and it is the session.layerTree this test issued').toMatchObject({
+      group: 'session',
+      method: 'layerTree',
+    });
     incumbent.ws.send(JSON.stringify({ type: 'result', id: frame.id, ok: true, value: { id: 'root' } }));
     await callPromise;
   });

@@ -217,6 +217,14 @@ describe('REQ-1457 AC-5 — the six pre-existing fields keep their names and mea
       // that is what it still checks: `liveness` is declared here purely so the
       // collection stays exact, and `req1503Liveness.test.ts` owns what the new
       // block contains.
+      //
+      // REQ-1451 (2026-10-05) added `document` — the active design's `{id, name}`
+      // — for the same declared reason: a new, additive key an agent can ignore,
+      // `null` when it cannot be read, with no pre-existing key renamed, retyped
+      // or redefined. It is also re-pinned in REQ-1394's copy and in
+      // `req1451-status-document.test.ts`, so all three pins must name the same
+      // keys or one of them goes red for a reason that has nothing to do with
+      // the requirement it belongs to.
       expect(Object.keys(s).sort(), `status key set in ${toolMode} mode`).toEqual(
         [
           ...OLD_KEYS,
@@ -228,6 +236,7 @@ describe('REQ-1457 AC-5 — the six pre-existing fields keep their names and mea
           'tab',
           'connections',
           'liveness',
+          'document',
         ].sort(),
       );
     });

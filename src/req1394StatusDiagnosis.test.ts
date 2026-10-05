@@ -400,6 +400,17 @@ describe('REQ-1394 AC-2 — nothing that `status` means today changed', () => {
       // REQ-owned assertions about the block's contents and its calibration live
       // in `req1503Liveness.test.ts`; this row stays the mechanical net and
       // stays EXACT.
+      //
+      // REQ-1451 (2026-10-05) grows it by exactly one more — `document`, the
+      // active design's `{id, name}` — for the same declared reason: a new,
+      // additive key an agent can ignore, `null` when it cannot be read, with no
+      // pre-existing key renamed, retyped or redefined. It is a second axis
+      // beside `connection`, not a reinterpretation of it: `connection` reports
+      // how the socket is, `document` reports which design the socket is pointed
+      // at. Its own REQ-owned assertions (swap visibility, total degradation to
+      // `null`) live in `req1451-status-document.test.ts`; this row stays the
+      // mechanical net and stays EXACT. REQ-1394's promise — "nothing that
+      // `status` means today changed" — is preserved rather than weakened.
       expect(Object.keys(s).sort(), `status key set in ${toolMode} mode`).toEqual(
         [
           ...OLD_KEYS,
@@ -411,6 +422,7 @@ describe('REQ-1394 AC-2 — nothing that `status` means today changed', () => {
           'tab',
           'connections',
           'liveness',
+          'document',
         ].sort(),
       );
       // …and with NO tab paired the new block is honestly empty rather than

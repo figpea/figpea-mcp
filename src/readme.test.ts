@@ -674,6 +674,68 @@ describe('README.md (AC-5)', () => {
     expect(setPageFill, 'and why the JSON-string route did not save it').toMatch(/never descends into an object/i);
   });
 
+  it('states the durability boundary: a project only in the live tab is not durable, and an exported .fp is the only durable form (REQ-1451 AC-7)', () => {
+    // AC-7's own claim, in both halves. The section is located by its heading
+    // so the assertions are about the durability paragraph and not about the
+    // whole document — a phrase like "sync" appearing in an unrelated section
+    // must not be able to satisfy (or break) this.
+    const lines = readme.split('\n');
+    const start = lines.findIndex((l) => /^##\s+Durability/i.test(l));
+    expect(start, 'the durability section exists').toBeGreaterThan(-1);
+    const section: string[] = [];
+    for (let i = start + 1; i < lines.length && !/^##\s/.test(lines[i]!); i++) section.push(lines[i]!);
+    const text = section.join('\n');
+
+    // Half one — the honesty the card is really about: what an agent believes
+    // it has, when it has only the live tab.
+    expect(text, 'a project existing only in the live tab is named as not durable').toMatch(
+      /only in the live[^.]*is not durable|live editor tab is not durable/i,
+    );
+    // Half two — what IS durable, named concretely rather than as "save first".
+    expect(text, 'an exported .fp checkpoint is named as the only durable form').toMatch(/\.fp/);
+    expect(text, 'and it is the ONLY durable form').toMatch(/only durable form/i);
+    // The `.fp` must be named as the thing that survives, not merely mentioned.
+    expect(text, 'the .fp is named as what survives').toMatch(/\.fp[^.]*(only durable|is what survives|survives)/i);
+
+    // The trap the marketing brief flagged: an agent reading "it saves" would
+    // believe a PSD/XD/.fig round-trips, which it does not. So the section must
+    // not CLAIM autosave, a save-back, or a sync.
+    //
+    // Matching is done against the AFFIRMATIVE sentences only. The section has
+    // to be able to say "there is no save-back" — that denial is required
+    // content — so a naive substring scan over the whole section would fail the
+    // very prose AC-7 needs. A sentence is dropped when it carries a negation
+    // before the keyword ("no", "not", "never", "does not", "don't"), which is
+    // why the required-denial assertion below exists as a separate check: it
+    // proves the denial is really there rather than the keyword simply having
+    // been scrubbed out to make this loop pass.
+    const affirmative = text
+      .split(/(?<=[.!?:])\s+/)
+      .filter((s) => !/\b(no|not|never|does not|do not|don't|without|cannot|can't)\b/i.test(s))
+      .join(' ');
+    for (const forbidden of [/autosave/i, /auto-save/i, /save[ -]?back/i, /\bsyncs?\b/i, /\bsynchronis/i]) {
+      expect(affirmative, `${forbidden} is NOT CLAIMED — it would be false`).not.toMatch(forbidden);
+    }
+    expect(text, 'and the no-save-back truth is stated outright').toMatch(
+      /does not write back|no save-back|never writes? back/i,
+    );
+
+    // AC-6/AC-5 honesty in the same breath: the guard's promise is scoped to a
+    // mutation that WAS given an expected identifier.
+    expect(text, 'the guard is scoped to a mutation given an expected identifier').toMatch(/expectDocument/);
+  });
+
+  it('documents status.document as the way to detect a swap without mutating (REQ-1451 AC-4)', () => {
+    // The README is the only surface a third-party developer of this published
+    // package reads before wiring it up, so the new key is documented where
+    // `status` itself is documented — not in a section nobody looks in.
+    const row = readme.split('\n').find((l) => /^\|\s*`status`\s*\|/.test(l));
+    expect(row, 'the status tool row exists').toBeDefined();
+    expect(row!, 'and names the document identity it now reports').toMatch(/`document`/);
+    expect(row!, 'naming both halves of the payload').toMatch(/id/);
+    expect(row!, 'and the degradation').toMatch(/null/);
+  });
+
   it('points at figpea_describe rather than quoting the new diagnostic text (REQ-1444)', () => {
     // The pointer has to name the ONE authority that cannot drift. Quoting the
     // pre-flight's own sentence here would put a second copy of it in the

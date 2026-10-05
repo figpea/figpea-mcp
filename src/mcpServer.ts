@@ -817,6 +817,36 @@ function opsFileNoArrayParamRefusal(optionKey: string): { ok: false; code: strin
  * registered (OQ-4); contract tools are registered/updated from the bridge's
  * live `describe()` manifest on every connect/reconnect.
  */
+/**
+ * REQ-1451 T6 (AC-4) — the bounded deadline for `status`'s one tab-side
+ * document read.
+ *
+ * Deliberately far below `DEFAULT_CALL_TIMEOUT_MS` (60 s, `callTimeout.ts`).
+ * That default is right for a call that may CREATE something, where a slow
+ * answer beats a false failure. `status` is the opposite: it is the diagnostic
+ * an agent reaches for when something is already wrong, and it is called
+ * repeatedly, so it must not stall on a tab that will never answer. 2 s is the
+ * honest trade:
+ *
+ *  - Long enough that a busy-but-healthy tab answers inside it. The read is two
+ *    property reads off the live project — no tree walk, no serialization —
+ *    which is exactly why AC-4 needed a dedicated `session.document` method
+ *    rather than reusing `layerTree()`. A tab that cannot answer two property
+ *    reads in 2 s is wedged, not busy.
+ *  - Short enough that the degradation is reached while the agent still cares
+ *    about the answer. Every `status` call pays this at most once, so a wedged
+ *    tab costs a 2 s stall per call rather than a 60 s one — and `status` is
+ *    precisely the call an agent makes repeatedly while something is wrong, so
+ *    the difference between 2 s and 60 s is the difference between a usable
+ *    diagnostic loop and an unusable one.
+ *
+ * This is the cost of the `document` key, stated rather than hidden: against a
+ * tab that ignores the call, `status` is now bounded by this deadline instead
+ * of answering instantly. It is paid only in that state, and it buys the swap
+ * detection AC-4 asks for in every healthy state.
+ */
+const DOCUMENT_READ_TIMEOUT_MS = 2_000;
+
 export function createMcpServer(bridge: BridgeServerHandleLike, options?: CreateMcpServerOptions): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
@@ -901,6 +931,54 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     return options?.buildStatus ? options.buildStatus() : servingBuild();
   }
 
+  /**
+   * REQ-1451 T6 (AC-4) — the active document's `{id, name}`, or `null`.
+   *
+   * This is the ONE tab-side call `status` makes, and it is bounded on purpose.
+   * `status` is the call an agent makes when something is already wrong, so it
+   * must never block: a wedged tab answers `null` after
+   * `DOCUMENT_READ_TIMEOUT_MS` rather than holding the tool open for the flat
+   * 60 s contract-call default, which would be the worst possible trade for a
+   * diagnostic read.
+   *
+   * DEGRADATION IS TOTAL AND SILENT in all four cases, and every one of them is
+   * a normal state rather than a fault:
+   *   - no tab paired (matching `contractVersion: null`);
+   *   - a tab that predates `session.document` — ORDINARY, because this package
+   *     self-syncs its contract at runtime by origin fetch, so a newer MCP
+   *     paired with an older editor is a supported combination, not a version
+   *     error to surface;
+   *   - a tab that answers something unusable (a non-object, a missing id, a
+   *     `{ok:false}` envelope) — never passed through raw;
+   *   - a bounded-call timeout.
+   *
+   * Never an error and never a throw: a status call that fails to learn the
+   * document is still a status call that answers everything else.
+   */
+  async function activeDocument(): Promise<{ id: string; name: string } | null> {
+    if (!bridge.isTabConnected()) return null;
+    try {
+      const raw = await bridge.callTab('session', 'document', [], DOCUMENT_READ_TIMEOUT_MS);
+      // The relay resolves the tab's `{ok, value}` envelope; an older tab that
+      // has no such method rejects or answers `{ok:false}`, so the shape is
+      // checked rather than trusted.
+      const value = (raw && typeof raw === 'object' && 'value' in (raw as Record<string, unknown>)
+        ? (raw as Record<string, unknown>).value
+        : raw) as Record<string, unknown> | undefined;
+      if (!value || typeof value !== 'object') return null;
+      const id = value.documentId;
+      const name = value.documentName;
+      if (typeof id !== 'string' || !id) return null;
+      return { id, name: typeof name === 'string' ? name : '' };
+    } catch {
+      // No tab (it disconnected mid-call), an older tab without the method, or
+      // the bounded deadline. All are `null`; none is worth failing `status`
+      // over, and none may surface as a raw bridge error to the agent.
+      return null;
+    }
+  }
+
+
   function buildConnectUrl(perCallBaseUrl?: string, fileArg?: string): string {
     const url = new URL(resolveEditorBaseUrl(perCallBaseUrl));
     url.searchParams.set('agent', '1');
@@ -935,7 +1013,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     'status',
     {
       description:
-        "Reports the bridge's port, whether an editor tab is connected, the connected tab's contract version (null if none), and how many contract tools are currently registered. Also returns token and url so an LLM can construct the paste-ready pairing string without re-launching (REQ-1035). Returns a `connection` block naming WHY a tab is not connected — `lastEvent` (no_attempt, transport_only, hello_timeout, hello_rejected, hello_accepted, slot_refused, tab_superseded, disconnected) with the `nextStep` it implies, plus per-process counters and the run's `startedAt`; read it instead of re-trying a pairing blindly. `slot_refused` means a second tab asked for this bridge's single slot and did not get it — the tab already paired is untouched and still serving; open it with --bridge-slots=multi (or FIGPEA_BRIDGE_SLOTS=multi) to pair both at once. Also returns WHICH BUILD is answering: a `build` block (`version`, `buildId`, `builtAt`, `servedAt`, `root`) and a top-level `buildStale` boolean. Read `buildStale` BEFORE spending time on a call that fails in a way the current source would not — your MCP host owns this process and does not restart it when a newer build lands on disk, so a stale process answers with code from before the fix and the failure reads as a bug in the design file. `buildStale: true` means restart the MCP server; when it is false, `build.buildId` is provably the build this process loaded, so match it against the commit you are reading the source of. It says nothing about the connected editor tab's build (REQ-1457). REQ-1492 adds WHICH TAB it is attached to: a `tab` block (`connectionId`, `origin`, `originSource`, `contractVersion`, `pairedAt`) naming the tab this call is answered for, a `connections[]` list of every paired tab with its own id/origin/contract version and `active` flag, `activeConnectionId`, and `bridgeSlots` ('single' or 'multi' — how this bridge serves tabs). Read `tab.origin` and `tab.contractVersion` BEFORE a destructive write: assert you are on the document you expect. `originSource` is 'handshake' when the tab's connection carried an Origin header and 'absent' when it did not, so origin null means the browser declined to send one, never a value this server guessed. REQ-1503 adds a `liveness` block beside `tabConnected`, naming whether the TAB is ANSWERING: `state` (unpaired, unknown, responsive, unresponsive) with the `nextStep` that token implies, plus `connectionId`, `inFlight`, `oldestInFlightMs`, `consecutiveTimeouts`, `lastAnswerAt` and `lastTimeoutAt`. `tabConnected` keeps its own meaning — the socket is open — and cannot see a wedged tab, because a frozen tab holds its socket open forever while every call times out; read `liveness` BEFORE retrying a timed-out call. It reports what this bridge OBSERVED, never why: `unresponsive` is two calls in a row going unanswered, or one on a tab that had never answered, and it is NOT proof the tab failed — a large project mid-render and a frozen tab look identical from here, and a timed-out call may still land. `unknown` means nothing has been observed yet, not that the tab is healthy; in-flight age is published as `inFlight`/`oldestInFlightMs` rather than folded into the state, because a slow `session.openFile` runs 120000ms by its own documented default. It describes the tab calls are ADDRESSED TO — read `activeConnectionId` to know which one that is, and `select_tab` to change it. With the MCP channel gone, the same facts are readable over the bridge's own `GET /state` and a call can be relayed over its token-gated `POST /call`, so a run can be finished without this server: the bridge keeps serving without the MCP channel (README → Recovering a lost session).",
+        "Reports the bridge's port, whether an editor tab is connected, the connected tab's contract version (null if none), and how many contract tools are currently registered. Also returns token and url so an LLM can construct the paste-ready pairing string without re-launching (REQ-1035). Returns a `connection` block naming WHY a tab is not connected — `lastEvent` (no_attempt, transport_only, hello_timeout, hello_rejected, hello_accepted, slot_refused, tab_superseded, disconnected) with the `nextStep` it implies, plus per-process counters and the run's `startedAt`; read it instead of re-trying a pairing blindly. Returns `document` — the active design's `{id, name}`, or null with no tab, with an older tab, or when the tab does not answer — so you can tell WHICH design you are pointed at, and notice that it changed between two calls, without issuing a mutation first. Pair it with the tab's `session.expectDocument` to make a mutation refuse itself against the wrong design. `slot_refused` means a second tab asked for this bridge's single slot and did not get it — the tab already paired is untouched and still serving; open it with --bridge-slots=multi (or FIGPEA_BRIDGE_SLOTS=multi) to pair both at once. Also returns WHICH BUILD is answering: a `build` block (`version`, `buildId`, `builtAt`, `servedAt`, `root`) and a top-level `buildStale` boolean. Read `buildStale` BEFORE spending time on a call that fails in a way the current source would not — your MCP host owns this process and does not restart it when a newer build lands on disk, so a stale process answers with code from before the fix and the failure reads as a bug in the design file. `buildStale: true` means restart the MCP server; when it is false, `build.buildId` is provably the build this process loaded, so match it against the commit you are reading the source of. It says nothing about the connected editor tab's build (REQ-1457). REQ-1492 adds WHICH TAB it is attached to: a `tab` block (`connectionId`, `origin`, `originSource`, `contractVersion`, `pairedAt`) naming the tab this call is answered for, a `connections[]` list of every paired tab with its own id/origin/contract version and `active` flag, `activeConnectionId`, and `bridgeSlots` ('single' or 'multi' — how this bridge serves tabs). Read `tab.origin` and `tab.contractVersion` BEFORE a destructive write: assert you are on the document you expect. `originSource` is 'handshake' when the tab's connection carried an Origin header and 'absent' when it did not, so origin null means the browser declined to send one, never a value this server guessed. REQ-1503 adds a `liveness` block beside `tabConnected`, naming whether the TAB is ANSWERING: `state` (unpaired, unknown, responsive, unresponsive) with the `nextStep` that token implies, plus `connectionId`, `inFlight`, `oldestInFlightMs`, `consecutiveTimeouts`, `lastAnswerAt` and `lastTimeoutAt`. `tabConnected` keeps its own meaning — the socket is open — and cannot see a wedged tab, because a frozen tab holds its socket open forever while every call times out; read `liveness` BEFORE retrying a timed-out call. It reports what this bridge OBSERVED, never why: `unresponsive` is two calls in a row going unanswered, or one on a tab that had never answered, and it is NOT proof the tab failed — a large project mid-render and a frozen tab look identical from here, and a timed-out call may still land. `unknown` means nothing has been observed yet, not that the tab is healthy; in-flight age is published as `inFlight`/`oldestInFlightMs` rather than folded into the state, because a slow `session.openFile` runs 120000ms by its own documented default. It describes the tab calls are ADDRESSED TO — read `activeConnectionId` to know which one that is, and `select_tab` to change it. With the MCP channel gone, the same facts are readable over the bridge's own `GET /state` and a call can be relayed over its token-gated `POST /call`, so a run can be finished without this server: the bridge keeps serving without the MCP channel (README → Recovering a lost session).",
     },
     async () => {
       const { build, stale } = buildFacts();
@@ -966,6 +1044,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         connection: connectionDiagnosis(),
         build,
         buildStale: stale,
+        document: await activeDocument(),
       });
     },
   );
