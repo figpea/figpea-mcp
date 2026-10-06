@@ -244,6 +244,29 @@ function quoteForHint(value: string): string {
   return JSON.stringify(capped);
 }
 
+/**
+ * REQ-1522 AC-4 — "may this call be re-issued?", answered in ONE place.
+ *
+ * It is asked in two places that must never disagree. The timeout envelope
+ * already tells an agent what to do next, and its branches rest on these two
+ * sets: a read or an export gets "re-issue is safe", anything else gets the
+ * conservative route. The bridge's refusal of an identical re-issue rests on
+ * exactly the same question, and a guard that disagreed with the prose beside
+ * it would refuse a read the envelope had just told the agent to repeat — so
+ * the predicate is exported from here, next to the two sets it consults, rather
+ * than re-derived wherever it is needed.
+ *
+ * Both directions matter and they are not the same claim. `true` means re-
+ * issuing cannot half-apply anything in the design, which is why the refusal
+ * never fires for these; `false` means only that re-issuing is not known to be
+ * safe, NOT that it is known to be harmful — an unaudited method falls here
+ * because these are positive allowlists that fail closed, and the conservative
+ * answer is the one that cannot duplicate a layer.
+ */
+export function isReissueSafe(toolName: string): boolean {
+  return REISSUE_SAFE_READS.has(toolName) || REISSUE_SAFE_EXPORTS.has(toolName);
+}
+
 /** REQ-1282 AC-3 — the one clause appended to a relay timeout envelope: the
  * specific, callable state check that resolves the ambiguity.
  *

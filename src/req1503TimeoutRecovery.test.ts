@@ -256,16 +256,24 @@ describe('REQ-1503 — the timeout envelope gains a recovery clause', () => {
       ],
       [
         'compact mode',
+        // REQ-1522 AC-4: a different layer KIND from the full-mode row above, so
+        // the two lanes are not the same call — an identical re-issue of an
+        // unresolved call is refused, and this test is about the envelope
+        // reaching both lanes, not about a retry. The kind is not interpolated
+        // into the hint, so every message assertion below is unchanged.
         await callToolJson(compactClient, 'figpea_call', {
           group: 'layer',
           method: 'create',
-          args: ['text', { name: 'cat-label' }],
+          args: ['rect', { name: 'cat-label' }],
           _timeoutMs: 60,
         }),
       ],
     ] as const) {
       expect(result.ok, `${lane}: a timed-out call is a failed envelope`).toBe(false);
-      expect(result.code).toBe('bridge_error');
+      // REQ-1522 AC-2: the deadline now carries its own code, so a caller
+      // branching on `code` can tell it from a hard relay failure. The recovery
+      // clause assertions below are untouched.
+      expect(result.code).toBe('bridge_timeout_maybe_applied');
       for (const pinned of PINNED_SUBSTRINGS) {
         expect(result.message, `${lane}: "${pinned}" survives verbatim`).toContain(pinned);
       }

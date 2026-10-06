@@ -49,6 +49,11 @@ import {
   type RawJsonSchemaLike,
 } from './rawJson';
 import { resolveTimeoutMs } from './callTimeout';
+// REQ-1522 — the outcome-code literals, for the tool descriptions only.
+// Importing a LEAF is not the coupling `callTimeout.ts`/`tabLiveness.ts`
+// refuse: nothing here imports `bridgeServer.ts`, and the runtime code still
+// crosses the boundary on the error object (see `relayErrorCode` below).
+import { OUTCOME_PREVIOUS_UNRESOLVED, OUTCOME_TIMEOUT_MAYBE_APPLIED } from './callOutcome';
 // REQ-1394 — the one connection-diagnosis vocabulary and its actionable
 // sentences, imported from the same zero-import leaf the bridge records into.
 // `getConnectionDiagnosis` is OPTIONAL below, so the ~45 test files that build a
@@ -211,7 +216,51 @@ export { MAX_CALL_TIMEOUT_MS, DEFAULT_TIMEOUT_TABLE_MS } from './callTimeout';
  * the whole point of extracting it.
  */
 const TIMEOUT_KNOB_ADVICE =
-  'The default can be too low during a burst of mutations, where the editor is still settling after the relay has already given up — pass _timeoutMs deliberately (90000 is a legal value) rather than discovering the limit by timing out. Clamped to 120000, not rejected.';
+  'The default can be too low during a burst of mutations, where the editor is still settling after the relay has already given up — pass _timeoutMs deliberately (90000 is a legal value) rather than discovering the limit by timing out. Clamped to 120000, not rejected. ' +
+  // REQ-1522 AC-6: the OUTCOME vocabulary, in the one string every site already
+  // advertises, because `_timeoutMs` is the key an agent reaches for at the
+  // moment it decides whether to wait — which is the moment it also needs to
+  // know what a timeout will tell it.
+  //
+  // The code literals are INTERPOLATED from `callOutcome.ts`, not typed here.
+  // That is the same discipline as the rest of this package's shared strings
+  // ("one place, one number"), and it is stronger than the pin a test could
+  // give: renaming the constant moves this sentence with it, instead of turning
+  // a test red and waiting for someone to reword four prose surfaces. The
+  // markdown README cannot be interpolated, so THAT surface is pinned by
+  // `req1522OutcomeDocs.test.ts`, which compares the docs against the same
+  // export.
+  //
+  // The claim is deliberately not "the ambiguity is resolved": the code says
+  // the deadline fired and the change may have landed, and the sentence names
+  // the state check rather than a retry — because an identical re-issue of a
+  // non-idempotent call is now REFUSED, so "retry it" would be advice this
+  // server will not carry out.
+  `If a call does time out you get code ${OUTCOME_TIMEOUT_MAYBE_APPLIED} — the deadline fired and the change may have landed, so it is not a failure report — and an identical re-issue of a non-idempotent call is refused with ${OUTCOME_PREVIOUS_UNRESOLVED} rather than applied twice. Run the state check the message names.`;
+
+/**
+ * REQ-1522 — the one place a relay rejection becomes an envelope `code`.
+ *
+ * The relay rejects a call that crossed its deadline with an error carrying its
+ * own code, and this layer passes that code through instead of flattening
+ * everything into `bridge_error`. It is read STRUCTURALLY, off the rejection,
+ * with `bridge_error` as the fallback: `mcpServer.ts` must never import
+ * `bridgeServer.ts` (nor the reverse), which is the discipline `callTimeout.ts`,
+ * `tabLiveness.ts` and `buildIdentity.ts` all exist to keep, and reading the
+ * property honours it — the two files agree on the vocabulary without knowing
+ * each other exists.
+ *
+ * The fallback is what makes the new codes additions rather than a
+ * redefinition: `bridge_error` still means no tab, socket gone, malformed relay,
+ * and a rejection that carries no code at all (a bridge stub in a test, an
+ * older build behind the same handle) keeps reporting exactly what it always
+ * did, because a bridge that cannot say which failure it was should not have
+ * its silence turned into a specific claim.
+ */
+function relayErrorCode(err: unknown): string {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && code !== '' ? code : 'bridge_error';
+}
 
 /**
  * REQ-1432 T6 — the per-call args budget, on `figpea_call`'s own description
@@ -1013,7 +1062,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
     'status',
     {
       description:
-        "Reports the bridge's port, whether an editor tab is connected, the connected tab's contract version (null if none), and how many contract tools are currently registered. Also returns token and url so an LLM can construct the paste-ready pairing string without re-launching (REQ-1035). Returns a `connection` block naming WHY a tab is not connected — `lastEvent` (no_attempt, transport_only, hello_timeout, hello_rejected, hello_accepted, slot_refused, tab_superseded, disconnected) with the `nextStep` it implies, plus per-process counters and the run's `startedAt`; read it instead of re-trying a pairing blindly. Returns `document` — the active design's `{id, name}`, or null with no tab, with an older tab, or when the tab does not answer — so you can tell WHICH design you are pointed at, and notice that it changed between two calls, without issuing a mutation first. Pair it with the tab's `session.expectDocument` to make a mutation refuse itself against the wrong design. `slot_refused` means a second tab asked for this bridge's single slot and did not get it — the tab already paired is untouched and still serving; open it with --bridge-slots=multi (or FIGPEA_BRIDGE_SLOTS=multi) to pair both at once. Also returns WHICH BUILD is answering: a `build` block (`version`, `buildId`, `builtAt`, `servedAt`, `root`) and a top-level `buildStale` boolean. Read `buildStale` BEFORE spending time on a call that fails in a way the current source would not — your MCP host owns this process and does not restart it when a newer build lands on disk, so a stale process answers with code from before the fix and the failure reads as a bug in the design file. `buildStale: true` means restart the MCP server; when it is false, `build.buildId` is provably the build this process loaded, so match it against the commit you are reading the source of. It says nothing about the connected editor tab's build (REQ-1457). REQ-1492 adds WHICH TAB it is attached to: a `tab` block (`connectionId`, `origin`, `originSource`, `contractVersion`, `pairedAt`) naming the tab this call is answered for, a `connections[]` list of every paired tab with its own id/origin/contract version and `active` flag, `activeConnectionId`, and `bridgeSlots` ('single' or 'multi' — how this bridge serves tabs). Read `tab.origin` and `tab.contractVersion` BEFORE a destructive write: assert you are on the document you expect. `originSource` is 'handshake' when the tab's connection carried an Origin header and 'absent' when it did not, so origin null means the browser declined to send one, never a value this server guessed. REQ-1503 adds a `liveness` block beside `tabConnected`, naming whether the TAB is ANSWERING: `state` (unpaired, unknown, responsive, unresponsive) with the `nextStep` that token implies, plus `connectionId`, `inFlight`, `oldestInFlightMs`, `consecutiveTimeouts`, `lastAnswerAt` and `lastTimeoutAt`. `tabConnected` keeps its own meaning — the socket is open — and cannot see a wedged tab, because a frozen tab holds its socket open forever while every call times out; read `liveness` BEFORE retrying a timed-out call. It reports what this bridge OBSERVED, never why: `unresponsive` is two calls in a row going unanswered, or one on a tab that had never answered, and it is NOT proof the tab failed — a large project mid-render and a frozen tab look identical from here, and a timed-out call may still land. `unknown` means nothing has been observed yet, not that the tab is healthy; in-flight age is published as `inFlight`/`oldestInFlightMs` rather than folded into the state, because a slow `session.openFile` runs 120000ms by its own documented default. It describes the tab calls are ADDRESSED TO — read `activeConnectionId` to know which one that is, and `select_tab` to change it. With the MCP channel gone, the same facts are readable over the bridge's own `GET /state` and a call can be relayed over its token-gated `POST /call`, so a run can be finished without this server: the bridge keeps serving without the MCP channel (README → Recovering a lost session).",
+        "Reports the bridge's port, whether an editor tab is connected, the connected tab's contract version (null if none), and how many contract tools are currently registered. Also returns token and url so an LLM can construct the paste-ready pairing string without re-launching (REQ-1035). Returns a `connection` block naming WHY a tab is not connected — `lastEvent` (no_attempt, transport_only, hello_timeout, hello_rejected, hello_accepted, slot_refused, tab_superseded, disconnected) with the `nextStep` it implies, plus per-process counters and the run's `startedAt`; read it instead of re-trying a pairing blindly. Returns `document` — the active design's `{id, name}`, or null with no tab, with an older tab, or when the tab does not answer — so you can tell WHICH design you are pointed at, and notice that it changed between two calls, without issuing a mutation first. Pair it with the tab's `session.expectDocument` to make a mutation refuse itself against the wrong design. `slot_refused` means a second tab asked for this bridge's single slot and did not get it — the tab already paired is untouched and still serving; open it with --bridge-slots=multi (or FIGPEA_BRIDGE_SLOTS=multi) to pair both at once. Also returns WHICH BUILD is answering: a `build` block (`version`, `buildId`, `builtAt`, `servedAt`, `root`) and a top-level `buildStale` boolean. Read `buildStale` BEFORE spending time on a call that fails in a way the current source would not — your MCP host owns this process and does not restart it when a newer build lands on disk, so a stale process answers with code from before the fix and the failure reads as a bug in the design file. `buildStale: true` means restart the MCP server; when it is false, `build.buildId` is provably the build this process loaded, so match it against the commit you are reading the source of. It says nothing about the connected editor tab's build (REQ-1457). REQ-1492 adds WHICH TAB it is attached to: a `tab` block (`connectionId`, `origin`, `originSource`, `contractVersion`, `pairedAt`) naming the tab this call is answered for, a `connections[]` list of every paired tab with its own id/origin/contract version and `active` flag, `activeConnectionId`, and `bridgeSlots` ('single' or 'multi' — how this bridge serves tabs). Read `tab.origin` and `tab.contractVersion` BEFORE a destructive write: assert you are on the document you expect. `originSource` is 'handshake' when the tab's connection carried an Origin header and 'absent' when it did not, so origin null means the browser declined to send one, never a value this server guessed. REQ-1503 adds a `liveness` block beside `tabConnected`, naming whether the TAB is ANSWERING: `state` (unpaired, unknown, responsive, unresponsive) with the `nextStep` that token implies, plus `connectionId`, `inFlight`, `oldestInFlightMs`, `consecutiveTimeouts`, `lastAnswerAt` and `lastTimeoutAt`. `tabConnected` keeps its own meaning — the socket is open — and cannot see a wedged tab, because a frozen tab holds its socket open forever while every call times out; read `liveness` BEFORE retrying a timed-out call. REQ-1522 names that call's code: a timed-out call comes back as `bridge_timeout_maybe_applied`, meaning the deadline fired and the change MAY have landed (it is not a failure report), and re-issuing an identical non-idempotent call is then REFUSED with `bridge_previous_call_unresolved` rather than applied twice — so the state check the timeout message names is the route forward, not a retry. A `bridge_error` is the different case: the call was never delivered at all. It reports what this bridge OBSERVED, never why: `unresponsive` is two calls in a row going unanswered, or one on a tab that had never answered, and it is NOT proof the tab failed — a large project mid-render and a frozen tab look identical from here, and a timed-out call may still land. `unknown` means nothing has been observed yet, not that the tab is healthy; in-flight age is published as `inFlight`/`oldestInFlightMs` rather than folded into the state, because a slow `session.openFile` runs 120000ms by its own documented default. It describes the tab calls are ADDRESSED TO — read `activeConnectionId` to know which one that is, and `select_tab` to change it. With the MCP channel gone, the same facts are readable over the bridge's own `GET /state` and a call can be relayed over its token-gated `POST /call`, so a run can be finished without this server: the bridge keeps serving without the MCP channel (README → Recovering a lost session).",
     },
     async () => {
       const { build, stale } = buildFacts();
@@ -2243,7 +2292,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
           );
         } catch (e) {
           return toCallToolResult(
-            resultToContent({ ok: false, code: 'bridge_error', message: e instanceof Error ? e.message : String(e) }),
+            resultToContent({ ok: false, code: relayErrorCode(e), message: e instanceof Error ? e.message : String(e) }),
           );
         }
       },
@@ -2978,7 +3027,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
         );
       } catch (e) {
         return toCallToolResult(
-          resultToContent({ ok: false, code: 'bridge_error', message: e instanceof Error ? e.message : String(e) }),
+          resultToContent({ ok: false, code: relayErrorCode(e), message: e instanceof Error ? e.message : String(e) }),
         );
       }
     };

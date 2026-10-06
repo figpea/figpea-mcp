@@ -466,11 +466,28 @@ The flat default is 60 s rather than 10 s because the editor's render-settle win
 
 When a call does time out, the error says so honestly — `timed out after Nms; the editor may still be executing this call — check state before retrying` — and then **names the call to run**: `session.find({name})` for a create (the check that stops a retry from duplicating the layer), `session.layerById(<id>)` for a patch whose id you already have, `session.layerTree()` when there is no name or id to check by, and a plain "re-issue is safe" for a read. **Do not blindly retry a failed mutation**: the tab keeps working after the relay gives up, so the effect may have landed anyway.
 
+### Which failure was it? Branch on `code`
+
+The message above is advice, and advice is what an automated retry policy cannot read. The `code` field says which of these you have, and it is the field every consumer should branch on:
+
+| `code` | What happened | What to do |
+|--------|---------------|------------|
+| `bridge_timeout_maybe_applied` | This relay's own deadline fired. The tab keeps working, so the change **may have landed** and this bridge will never know for certain | Run the state check the message names. Do **not** re-issue a non-idempotent call — see the refusal below |
+| `bridge_previous_call_unresolved` | An identical re-issue of a call already in doubt was **refused**; nothing was sent to the tab, so nothing was applied twice | The state check the message names. The refusal says whether the earlier call is recorded as applied or still unknown |
+| `bridge_error` | The call was never delivered: no tab paired, the socket went away, the frame was malformed | Re-pair or reconnect. Nothing was in doubt about this one — it never ran |
+| the tab's own codes (`no_tab`, `invalid_params`, …) | The tab **answered**, and refused. A successful relay of a failed call, delivered with the tab's code | Act on the tab's message; nothing was half-applied |
+
+`bridge_timeout_maybe_applied` is a different fact from `bridge_error`, not a softer version of the same one. It does not mean the change failed; it means the bridge stopped waiting.
+
+**A late answer is no longer thrown away.** A result frame that arrives within a grace window of 120000 ms after the deadline is matched to the call it belongs to, and its outcome recorded — which is how a later identical re-issue can be told that the earlier one was already applied. The bridge still cannot tell you what happened; it can only stop discarding the evidence, and it names the code rather than claiming the ambiguity is gone.
+
+**Re-issuing a timed-out mutation is refused, not merely discouraged.** A second identical `layer.create` or `layer.setText` while the first is still unresolved is answered with `bridge_previous_call_unresolved` and never reaches the tab — so a retry cannot duplicate a layer, whatever the caller believed about the first call. Two cases are relayed normally on purpose, because both are known rather than guessed: the earlier call is **recorded as failed** (the tab answered with an error, so it demonstrably did not land), and the call is an audited **read or export** (it cannot half-apply anything in the design, so re-issuing it is free — those two audited sets fail closed, and an unaudited method gets the conservative refusal). In every other case the state check named in the message is the route forward.
+
 That envelope also ends with the serving build identity — `served by figpea-mcp <version> build <buildId> (built …, loaded …)` — so a timeout can be matched against the commit you believe is running without a second `status` call; when the served build has changed on disk since the process loaded it, the message says so and names the restart ([Which build is this server running?](#which-build-is-this-server-running)).
 
 ### Host request timeout
 
-`_timeoutMs` raises *this package's* deadline only. Your MCP host has its own request timeout on top of it, which `_timeoutMs` cannot raise. When the host's ceiling fires first you get a transport-level error (e.g. `MCP error -32001: Request timed out`) and **no envelope at all** — no message, no named state check, nothing telling you whether the mutation applied. That is the one case where the advice above is not delivered for you: run the state check yourself, and prefer passing `_timeoutMs` up front to waiting under the host's ceiling.
+`_timeoutMs` raises *this package's* deadline only. Your MCP host has its own request timeout on top of it, which `_timeoutMs` cannot raise. When the host's ceiling fires first you get a transport-level error (e.g. `MCP error -32001: Request timed out`) and **no envelope at all** — no message, no named state check, nothing telling you whether the mutation applied. That is the one case where the advice above is not delivered for you, and it is also the one case where the outcome table does not reach you: no envelope was produced at all, so there is no `code` to branch on. What you are missing is specifically the `bridge_timeout_maybe_applied` envelope described in [Which failure was it?](#which-failure-was-it-branch-on-code) — the host's error carries no hint that it is standing in for that, and a transport-level timeout is indistinguishable from every other transport-level failure. Run the state check yourself, and prefer passing `_timeoutMs` up front to waiting under the host's ceiling.
 
 Every tool also accepts `_rawJson` (boolean, optional) — the escape hatch for a host harness that stringifies a nested object or array instead of sending it as one. Set it to `true` and a JSON-looking string is JSON-parsed before forwarding at any position this build's manifest **declares** `object`/`array`/`matrix`, or at any position it declares nothing about at all — so the whole object can travel as a string and arrive as a real object with real numbers.
 
@@ -584,7 +601,7 @@ A refusal the editor made is a **successful relay of a failed call**, so it arri
 {"ok": false, "code": "not_found", "message": "no layer named \"RecoveredCard\""}
 ```
 
-The status codes are facts rather than categories: `200` answered (including the tab's own `{ok:false}`), `400` a body that cannot be addressed (nothing is relayed), `401` the token gate, `409` no tab is paired, `413` past the 32 MB body cap, `504` the relay deadline — carrying the relay's own envelope, so the state check and the recovery clause below reach this caller too — and `502` a relay failure that is not a deadline. Every non-200 body is `{ok: false, code, message}`, the package's one failure shape.
+The status codes are facts rather than categories: `200` answered (including the tab's own `{ok:false}`), `400` a body that cannot be addressed (nothing is relayed), `401` the token gate, `409` no tab is paired, `413` past the 32 MB body cap, `504` the relay deadline — carrying the relay's own envelope, so the state check and the recovery clause below reach this caller too — and `502` a relay failure that is not a deadline. Every non-200 body is `{ok: false, code, message}`, the package's one failure shape, and its `code` is the same vocabulary the MCP tools emit: a `504` body carries `bridge_timeout_maybe_applied`, so this route does not hand a caller a second, private set of words to learn.
 
 Both routes require the per-run pairing token in the **`x-figpea-token` header** — never a query string, because a query string lands in a URL, in a pasted shell history and in an access log. Neither route is reachable from a browser page: no CORS headers are sent on either and `Access-Control-Allow-Methods` stays `GET, OPTIONS`, so a browser can neither read them nor preflight the POST. Call them with `curl`, `node`, or any local process.
 
@@ -595,6 +612,14 @@ A timed-out call has always named the state check to run ([Call timeouts](#call-
 > if your next call to this tab also times out, this tab is not answering — layer.create timed out unanswered, and it is the streak that separates a busy tab from a wedged one. Read `status.liveness`, then drive the tab through the bridge's own `POST /call` route (README → Recovering a lost session); the bridge keeps serving without the MCP channel.
 
 The clause is **conditional on the streak** because one unanswered call is not evidence: the tab keeps executing after the relay gives up and the effect may land anyway.
+
+**What the envelope's `code` adds.** The prose in a timeout has always been the same for every kind of deadline, and it always will be — it is what a reader of English needs. The `code` is for the machine beside it, and it now distinguishes what used to be one indistinguishable value:
+
+- `bridge_timeout_maybe_applied` — the relay's own deadline fired. The call may have landed; this bridge stopped waiting and its late answer, if one arrives, is recorded rather than discarded.
+- `bridge_previous_call_unresolved` — this call was **refused**, not relayed, because an identical earlier call is still in doubt. Nothing reached the tab, so nothing was applied twice.
+- `bridge_error` — the call was never delivered (no tab, socket gone, malformed frame). Unchanged in meaning from earlier versions: a relay that cannot say which failure it was reports the generic code rather than guessing.
+
+Full table, with what to do in each case, in [Which failure was it?](#which-failure-was-it-branch-on-code).
 
 ### The `liveness` vocabulary
 
@@ -691,6 +716,8 @@ The remaining suites exercise the server in-process and do not need a build.
 - **`buildStale: true`** — the `figpea-mcp/dist` build on disk is not the one this process loaded, so the code answering you predates a merge. This is what a stale server looks like from the outside: a call the current source handles correctly comes back as a failure, and it reads as a bug in the design file. Restart the MCP server; it cannot restart itself, because your MCP client owns the process. Before you go hunting for a product bug, compare `build.buildId` with your own build — an unchanged `buildId` means the directory was simply rebuilt, not that newer code is waiting ([Which build is this server running?](#which-build-is-this-server-running)). Nothing else on `status` is affected, and it says nothing about the editor tab's build.
 - **The MCP namespace vanished mid-session** — the tools are simply gone from a session that had them a minute ago, because the host stopped driving (or dropped) the stdio server. This package cannot bring that channel back; the host owns the process. What it can still do is finish the run: the bridge is likely still listening, so follow [Recovering a lost session](#recovering-a-lost-session) — read the bridge-info file, `GET /state` to see whether the tab is answering, then `POST /call` for the calls you still owe. If no bridge-info file answers, the process is gone too, and the answer is a fresh `figpea-mcp` plus a re-pair.
 - **Every call times out while `tabConnected` is still `true`** — that bit describes the socket, not the tab, so a wedged tab keeps reading `true` while nothing answers. Read `liveness.state`: `unknown` means nothing has been observed yet, `responsive` means the last call came back, and `unresponsive` means two calls in a row went unanswered — which is what the bridge observed, not proof the tab failed, so look at the editor tab before you abandon work ([Recovering a lost session](#recovering-a-lost-session)).
+- **`bridge_timeout_maybe_applied`** — the relay's own deadline fired, and the call **may have landed**: the tab keeps working after the bridge stops waiting. This is not a failure report. Run the state check the message names (`session.find({name})`, `session.layerById(<id>)` or `session.layerTree()`) before doing anything else, and do not re-issue a non-idempotent call — a duplicate is refused anyway, but the state check is the faster answer. A slow tab still looks slow: the code names what the bridge observed, not why the tab was late ([Which failure was it?](#which-failure-was-it-branch-on-code)).
+- **`bridge_previous_call_unresolved`** — your re-issue of a timed-out call was **refused** and never reached the tab, so nothing was applied twice. This is the expected outcome of retrying a mutation that timed out, not a new failure. The message says whether the earlier call is recorded as applied or still unknown, and names the state check to run instead.
 - **Port already in use** — pass `--port=<n>` to bind a specific port instead of an OS-assigned one.
 
 ## License

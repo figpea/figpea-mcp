@@ -1005,26 +1005,59 @@ describe('REQ-772 AC-1/AC-2/AC-4 — per-call _timeoutMs override + method-aware
 /**
  * REQ-772 AC-3 propagation guard (T3) — the bridgeServer rejection message
  * (with its ambiguity clause) must flow through makeContractHandler's catch
- * into the tool result's bridge_error message unchanged.
+ * into the tool result's message unchanged.
+ *
+ * REQ-1522 (AC-2/AC-6) — and the `code` it lands under is no longer always
+ * `bridge_error`. The relay rejects a deadline with an error that CARRIES its
+ * own code, this layer reads that code structurally, and `bridge_error` becomes
+ * the fallback for a rejection that carries none. Both halves are pinned here,
+ * because only the first is the change and only the second is what keeps the
+ * existing meaning of `bridge_error` intact.
  */
-describe('REQ-772 AC-3 — bridge_error propagation of the honest timeout message', () => {
-  it('a timed-out call surfaces bridge_error whose message carries the ambiguity clause verbatim', async () => {
+describe('REQ-772 AC-3 — propagation of the honest timeout message, under its own code', () => {
+  it('a timed-out call surfaces the deadline outcome, with the ambiguity clause verbatim', async () => {
     const bridge = fakeBridge({
       onDescribe: (handler) =>
         handler({ session: { waitForIdle: { doc: 'Waits.', params: {}, result: {} } } }),
       isTabConnected: () => true,
       callTab: async () => {
-        throw new Error(
-          'figpea-mcp bridgeServer: call session.waitForIdle timed out after 30000ms; the editor may still be executing this call — check state before retrying',
+        // The rejection the real relay now throws: the same prose REQ-772
+        // pinned, on an error that names the outcome in its `code`.
+        throw Object.assign(
+          new Error(
+            'figpea-mcp bridgeServer: call session.waitForIdle timed out after 30000ms; the editor may still be executing this call — check state before retrying',
+          ),
+          { code: 'bridge_timeout_maybe_applied' },
         );
       },
     });
     const client = await connectedClient(bridge);
     const payload = await callToolJson(client, 'session_waitForIdle', {});
     expect(payload.ok).toBe(false);
-    expect(payload.code).toBe('bridge_error');
+    expect(
+      payload.code,
+      'AC-2: the deadline is named by its own code, so a caller branching on `code` can tell it from a hard relay failure',
+    ).toBe('bridge_timeout_maybe_applied');
     expect(payload.message).toContain('may still be executing this call');
     expect(payload.message).toContain('check state before retrying');
+  });
+
+  it('a rejection that carries no code still reports bridge_error — the fallback keeps its old meaning', async () => {
+    const bridge = fakeBridge({
+      onDescribe: (handler) =>
+        handler({ session: { waitForIdle: { doc: 'Waits.', params: {}, result: {} } } }),
+      isTabConnected: () => true,
+      callTab: async () => {
+        throw new Error('figpea-mcp bridgeServer: no tab is connected');
+      },
+    });
+    const client = await connectedClient(bridge);
+    const payload = await callToolJson(client, 'session_waitForIdle', {});
+    expect(payload.ok).toBe(false);
+    expect(
+      payload.code,
+      'a relay that cannot say which failure it was must not have its silence turned into a specific claim',
+    ).toBe('bridge_error');
   });
 });
 

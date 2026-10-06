@@ -395,7 +395,7 @@ describe('REQ-772 AC-3 — timeout rejection states the editor may still be exec
     expect(message, 'AC-3: callers must be told not to blindly retry').toContain('check state before retrying');
   });
 
-  it('the pending entry is deleted at the deadline while a late tab-side result still arrives (the effect lands anyway)', async () => {
+  it('a late tab-side result still arrives after the deadline and does not crash or wedge the bridge (the effect lands anyway)', async () => {
     const bridge = trackHandle(await startBridgeServer());
     const ws = await connectSilentTab(bridge);
 
@@ -408,7 +408,13 @@ describe('REQ-772 AC-3 — timeout rejection states the editor may still be exec
       if (frame?.type !== 'call') return;
       // The tab side keeps working past the relay's deadline and eventually
       // delivers its result — exactly the ambiguous-failure shape REQ-772
-      // documents. The server must ignore this stale id (entry deleted).
+      // documents, and the shape REQ-1522 AC-2 deliberately reversed: the late
+      // frame is now CONSUMED (matched to the demoted entry, its outcome
+      // recorded) rather than dropped into the stale-id guard. What this test
+      // asserts is REQ-772's own surviving guarantee — that the late frame must
+      // not crash or wedge the bridge — which AC-2 does not weaken. That the
+      // frame is now actually MATCHED is `req1522TimeoutOutcome.test.ts`'s
+      // subject, not this one's.
       setTimeout(() => {
         ws.send(JSON.stringify({ type: 'result', id: frame.id, ok: true, value: 'late-tab-side-effect' }));
       }, LATE_RESULT_DELAY_MS);
@@ -417,7 +423,7 @@ describe('REQ-772 AC-3 — timeout rejection states the editor may still be exec
     const callPromise = bridge.callTab('session', 'waitForIdle', [], TIMEOUT_MS);
     await expect(callPromise, 'the relay itself still gives up at its own deadline').rejects.toThrow(/timed out/);
 
-    // Let the late reply arrive and be dropped; the bridge must neither
+    // Let the late reply arrive and be consumed; the bridge must neither
     // crash nor wedge — it stays usable for the next call.
     await new Promise((resolve) => setTimeout(resolve, LATE_RESULT_DELAY_MS + 150));
     expect(bridge.isTabConnected()).toBe(true);

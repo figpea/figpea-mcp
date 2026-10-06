@@ -230,16 +230,24 @@ describe('REQ-1457 AC-4 — both calling lanes carry the stamp', () => {
       ],
       [
         'compact mode',
+        // REQ-1522 AC-4: a different layer KIND from the full-mode row above, so
+        // the two lanes are not the same call — an identical re-issue of an
+        // unresolved call is refused, and this test is about the envelope
+        // reaching both lanes, not about a retry. The kind is not interpolated
+        // into the hint, so every message assertion below is unchanged.
         await callToolJson(compactClient, 'figpea_call', {
           group: 'layer',
           method: 'create',
-          args: ['text', { name: 'cat-label' }],
+          args: ['rect', { name: 'cat-label' }],
           _timeoutMs: 60,
         }),
       ],
     ] as const) {
       expect(result.ok, `${lane}: a timed-out call is a failed envelope`).toBe(false);
-      expect(result.code).toBe('bridge_error');
+      // REQ-1522 AC-2: the deadline now carries its own code. Every `message`
+      // assertion below is untouched — the envelope is appended to, never
+      // substituted — which is exactly what this requirement's own pins say.
+      expect(result.code).toBe('bridge_timeout_maybe_applied');
       expect(result.message, `AC-4, ${lane}: the serving build reaches the agent there too`).toMatch(STAMP_RE);
       for (const pinned of PINNED_SUBSTRINGS) {
         expect(result.message, `${lane}: "${pinned}" survives verbatim`).toContain(pinned);

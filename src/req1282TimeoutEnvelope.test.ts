@@ -620,7 +620,10 @@ async function callToolJson(client: Client, name: string, args: Record<string, u
   return JSON.parse(content.find((c) => c.type === 'text')!.text!);
 }
 
-describe('REQ-1282 — the clause survives both calling lanes as bridge_error (AC-3)', () => {
+// REQ-1522 AC-2 renamed the code this test pins: the deadline is now named by
+// its own outcome rather than flattened into `bridge_error`. The envelope this
+// test is actually about — the clause, both lanes — is unchanged.
+describe('REQ-1282 — the clause survives both calling lanes, under their own outcome code (AC-3)', () => {
   it('compact figpea_call and a full-mode contract tool both surface the state check intact', async () => {
     const bridge = await startBridgeServer();
     activeHandle = bridge;
@@ -642,22 +645,32 @@ describe('REQ-1282 — the clause survives both calling lanes as bridge_error (A
       _timeoutMs: 60,
     });
     expect(fullResult.ok, 'a timed-out call is a failed envelope').toBe(false);
-    expect(fullResult.code).toBe('bridge_error');
+    // REQ-1522 AC-2: `code` moves from the generic `bridge_error` to the
+    // deadline's own outcome. Deliberate, enumerated in that plan: the field
+    // every consumer branches on is the defect, and the prose above still says
+    // the same words.
+    expect(fullResult.code).toBe('bridge_timeout_maybe_applied');
     expect(
       fullResult.message,
       'AC-3, full mode: the named state check reaches the agent, not just the ambiguity clause',
     ).toContain('session.find({name:"cat-label"})');
     for (const pinned of PINNED_SUBSTRINGS) expect(fullResult.message).toContain(pinned);
 
+    // REQ-1522 AC-4: the two lanes must NOT be the same call. An identical
+    // re-issue of an unresolved call is now refused, so a both-lanes test that
+    // relayed the same create twice would be asserting a refusal while claiming
+    // to assert an envelope. The lane below differs in its layer KIND, which the
+    // state-check hint does not interpolate — so it is genuinely a different
+    // call while every message assertion in this test stays byte-identical.
     // Compact mode: the only way an agent reaches a contract method at all.
     const compactResult = await callToolJson(compactClient, 'figpea_call', {
       group: 'layer',
       method: 'create',
-      args: ['text', { name: 'cat-label' }],
+      args: ['rect', { name: 'cat-label' }],
       _timeoutMs: 60,
     });
     expect(compactResult.ok).toBe(false);
-    expect(compactResult.code).toBe('bridge_error');
+    expect(compactResult.code).toBe('bridge_timeout_maybe_applied');
     expect(
       compactResult.message,
       'AC-3, compact mode: the named state check reaches the agent there too',

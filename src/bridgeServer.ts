@@ -15,7 +15,20 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import WebSocket, { WebSocketServer } from 'ws';
 import { BRIDGE_BIND_HOST, BRIDGE_URL_HOST } from './bridgeHost';
-import { DEFAULT_CALL_TIMEOUT_MS, resolveTimeoutMs, stateCheckHint } from './callTimeout';
+import { DEFAULT_CALL_TIMEOUT_MS, isReissueSafe, resolveTimeoutMs, stateCheckHint } from './callTimeout';
+// REQ-1522 — the outcome vocabulary for a call that is NOT known to have failed,
+// plus the per-slot record of calls whose fate is still unknown. Another
+// zero-import leaf for the reason `callTimeout.ts` and `tabLiveness.ts` are:
+// `mcpServer.ts` must read these codes without this file ever importing it back.
+import {
+  CallOutcomeError,
+  OUTCOME_PREVIOUS_UNRESOLVED,
+  OUTCOME_TIMEOUT_MAYBE_APPLIED,
+  UNRESOLVED_CALL_TTL_MS,
+  createUnresolvedCallLedger,
+  unresolvedCallKey,
+  type UnresolvedCallLedger,
+} from './callOutcome';
 // REQ-1503 — the bridge-info file, so an agent that has lost its MCP channel can
 // still find this bridge's port and token. Best-effort and never fatal; see the
 // module's docblock for why it lives outside the per-token session dir.
@@ -180,6 +193,24 @@ interface PendingCall {
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
   timer: ReturnType<typeof setTimeout>;
+  /**
+   * REQ-1522 — whether the caller is still waiting, or the deadline has already
+   * reported the ambiguity and only the TAB is out of step.
+   *
+   * `expired` is what the deadline path demotes an entry to instead of deleting
+   * it. The old behaviour deleted it, which meant the correlation record died
+   * while the frame was still on the wire; the tab's answer then arrived into
+   * the stale-id guard and was dropped, so the bridge threw away the only
+   * evidence it would ever get about whether the change had landed.
+   */
+  phase: 'awaiting' | 'expired';
+  /**
+   * REQ-1522 — the key an identical re-issue of THIS call is recognised by,
+   * stamped when the entry is demoted. Present only on an `expired` entry,
+   * because that is the only state in which "was this the same call?" is a
+   * question anybody asks.
+   */
+  unresolvedKey?: string;
 }
 
 /**
@@ -215,6 +246,14 @@ interface Slot {
    * the confusion REQ-1492's per-slot split exists to prevent.
    */
   liveness: TabLivenessLedger;
+  /**
+   * REQ-1522 — the calls this tab was asked to make whose outcome the bridge
+   * stopped waiting for and the tab has not yet reported. Per-slot for the same
+   * reason everything else here is: "may this be re-issued?" has one answer per
+   * tab, and blending two of them into one bit is the confusion REQ-1492's
+   * per-slot split exists to prevent.
+   */
+  unresolved: UnresolvedCallLedger;
 }
 
 /** Starts the localhost-only bridge WebSocket + HTTP file server (plan §3, REQ-1017). */
@@ -528,10 +567,21 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
       // The relay's own envelope, passed through rather than replaced: this route
       // IS the recovery surface, so a timeout here must not be the one place an
       // agent is handed a bare "timed out" with nothing to act on.
-      const timedOut = /timed out after \d+ms/.test(message);
-      sendJson(res, timedOut ? 504 : 502, {
+      //
+      // REQ-1522: the CODE is read off the error, the way the MCP lanes read
+      // it, rather than inferred from a phrase in the prose. It used to be
+      // `/timed out after \d+ms/.test(message)` answered with a private
+      // `relay_timeout`, which made this route the last place in the package
+      // handing a caller a vocabulary the MCP lane does not — and the route
+      // whose own comment says it is the recovery surface. The status code is
+      // unchanged (504 for the deadline, 502 for anything else) because that is
+      // a fact about the transport that callers and proxies already branch on;
+      // the body now names the same outcome the tools do.
+      const structured = (err as { code?: unknown } | null)?.code;
+      const outcome = typeof structured === 'string' ? structured : 'relay_failed';
+      sendJson(res, outcome === OUTCOME_TIMEOUT_MAYBE_APPLIED ? 504 : 502, {
         ok: false,
-        code: timedOut ? 'relay_timeout' : 'relay_failed',
+        code: outcome,
         message,
       });
     }
@@ -732,18 +782,45 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
     socket.close(CLOSE_CODE_SUPERSEDED, trimmed);
   }
 
+  /**
+   * REQ-1522 AC-3 — the ONE place a pending call's teardown happens.
+   *
+   * It used to be three places: the reply handler, `rejectSlotPending`, and the
+   * deadline timer — which is how the deadline grew its own `pending.delete`
+   * with no `clearTimeout` beside it, deleted the record its own in-flight frame
+   * was about to be matched against, and dropped the tab's answer into a
+   * stale-id guard. "Cleared in exactly one place" is only true if there is
+   * only one place, so this is that place and the `pending.delete` +
+   * `clearTimeout` pair now exists here alone.
+   *
+   * `noteSettled()` is settled by the PHASE rather than by the caller, which is
+   * what keeps the in-flight count from double-decrementing now that an expired
+   * entry can legitimately be settled twice — once by the deadline that
+   * demoted it, and again here when its late frame lands. The count belongs to
+   * the dispatch that started it, and only the first settle of an `awaiting`
+   * entry ends it. Deciding that inside this function rather than at each call
+   * site is the whole reason the asymmetry cannot be got wrong.
+   */
+  function settlePending(slot: Slot, id: string): PendingCall | undefined {
+    const entry = slot.pending.get(id);
+    if (entry === undefined) return undefined;
+    slot.pending.delete(id);
+    clearTimeout(entry.timer);
+    if (entry.phase === 'awaiting') slot.liveness.noteSettled();
+    return entry;
+  }
+
   function rejectSlotPending(slot: Slot, reason: unknown): void {
-    for (const entry of slot.pending.values()) {
-      clearTimeout(entry.timer);
-      // REQ-1503: this is the third `pending` removal site, and it is the one
-      // that is easy to miss — a departing tab would otherwise leave its ledger
-      // claiming calls are still in flight. Settled, but NOT an answer and NOT a
+    for (const id of [...slot.pending.keys()]) {
+      const entry = settlePending(slot, id);
+      // REQ-1503: a departing tab would otherwise leave its ledger claiming
+      // calls are still in flight. Settled, but NOT an answer and NOT a
       // timeout: a tab that went away is `unpaired` on the next read, and this
-      // axis reports nothing about a tab that is no longer there.
-      slot.liveness.noteSettled();
-      entry.reject(reason);
+      // axis reports nothing about a tab that is no longer there. An entry the
+      // deadline had already demoted is settled too — its in-flight count was
+      // ended there, and rejecting an already-rejected promise is a no-op.
+      entry?.reject(reason);
     }
-    slot.pending.clear();
   }
 
   function rejectAllPending(reason: unknown): void {
@@ -781,18 +858,35 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
       }
 
       if (frame?.type === 'result' && typeof frame.id === 'string') {
-        const entry = slot.pending.get(frame.id);
-        if (!entry) return; // Stale/unknown id (e.g. already timed out) -- ignore.
-        slot.pending.delete(frame.id);
-        clearTimeout(entry.timer);
-        // REQ-1503: the answer is recorded HERE, where the fact already exists
-        // and where the `pending.delete` above already settles the in-flight
-        // count. Both branches below count as an answer — `{ok:false}` is the
-        // tab REPLYING, which is exactly the fact this axis is about, and
-        // treating a tab's own error as silence is how a working tab would read
-        // as wedged.
-        slot.liveness.noteSettled();
+        // REQ-772 AC-3 accepted "ignore a stale id" as the behaviour here, and
+        // REQ-1522 AC-2 deliberately REVERSES that — but only for a frame whose
+        // call the deadline reported and then forgot to keep. An id this bridge
+        // never issued is still dropped: guessing at it would attach one call's
+        // answer to another's promise.
+        const entry = settlePending(slot, frame.id);
+        if (entry === undefined) return;
+        // REQ-1503: the answer is recorded HERE, where the fact already exists.
+        // Both branches count as an answer — `{ok:false}` is the tab REPLYING,
+        // which is exactly the fact this axis is about, and treating a tab's own
+        // error as silence is how a working tab would read as wedged.
+        //
+        // REQ-1522: that includes a reply that arrives AFTER the deadline. The
+        // tab answered, so the tab is not wedged, and recording otherwise is how
+        // a merely-busy tab accumulates a timeout streak on the strength of
+        // frames this bridge used to throw away.
         slot.liveness.noteAnswered();
+
+        if (entry.phase === 'expired') {
+          // The caller already holds its outcome and has been told to check
+          // state; what is missing is the bridge's own knowledge. Record it, so
+          // an identical re-issue can be answered from this instead of being
+          // re-applied, and let the entry go.
+          if (entry.unresolvedKey !== undefined) {
+            slot.unresolved.resolve(entry.unresolvedKey, frame.ok ? 'applied' : 'failed');
+          }
+          return;
+        }
+
         if (frame.ok) {
           entry.resolve({ ok: true, value: frame.value });
         } else {
@@ -986,6 +1080,10 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
         pending: new Map(),
         drillPromise: undefined,
         liveness: createTabLivenessLedger(slotId),
+        // REQ-1522: created beside the ledger it belongs to, and it dies with
+        // the slot — a tab that leaves takes its own unresolved calls with it,
+        // which is right: nothing will ever answer them now.
+        unresolved: createUnresolvedCallLedger(),
       };
       slots.set(slot.id, slot);
       slotForSocket.set(socket, slot);
@@ -1061,6 +1159,46 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
     const target = slot;
     const id = String(nextCallId++);
     const frame: CallFrame = { type: 'call', id, group, method, args };
+
+    // REQ-1522 AC-4 — is this the same call as one we are already in doubt
+    // about? Asked BEFORE the frame is built, because the whole point is that
+    // the second frame must never reach the tab: a refusal that arrived after
+    // the call was relayed would produce an honest-looking envelope over a
+    // duplicated layer.
+    //
+    // Three ways out, and each is a different fact rather than a tolerance:
+    //  - the earlier call is recorded as FAILED, so we know it did not land and
+    //    refusing the retry would be refusing the only route to the work;
+    //  - the call is an audited read or export, which cannot be half-applied in
+    //    the design at all (`isReissueSafe` — the same two sets the timeout
+    //    envelope's advice rests on, so the guard and the prose cannot
+    //    contradict each other);
+    //  - the earlier call is recorded as APPLIED, or is still unknown: refuse,
+    //    because re-issuing is at best a no-op and at worst a duplicate.
+    const tool = `${group}_${method}`;
+    const unresolvedKey = unresolvedCallKey(group, method, args);
+    const prior = target.unresolved.priorOutcome(unresolvedKey);
+    if (prior !== null && prior !== 'failed' && !isReissueSafe(tool)) {
+      return Promise.reject(
+        new CallOutcomeError(
+          OUTCOME_PREVIOUS_UNRESOLVED,
+          // Two sentences, because there are two different facts and one of
+          // them is load-bearing: "unknown" must not read as "the earlier call
+          // failed" (a caller who believes that abandons a layer that exists),
+          // and "applied" must not read as "unknown" (a caller who believes that
+          // goes looking for a problem that has already been solved). So the
+          // record is quoted, in whichever state it is actually in.
+          //
+          // The route forward is a call to run, never an instruction to try
+          // again: re-issuing is precisely what is being refused, so advising
+          // it would contradict the refusal in the same sentence. The state
+          // check is the same one the timeout envelope named, for the same
+          // reason — it is the call that answers the question this raises.
+          `figpea-mcp bridgeServer: refusing an identical ${group}.${method} — an earlier identical call is already in doubt, and ${prior === 'applied' ? 'it is recorded as applied — re-issuing it would at best be a no-op' : 'the outcome of that earlier call is unknown'}; it is not re-issued because re-issuing could apply it twice; ${stateCheckHint(group, method, args)}`,
+          prior === 'applied' ? 'applied' : 'unknown',
+        ),
+      );
+    }
     // REQ-1503: in-flight is recorded where the call is actually dispatched,
     // beside the `pending.set` that makes the work real. While a call sits here
     // `liveness.inFlight`/`oldestInFlightMs` say so, which is the honest answer
@@ -1070,12 +1208,37 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
     target.liveness.noteDispatched();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        target.pending.delete(id);
+        // REQ-1522 AC-2/AC-3 — DEMOTE, do not delete. This line used to be
+        // `target.pending.delete(id)`, which destroyed the correlation record
+        // while the frame was still on the wire: the tab's answer then arrived
+        // into the stale-id guard below and was discarded, so the bridge could
+        // never learn whether the change had landed. The caller is released
+        // immediately either way (REQ-1282 D1 — the relay's own deadline is the
+        // one that must fire, so the informative envelope reaches the agent
+        // instead of the host's opaque transport error); what changes is that
+        // the entry SURVIVES to be matched, and the in-flight count is settled
+        // exactly once, by whichever of the two paths got here first.
+        const entry = target.pending.get(id);
+        if (entry === undefined || entry.phase !== 'awaiting') {
+          // Already answered or already swept: this promise has been settled,
+          // and a settled call cannot time out.
+          return;
+        }
+        entry.phase = 'expired';
+        entry.unresolvedKey = unresolvedCallKey(group, method, args);
         // …and the timeout is recorded HERE, in the timer that already decided
-        // the call is unanswered. Paired with the settle so the in-flight count
-        // cannot leak on the path that most needs it.
+        // the call is unanswered. Paired with the settle above so the in-flight
+        // count cannot leak on the path that most needs it.
         target.liveness.noteSettled();
         target.liveness.noteTimedOut();
+        target.unresolved.markUnresolved(`${group}_${method}`, entry.unresolvedKey);
+        // The grace window: an answer arriving inside it is matched and
+        // recorded rather than dropped. Bounded, swept regardless of whether
+        // anything ever answers, and `unref`'d so a waiting record can never
+        // hold the process open. The same shape as the blob map's expiry above.
+        setTimeout(() => {
+          settlePending(target, id);
+        }, UNRESOLVED_CALL_TTL_MS).unref?.();
         // REQ-772 AC-3: a relay timeout is NOT proof the tab failed — the
         // tab keeps executing and the effect (e.g. layer.create) may land
         // anyway. The rejection must say so, so callers check state before
@@ -1103,13 +1266,22 @@ export async function startBridgeServer(options?: StartBridgeServerOptions): Pro
         // and it must precede the stamp, because REQ-1457's guarantee is that
         // the message ENDS with the build identity and a caller takes that
         // tail as the stamp.
+        // REQ-1522 AC-2: the code, not just the prose. Every word above is
+        // unchanged and every word is still only advice; what this requirement
+        // adds is the field every consumer actually branches on, saying the
+        // deadline fired and the change MAY have landed — instead of the
+        // generic `bridge_error`, which means no tab, socket gone or malformed
+        // relay and which is what made this failure indistinguishable from a
+        // real one.
         reject(
-          new Error(
+          new CallOutcomeError(
+            OUTCOME_TIMEOUT_MAYBE_APPLIED,
             `figpea-mcp bridgeServer: call ${group}.${method} timed out after ${timeoutMs}ms; the editor may still be executing this call — check state before retrying; ${stateCheckHint(group, method, args)}; ${recoveryHint(group, method)}; ${servingBuildStamp()}`,
+            'unknown',
           ),
         );
       }, timeoutMs);
-      target.pending.set(id, { resolve, reject, timer });
+      target.pending.set(id, { resolve, reject, timer, phase: 'awaiting' });
       sendFrame(target.socket, frame);
     });
   }
