@@ -14,9 +14,11 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { startBridgeServer } from './bridgeServer';
 import { BRIDGE_URL_HOST } from './bridgeHost';
+import { bridgeInfoPath } from './bridgeInfo';
 import { createMcpServer } from './mcpServer';
 import { fetchContract } from './contractFetch';
 import { fetchSkill } from './skillFetch';
+import { startHttpMcpEntry } from './httpEntry';
 
 /** Minimal argv parsing (plan §2): only a fixed bridge port is worth
  * exposing on the command line -- everything else (editor base URL) is
@@ -130,12 +132,86 @@ function defaultConnectUrl(port: number, token: string): string {
   return url.toString();
 }
 
+/**
+ * REQ-1516 — whether `argv` carries the exact boolean flag `--http`.
+ * A `--http=<value>` spelling is ignored with a stderr hint (house
+ * convention: `resolveToolMode`, `resolveBridgeSlots`).
+ */
+function hasHttpFlag(argv: string[]): boolean {
+  let found = false;
+  for (const arg of argv) {
+    if (arg === '--http') {
+      found = true;
+    } else if (arg.startsWith('--http=')) {
+      console.error(`[figpea-mcp] ignoring invalid --http value "${arg.slice('--http='.length)}" — pass bare --http`);
+    }
+  }
+  return found;
+}
+
+/**
+ * REQ-1516 — `--help`. Printed to stdout (this mode owns no MCP channel, so
+ * stdout hygiene does not apply) and the process exits without starting a
+ * bridge. Names every flag, including `--http`.
+ */
+function printHelp(): void {
+  console.log(
+    [
+      'figpea-mcp — MCP server for AI agents to drive a live Figpea editor.',
+      '',
+      'Usage:',
+      '  figpea-mcp [--port=N] [--mode=compact|full] [--bridge-slots=single|multi]',
+      '  figpea-mcp --http [--port=N] [--mode=compact|full] [--bridge-slots=single|multi]',
+      '  figpea-mcp --help',
+      '',
+      'Transports (pick one):',
+      '  (default)  stdio — the registered MCP server speaks JSON-RPC on stdout.',
+      '  --http     serve the SAME tools over loopback HTTP:',
+      '               POST http://127.0.0.1:<port>/mcp with the per-run pairing token',
+      '               in the x-figpea-token header. For clients that cannot host a',
+      '               stdio child. See the README section "The registered server did',
+      '               not start" for the copy-pasteable recipe.',
+      '',
+      'Flags:',
+      '  --port=N   stdio mode: the bridge port. --http mode: the HTTP listener port',
+      '             (ephemeral default, printed to stderr; the bridge takes',
+      '             FIGPEA_MCP_PORT only when it names a different port, else an',
+      '             ephemeral one).',
+      '  --mode=compact|full',
+      '             tool surface mode (default compact).',
+      '  --bridge-slots=single|multi',
+      '             how many editor tabs this bridge serves (default single).',
+      '  --help     print this text and exit.',
+      '',
+      'Environment:',
+      '  FIGPEA_MCP_PORT, FIGPEA_TOOL_MODE, FIGPEA_BRIDGE_SLOTS, FIGPEA_EDITOR_URL,',
+      '  FIGPEA_DISABLE_CONTRACT_FETCH=1 (skip the startup contract/skill fetch).',
+    ].join('\n'),
+  );
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
-  const port = resolveBridgePort(argv);
+  if (argv.some((arg) => arg === '--help')) {
+    printHelp();
+    return;
+  }
+  const httpMode = hasHttpFlag(argv);
   const toolMode = resolveToolMode(argv);
   const slots = resolveBridgeSlots(argv);
-  const bridge = await startBridgeServer({ ...(port !== undefined ? { port } : {}), slots });
+  // REQ-1516 — in --http mode --port names the HTTP listener port, while the
+  // bridge keeps its own resolution (env, else ephemeral). When both resolve
+  // to the same port the bridge yields to an ephemeral one with a stderr
+  // note, rather than failing the second listen loudly at startup.
+  const httpPort = httpMode ? resolveBridgePort(argv) : undefined;
+  let bridgePort = httpMode ? resolveBridgePort([], process.env) : resolveBridgePort(argv);
+  if (httpMode && bridgePort !== undefined && bridgePort === httpPort) {
+    console.error(
+      `[figpea-mcp] --http: bridge takes an ephemeral port (FIGPEA_MCP_PORT=${bridgePort} already names the HTTP listener)`,
+    );
+    bridgePort = undefined;
+  }
+  const bridge = await startBridgeServer({ ...(bridgePort !== undefined ? { port: bridgePort } : {}), slots });
 
   // REQ-1301: this line is not decoration — it is the anchor of the documented
   // two-line paste (README "Mid-session pairing"), which the editor's
@@ -189,6 +265,38 @@ async function main(): Promise<void> {
   }
   (serverOptions as any).toolMode = toolMode;
   const server = createMcpServer(bridge, Object.keys(serverOptions).length > 0 ? (serverOptions as any) : { toolMode } as any);
+
+  // REQ-1516 — the second door into the same room: the same bridge and the
+  // same McpServer, served over loopback HTTP instead of stdio. stdout stays
+  // clean (no transport owns it here either, so a harness may still read it).
+  if (httpMode) {
+    const entry = await startHttpMcpEntry(
+      server,
+      bridge,
+      ...(httpPort !== undefined ? [{ port: httpPort } as const] : []),
+    );
+    console.error(`[figpea-mcp] mcp http listening on 127.0.0.1:${entry.port}`);
+    console.error(`[figpea-mcp]   POST http://127.0.0.1:${entry.port}/mcp`);
+    console.error('[figpea-mcp] mcp http calls require the per-run pairing token in the x-figpea-token header');
+    console.error(`[figpea-mcp] bridge-info: ${bridgeInfoPath(bridge.port)}`);
+
+    let shuttingDown = false;
+    const shutdown = async (): Promise<void> => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      await entry.close().catch(() => {});
+      await server.close().catch(() => {});
+      await bridge.close().catch(() => {});
+      process.exit(0);
+    };
+    process.on('SIGINT', () => void shutdown());
+    process.on('SIGTERM', () => void shutdown());
+    // The HTTP listener keeps the event loop alive; park here so main never
+    // returns while it is serving.
+    await new Promise<void>(() => {});
+    return;
+  }
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
 

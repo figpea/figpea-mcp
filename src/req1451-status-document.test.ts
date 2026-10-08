@@ -295,6 +295,7 @@ describe('REQ-1451 AC-6 — status is additive', () => {
       //     tab, connections                   REQ-1492
       //   liveness                              REQ-1503
       //   document                              this requirement
+      //   pairingWarning                        REQ-1516
       // All three copies of this pin —
       // `req1394StatusDiagnosis.test.ts`, `req1457BuildStatus.test.ts` and this
       // file — must name the same keys, or one of them is red for a reason that
@@ -316,6 +317,7 @@ describe('REQ-1451 AC-6 — status is additive', () => {
           'connections',
           'liveness',
           'document',
+          'pairingWarning',
         ].sort(),
       );
       // …and each still means what it meant.

@@ -225,6 +225,7 @@ describe('REQ-1457 AC-5 — the six pre-existing fields keep their names and mea
       // `req1451-status-document.test.ts`, so all three pins must name the same
       // keys or one of them goes red for a reason that has nothing to do with
       // the requirement it belongs to.
+      // REQ-1516 AC-4 adds `pairingWarning` under the same additive-only rule.
       expect(Object.keys(s).sort(), `status key set in ${toolMode} mode`).toEqual(
         [
           ...OLD_KEYS,
@@ -237,6 +238,7 @@ describe('REQ-1457 AC-5 — the six pre-existing fields keep their names and mea
           'connections',
           'liveness',
           'document',
+          'pairingWarning',
         ].sort(),
       );
     });

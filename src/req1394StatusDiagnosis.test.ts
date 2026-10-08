@@ -423,6 +423,10 @@ describe('REQ-1394 AC-2 — nothing that `status` means today changed', () => {
           'connections',
           'liveness',
           'document',
+          // REQ-1516 AC-4 — one additive warning key (unset FIGPEA_EDITOR_URL
+          // ⇒ pairing targets production); no existing key renamed, retyped
+          // or redefined.
+          'pairingWarning',
         ].sort(),
       );
       // …and with NO tab paired the new block is honestly empty rather than

@@ -45,6 +45,57 @@ On start, the server prints a pairing URL (plus its port and token) to stderr. O
 
 Optional: the `FIGPEA_EDITOR_URL` env var and `--port=<n>` flag override the editor origin and bridge port; neither is needed for the default flow.
 
+## The registered server did not start
+
+Your client reports the server failed (`figpea failed: Connection closed`, or the `figpea_*` tools are simply absent) while the package itself is healthy. A stdio MCP process spawned at session start cannot be respawned by an agent — so start the same server a second way, with no code to write:
+
+```bash
+npx figpea-mcp --http
+```
+
+It prints the same pairing lines as the stdio entry, plus the loopback MCP endpoint to call:
+
+```text
+[figpea-mcp] bridge listening on localhost:54321
+[figpea-mcp] pairing token: 550e8400-e29b-41d4-a716-446655440000
+[figpea-mcp] mcp http listening on 127.0.0.1:54322
+[figpea-mcp]   POST http://127.0.0.1:54322/mcp
+[figpea-mcp] mcp http calls require the per-run pairing token in the x-figpea-token header
+```
+
+Point an MCP client at that endpoint with the token header (native client config — consult your client's HTTP-transport settings — or the header-less fallback below), open the pairing URL in a browser to connect an editor tab, then call the SAME registered tools: `tools/list` answers the same surface as the stdio server, and every `tools/call` answers the same `{ok, code, message}` envelope. Nothing about the tools changes — this is a second door to the same room, not a new capability.
+
+With no MCP client at all, `curl` sends the header — still no code:
+
+```bash
+URL=http://127.0.0.1:54322/mcp
+TOKEN=550e8400-e29b-41d4-a716-446655440000
+HDR=(-H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H "x-figpea-token: $TOKEN")
+
+# initialize (capture the session id the server answers with)
+SID=$(curl -s -D - "${HDR[@]}" -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"recipe","version":"0.0.0"}}}' "$URL" -o /tmp/figpea-init.json | grep -i '^mcp-session-id:' | tr -d '\r' | awk '{print $2}')
+
+# tools/list, then the first authoring call — a working layer.create
+curl -s "${HDR[@]}" -H "mcp-session-id: $SID" -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' "$URL"
+curl -s "${HDR[@]}" -H "mcp-session-id: $SID" -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"figpea_call","arguments":{"group":"layer","method":"create","args":["rect",{"name":"recipe-probe"}]}}}' "$URL"
+```
+
+`--port=<n>` names the HTTP listener port instead of an ephemeral one (in `--http` mode `--port` names the HTTP port, not the bridge port — the bridge takes `FIGPEA_MCP_PORT` only when it names a different port, else an ephemeral one). `figpea-mcp --help` prints every flag.
+
+### Point at a local dev editor
+
+By default the pairing URL targets `https://editor.figpea.com` — and `status()` says so, in one line, while `FIGPEA_EDITOR_URL is unset`. That warning is the fallback reading as a fallback: production pairing warns, dev-editor pointing is the explicit opt-in, never presented as equals:
+
+```bash
+FIGPEA_EDITOR_URL=http://localhost:8080 npx figpea-mcp --http
+```
+
+The pairing URL then targets your dev editor, and the warning goes quiet (an explicit origin is a choice, not an accident — including an explicit production one).
+
+### Two agents at once
+
+Give each run its own private bridge — its own `--http` process with its own `--port` and its own token from its own stderr. Never share pairing URLs between runs: a second agent opening your pairing URL pairs onto YOUR bridge, and by default that pairing is refused by name while your tab keeps serving. Pairing both tabs onto one bridge is the explicit opt-in (`--bridge-slots=multi`, with `select_tab` choosing which tab calls reach) — see [Running two tabs at once](#running-two-tabs-at-once).
+
 ## How pairing works
 
 The server binds a bridge on `127.0.0.1:<port>` — loopback only, never a public interface — and the editor tab connects back over that localhost WebSocket carrying the token (`?agent=1&bridgePort=…&bridgeToken=…`). By default the bridge serves **one tab**: a second connection is **refused by name**, with the close reason saying which tab holds the slot, and the tab already paired keeps its socket and keeps serving. Nothing is displaced.
@@ -660,7 +711,8 @@ Re-pairing is the way out of a dead process, not a step inside the procedure abo
 
 - `FIGPEA_EDITOR_URL` — overrides the default editor origin (`https://editor.figpea.com`) for contract prefetching, skill prefetching (`figpea_skill`), and `open_editor` links.
 - `FIGPEA_DISABLE_CONTRACT_FETCH=1` — disables BOTH the startup contract prefetch and the startup skill prefetch, falling back to cold-start static tools, drill-on-connect, and a degraded `figpea_skill` result.
-- `--port=<n>` — binds the bridge server to a specific port.
+- `--port=<n>` — binds the bridge server to a specific port (stdio mode). In `--http` mode it names the HTTP listener port instead — see [The registered server did not start](#the-registered-server-did-not-start).
+- `--http` — serve the same registered tools over loopback HTTP (`POST /mcp`, token in the `x-figpea-token` header) for clients that cannot host a stdio child. Same section.
 - `--mode=compact|full` — selects the tool surface mode (default `compact`; `full` restores all `group_method` tools). See [Tool modes & `figpea_call` dispatcher](#tool-modes--figpea_call-dispatcher).
 - `FIGPEA_TOOL_MODE=compact|full` — environment-variable fallback for `--mode` (same values, case-insensitive). CLI wins over env, both default to `compact`.
 - `--bridge-slots=single|multi` — how many editor tabs this bridge serves (default `single`: a second tab is refused by name and the first keeps serving; `multi` gives each tab its own slot and document, and registers `select_tab`). See [Running two tabs at once](#running-two-tabs-at-once).
