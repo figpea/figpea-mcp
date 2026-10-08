@@ -80,7 +80,7 @@ import { resolveOpenFileName } from './openFileName';
 // schema literal, where REQ-1280 rewrote the `_rawJson` description and
 // REQ-1296 wraps the whole literal in `z.looseObject` — REQ-1280's text is
 // preserved verbatim inside REQ-1296's wrapper, which is the correct merge.
-import { findUnknownTopLevelKeys, FULL_MODE_RESERVED, COMPACT_RESERVED } from './unknownParams';
+import { findUnknownTopLevelKeys, FULL_MODE_RESERVED, COMPACT_RESERVED, findNestedReservedKeys } from './unknownParams';
 // REQ-1457 — the one build-identity ledger: the version this process runs, the
 // artifact it loaded, and whether that artifact is still the artifact on disk.
 // It is a leaf precisely so BOTH sides can read it — `bridgeServer.ts` stamps
@@ -299,6 +299,19 @@ const ARGS_BUDGET_ADVICE =
   'so a payload carrying emoji or other multi-unit characters reaches the transport cap earlier than the ' +
   'number suggests — budget lower for those.';
 
+/** REQ-1508 AC-3 — the sibling-ness sentence, on `figpea_call`'s own
+ *  description so an agent reading only the tool learns the one placement
+ *  that silently fails: `returnAs` (and `_rawJson`) are siblings of
+ *  group/method/args, and a copy nested inside `args` is never read there —
+ *  the call is refused with `invalid_params` naming the key and its position.
+ *  Guidance only — parse behaviour is unchanged (the refusal is T2's). */
+const SIBLING_ADVICE =
+  'returnAs is a sibling of group/method/args on figpea_call itself — never a member of args. ' +
+  'The natural misspelling args:[<id>, {format:"png", returnAs:"path"}] is refused with invalid_params ' +
+  'naming the key and its position (args[1].returnAs), before the call reaches the editor and without ' +
+  'spending a tab round trip: a "returnAs" (or "_rawJson") nested inside args is never read from inside args. ' +
+  'Pass it as a sibling instead: {"group":"export","method":"artboard","args":[ …, …],"returnAs":"path"}.';
+
 /** REQ-1020 — the three tools whose off-band return is *documented* as an image
  * return, and the worked example set the README uses. This used to gate the
  * `returnAs` declaration in `buildInputShape`; REQ-1279 removed that gate,
@@ -347,6 +360,27 @@ function renderUnknownParameterMessage(toolName: string, unknownKeys: string[], 
     `${toolName}: unknown parameter${one ? '' : 's'} ${named}. Accepted parameters: ${accepted.join(', ')}. ` +
     `To get a result onto disk, pass returnAs:"path" — the bytes are written to a per-session file and its path is returned. ` +
     `Never pass a file path as a parameter.`
+  );
+}
+
+/** REQ-1508 — the fail-loud message for a `figpea_call`-level key nested
+ *  inside `args`, where it is never read.
+ *
+ *  A sibling of `renderUnknownParameterMessage`, not a reuse: that message is
+ *  for unknown top-level keys with an accepted-list, while this one names a
+ *  known key at a position it can never mean anything (`args[1].returnAs`,
+ *  or deeper for a `layer.batch` op's inner args) and teaches the one correct
+ *  form in the same round trip. Same `{ok:false, code, message}` envelope and
+ *  same `invalid_params` code, so one grammar covers "your call was malformed".
+ */
+function renderNestedReservedMessage(hits: Array<{ path: string; key: string }>): string {
+  const one = hits.length === 1;
+  const named = hits.map((h) => `"${h.key}" inside ${h.path}`).join(' and ');
+  return (
+    `figpea_call: ${named} ${one ? 'is a figpea_call-level parameter' : 'are figpea_call-level parameters'}, ` +
+    `not a method argument — pass ${one ? 'it' : 'them'} as a sibling of group/method/args, ` +
+    `e.g. {"group":"export","method":"artboard","args":[ …, …],"returnAs":"path"}. ` +
+    `${one ? 'It is' : 'They are'} never read from inside args.`
   );
 }
 
@@ -1567,7 +1601,7 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
       'figpea_call',
       {
         description:
-          'Universal dispatcher — calls any group.method on the paired editor tab via bridge.callTab(group, method, args, _timeoutMs?). In compact mode this is the only way to reach contract methods; in full mode the individual tools are also available. group/method are the describe() surface names, and args is the POSITIONAL argument array for that method, in that method\'s own parameter order. FLAT example: ["rect", {rwidth:100}] for layer.create. NESTED example — when a parameter is itself an array (e.g. layer.batch\'s ops), that parameter is passed as ONE element of args, so the element is an array of {method, args} ops: {"group":"layer","method":"batch","args":[[{"method":"create","args":["page",{"name":"probe","pageWidth":100,"pageHeight":100}]}]]}. Each op\'s own args is likewise a positional ARRAY, never an object. Unsure of a method\'s shape? Call figpea_describe({group, method}) first — it returns that method\'s doc and params from the manifest with no round trip to the tab. Image results return MCP image content + a text summary. Pass returnAs:"path" to receive a binary result off-band as a session file path instead of inline base64 — it reaches every binary export, e.g. canvas_screenshot / export_layer / export_artboard for images and export_project for a native .fp. ' + TIMEOUT_KNOB_ADVICE + ' ' + ARGS_BUDGET_ADVICE,
+          'Universal dispatcher — calls any group.method on the paired editor tab via bridge.callTab(group, method, args, _timeoutMs?). In compact mode this is the only way to reach contract methods; in full mode the individual tools are also available. group/method are the describe() surface names, and args is the POSITIONAL argument array for that method, in that method\'s own parameter order. FLAT example: ["rect", {rwidth:100}] for layer.create. NESTED example — when a parameter is itself an array (e.g. layer.batch\'s ops), that parameter is passed as ONE element of args, so the element is an array of {method, args} ops: {"group":"layer","method":"batch","args":[[{"method":"create","args":["page",{"name":"probe","pageWidth":100,"pageHeight":100}]}]]}. Each op\'s own args is likewise a positional ARRAY, never an object. Unsure of a method\'s shape? Call figpea_describe({group, method}) first — it returns that method\'s doc and params from the manifest with no round trip to the tab. Image results return MCP image content + a text summary. Pass returnAs:"path" to receive a binary result off-band as a session file path instead of inline base64 — it reaches every binary export, e.g. canvas_screenshot / export_layer / export_artboard for images and export_project for a native .fp. ' + TIMEOUT_KNOB_ADVICE + ' ' + ARGS_BUDGET_ADVICE + ' ' + SIBLING_ADVICE,
         // REQ-1296 D1 — loose for the SAME reason as buildInputShape, and it is
         // load-bearing rather than cosmetic here: `figpea_call` is the ONLY way
         // to reach a contract method in compact mode, so if its schema keeps
@@ -1668,6 +1702,23 @@ export function createMcpServer(bridge: BridgeServerHandleLike, options?: Create
               ok: false,
               code: 'invalid_params',
               message: renderUnknownParameterMessage('figpea_call', unknownTopLevelKeys, [...COMPACT_RESERVED]),
+            }),
+          );
+        }
+        // REQ-1508 — the same question one level down: a `figpea_call`-level
+        // key (`returnAs`, `_rawJson`) nested inside `args` is never read
+        // there, so the call is refused by name rather than answered with a
+        // silent inline success. Placed here, right after the top-level check
+        // and before the connection check, for the same reason as REQ-1296's
+        // placement — a defect in the call is true regardless of connection
+        // state, so it costs zero tab round trips.
+        const nestedReservedKeys = findNestedReservedKeys((rawArgs as Record<string, unknown>).args);
+        if (nestedReservedKeys.length > 0) {
+          return toCallToolResult(
+            resultToContent({
+              ok: false,
+              code: 'invalid_params',
+              message: renderNestedReservedMessage(nestedReservedKeys),
             }),
           );
         }

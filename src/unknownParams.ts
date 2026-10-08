@@ -81,3 +81,57 @@ export function findUnknownTopLevelKeys(raw: Record<string, unknown>, allowed: R
   }
   return unknown;
 }
+
+/**
+ * REQ-1508 — the `figpea_call`-level keys that are never read from inside
+ * `args`, and the pure scanner that finds them one level down.
+ *
+ * The card names exactly this pair (`returnAs`, `_rawJson`): the two whose
+ * misplacement silently changes result shape/parse behaviour (megabytes
+ * inline / unparsed JSON). A nested `_timeoutMs` merely falls back to the
+ * default timeout — a lower-harm class, deliberately not scanned.
+ *
+ * No contract method declares a parameter named `returnAs`/`_rawJson` (both
+ * lanes reserve and strip them server-side, never forward), so a nested
+ * own-key with either name cannot be a legitimate method argument — while a
+ * VALUE equal to one of those strings is not a hit (keys only).
+ */
+export const NESTED_RESERVED = ['returnAs', '_rawJson'] as const;
+
+/** A nested reserved key, and the `args[…]`-rooted position it was found at. */
+export interface NestedReservedHit {
+  path: string;
+  key: string;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * Walks the `args` tree and returns every own-key of `NESTED_RESERVED` on any
+ * plain object in it, with positions rendered as `args[1].returnAs` (and
+ * deeper, e.g. `args[0][0].args[1].returnAs` for a `layer.batch` op's inner
+ * args). Arrays are descended into; non-plain objects (class instances, Dates
+ * and the like) are skipped — a key on one is not caller-sent evidence, the
+ * same way an inherited key is not. Pure, no bridge, no I/O.
+ */
+export function findNestedReservedKeys(args: unknown): NestedReservedHit[] {
+  const reserved = new Set<string>(NESTED_RESERVED as readonly string[]);
+  const hits: NestedReservedHit[] = [];
+  const visit = (value: unknown, at: string): void => {
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) visit(value[i], `${at}[${i}]`);
+      return;
+    }
+    if (!isPlainObject(value)) return;
+    for (const key of Object.keys(value)) {
+      if (reserved.has(key)) hits.push({ path: `${at}.${key}`, key });
+      visit(value[key], `${at}.${key}`);
+    }
+  };
+  visit(args, 'args');
+  return hits;
+}
