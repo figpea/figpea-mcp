@@ -57,6 +57,12 @@ const CREATE_COMMON_FIELDS: Record<string, any> = {
   // test and is deliberately not transcribed; a two-field stand-in keeps the
   // fixture honest about what this suite depends on.
   style: { type: 'object', required: false, shape: { fill: { type: 'string', required: false }, opacity: { type: 'number', required: false } } },
+  // REQ-1029 — world-space `position` joined the editor's common fields
+  // (`v3/src/agent/createSchema.ts` — CREATE_COMMON_FIELDS), so every kind
+  // accepts it and the applicable-set derivation below must include it. The
+  // value shape is transcribed faithfully (both axes required); only
+  // key-membership is under test here.
+  position: { type: 'object', required: false, shape: { x: { type: 'number', required: true }, y: { type: 'number', required: true } } },
 };
 
 /** `v3/src/agent/createSchema.ts` — CREATE_KIND_SCHEMA (:114-195). */
@@ -123,9 +129,9 @@ function editorPropsMessage(kind: string, props: Record<string, unknown>): strin
 /** The AC-2 line, quoted from the requirement, pinned against the fixture so a
  *  wrong transcription fails here rather than being absorbed by the derivation
  *  it is supposed to be checking. */
-const AC2_TEXT_APPLICABLE = 'Applicable props for "text": index, name, parentId, style, text, transform';
+const AC2_TEXT_APPLICABLE = 'Applicable props for "text": index, name, parentId, position, style, text, transform';
 const AC2_ARC_APPLICABLE =
-  'Applicable props for "arc": endAngle, index, name, parentId, r, rx, ry, startAngle, style, sweep, thickness, transform';
+  'Applicable props for "arc": endAngle, index, name, parentId, position, r, rx, ry, startAngle, style, sweep, thickness, transform';
 
 /* ------------------------------------------------------------------ *
  * Fixture manifests
@@ -301,14 +307,15 @@ describe('REQ-1309 AC-2: the message states the applicable set in the editor\'s 
   });
 
   it('a second kind is a DIFFERENT set — proving the line is derived, not a literal', async () => {
-    // `arc` takes 12 applicable props and shares exactly five with `text`. A
-    // hard-coded `text` answer could not produce this.
+    // `arc` takes 13 applicable props (12 pre-REQ-1029 plus the common
+    // `position`) and shares exactly six with `text`. A hard-coded `text`
+    // answer could not produce this.
     const { client } = await createHarnessedClient({ mode: 'full' });
     const payload = payloadOf(await callFull(client, { name: 'A', text: 'not an arc prop' }, 'arc'));
     expect(payload.message, 'the set follows the requested kind').toContain(AC2_ARC_APPLICABLE);
     expect(payload.message, "and `text` is not an `arc` prop").toContain('text');
     const applicableLine = payload.message.split('\n').find((l: string) => l.startsWith('Applicable props for'))!;
-    expect(applicableLine.split(', ').length, 'twelve applicable props, not the six of `text`').toBe(12);
+    expect(applicableLine.split(', ').length, 'thirteen applicable props, not the seven of `text`').toBe(13);
     expect(applicableLine, 'the set is the one the editor computes for arc').not.toContain(AC2_TEXT_APPLICABLE);
   });
 });
