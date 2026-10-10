@@ -1,6 +1,6 @@
 {
   "name": "figpea-mcp",
-  "version": "2.8.0",
+  "version": "2.9.0",
   "description": "MCP server for AI agents to open, inspect, and export PSD, Adobe XD, Figma, SVG & PDF files in a live Figpea editor — runs locally over stdio, files never leave your machine.",
   "keywords": [
     "mcp",
