@@ -107,7 +107,7 @@ import * as crypto from 'node:crypto';
  * inline: `metadata.test.ts` takes the FIRST match of its regex in this file,
  * and a commented-out copy would answer for the real one.)
  */
-export const SERVER_VERSION = '2.8.0';
+export const SERVER_VERSION = '2.9.0';
 
 /** One covered file, as a fingerprint. `ino` catches an atomic replace. */
 export interface BuildEntry {
